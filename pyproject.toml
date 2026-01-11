@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pytorch-parallel-compiler"
 version = "0.0.1"
-description = "multimodal, geometric, fractal, geofractal, audio, visual, classification, predictive, and symbiosis-based models."
+description = "pytorch compilation for parallel wide models."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
