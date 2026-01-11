@@ -1,0 +1,6 @@
+torch
+huggingface_hub
+datasets
+numpy
+safetensors
+PyYAML>=6.0
