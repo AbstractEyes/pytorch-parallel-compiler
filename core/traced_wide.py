@@ -26,7 +26,7 @@ try:
         WideEmbedding, pack_inputs, unpack_outputs
     )
 except ImportError:
-    from core.tree import (
+    from wide_compiler.tree import (
         WideLinear, WideConv2d, WideConv1d,
         WideBatchNorm2d, WideBatchNorm1d, WideLayerNorm,
         WideEmbedding, pack_inputs, unpack_outputs

@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
 authors = [{ name = "AbstractPhil", email = "abstractpowered@outlook.com" }]
-keywords = ["fractal", "geometry", "multimodal", "multi-modal", "geofractal", "nlp", "symbolic", "embeddings", "simplex", "ksimplex"]
+keywords = ["pytorch", "compiler", "parallel", "wide", "batched", "grouped", "torch.compile", "fx", "tracing"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
@@ -23,19 +23,23 @@ classifiers = [
 
 dependencies = [
   "numpy>=1.23",
-  "datasets>=2.15",
   "torch>=2.1"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "tabulate",
 ]
 
 [project.urls]
 Homepage = "https://huggingface.co/AbstractPowered"
-Repository = "https://github.com/AbstractEyes/AbstractEyes/pytorch-parallel-compiler"
-Issues = "https://github.com/AbstractEyes/AbstractEyes/pytorch-parallel-compiler/issues"
+Repository = "https://github.com/AbstractEyes/pytorch-parallel-compiler"
+Issues = "https://github.com/AbstractEyes/pytorch-parallel-compiler/issues"
 
-[tool.setuptools]
-package-dir = {"" = "src"}
-include-package-data = true
+[project.scripts]
+wide-compiler = "wide_compiler.__main__:main"
 
 [tool.setuptools.packages.find]
-where = ["core"]
-include = ["geofractal*", "geovocab2*"]
+where = ["."]
+include = ["wide_compiler*", "wide_compiler.core*"]
