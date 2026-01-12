@@ -19,18 +19,11 @@ from torch import Tensor
 import torch.nn.functional as F
 import torch.fx as fx
 
-try:
-    from .tree import (
-        WideLinear, WideConv2d, WideConv1d,
-        WideBatchNorm2d, WideBatchNorm1d, WideLayerNorm,
-        WideEmbedding, pack_inputs, unpack_outputs
-    )
-except ImportError:
-    from wide_compiler.tree import (
-        WideLinear, WideConv2d, WideConv1d,
-        WideBatchNorm2d, WideBatchNorm1d, WideLayerNorm,
-        WideEmbedding, pack_inputs, unpack_outputs
-    )
+from wide_compiler import (
+    WideLinear, WideConv2d, WideConv1d,
+    WideBatchNorm2d, WideBatchNorm1d, WideLayerNorm,
+    WideEmbedding, pack_inputs, unpack_outputs
+)
 
 # =============================================================================
 # WIDE BUILDERS

@@ -27,7 +27,7 @@ Copyright 2025 AbstractPhil
 Apache License 2.0
 """
 
-from .tree import (
+from .primitives import (
     # Wide primitives
     WideLinear,
     WideConv2d,
@@ -36,10 +36,11 @@ from .tree import (
     WideBatchNorm1d,
     WideLayerNorm,
     WideEmbedding,
+)
 
-    # Packing utilities
+from .wide_model import (
     pack_inputs,
-    unpack_outputs,
+    unpack_outputs
 )
 
 from .traced_wide import (
@@ -51,8 +52,6 @@ from .traced_wide import (
     FunctionalOp,
     BinaryOp,
 )
-
-__version__ = "0.0.1"
 
 __all__ = [
     # Main API

@@ -293,12 +293,8 @@ def cmd_benchmark(args):
 
 def cmd_info(args):
     """Show library info."""
-    try:
-        from wide_compiler import __version__
-    except ImportError:
-        __version__ = "0.0.1"
 
-    print(f"WideCompiler v{__version__}")
+    print(f"WideCompiler")
     print("=" * 60)
     print()
     print("Fuse N identical models into a single Wide model.")

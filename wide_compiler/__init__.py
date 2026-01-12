@@ -38,8 +38,6 @@ from .core import (
     BinaryOp,
 )
 
-__version__ = "0.0.1"
-
 __all__ = [
     'TracedWideModel',
     'pack_inputs',
