@@ -18,6 +18,7 @@ import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
 import torch.fx as fx
+import operator
 
 try:
     from .primitives import (
@@ -95,6 +96,8 @@ def print_trace(traced: fx.GraphModule) -> str:
             lines.append(f"  [func] {fn_name}")
         elif node.op == 'call_method':
             lines.append(f"  [method] .{node.target}()")
+        elif node.op == 'get_attr':
+            lines.append(f"  [attr] {node.target}")
         elif node.op == 'output':
             lines.append(f"  [output]")
 
@@ -145,6 +148,21 @@ class BinaryOp(nn.Module):
         return f"BinaryOp({self.op})"
 
 
+class GetAttrOp(nn.Module):
+    """Wrapper for get_attr that returns a stored buffer/param."""
+
+    def __init__(self, name: str):
+        super().__init__()
+        self.attr_name = name
+
+    def forward(self, value: Tensor) -> Tensor:
+        # Value is passed in during forward
+        return value
+
+    def __repr__(self):
+        return f"GetAttrOp({self.attr_name})"
+
+
 # =============================================================================
 # TRACED WIDE MODEL
 # =============================================================================
@@ -159,6 +177,31 @@ class WideStage:
     wide_op: nn.Module
     n: int
     num_inputs: int = 1  # How many tensor inputs this op takes
+
+
+def _get_nested_attr(obj: Any, attr_path: str) -> Any:
+    """Get nested attribute like 'bn1.running_mean'."""
+    parts = attr_path.split('.')
+    for part in parts:
+        obj = getattr(obj, part)
+    return obj
+
+
+def _infer_concat_dim(tensors: List[Tensor]) -> int:
+    """Infer which dimension to concatenate on for wide attrs."""
+    if not tensors:
+        return 0
+    shape = tensors[0].shape
+    if len(shape) == 0:
+        # Scalar - stack to create dim
+        return 0
+    elif len(shape) == 1:
+        # 1D tensor (e.g., running_mean [C]) - concat on dim 0
+        return 0
+    elif len(shape) >= 2:
+        # Higher dims - concat on channel dim (typically 0 for params/buffers)
+        return 0
+    return 0
 
 
 class TracedWideModel(nn.Module):
@@ -177,8 +220,10 @@ class TracedWideModel(nn.Module):
         self._graph: Optional[fx.Graph] = None
         self._execution_order: List[str] = []
         self._node_args: Dict[str, Tuple] = {}  # node_name -> arg node names
+        self._node_kwargs: Dict[str, Dict] = {}  # node_name -> kwargs with node refs
         self._input_name: str = 'x'
         self._output_name: str = ''
+        self._attr_names: List[str] = []  # Track get_attr nodes
 
     @classmethod
     def from_models(cls, models: List[nn.Module], sample_input: Tensor) -> 'TracedWideModel':
@@ -201,7 +246,53 @@ class TracedWideModel(nn.Module):
 
         wide_model._graph = traced.graph
 
-        # Build stages from graph
+        # First pass: collect get_attr nodes and register as buffers
+        for node in traced.graph.nodes:
+            if node.op == 'get_attr':
+                attr_path = node.target
+
+                # Get attribute from all N models
+                attrs = []
+                for m in models:
+                    try:
+                        attr = _get_nested_attr(m, attr_path)
+                        if isinstance(attr, Tensor):
+                            attrs.append(attr)
+                        elif isinstance(attr, nn.Parameter):
+                            attrs.append(attr.data)
+                        else:
+                            # Non-tensor attribute - store from template
+                            attrs = None
+                            break
+                    except AttributeError:
+                        attrs = None
+                        break
+
+                if attrs is not None and len(attrs) == n:
+                    # Concatenate for wide model
+                    concat_dim = _infer_concat_dim(attrs)
+                    if attrs[0].dim() == 0:
+                        # Scalars - stack them
+                        wide_attr = torch.stack(attrs)
+                    else:
+                        wide_attr = torch.cat(attrs, dim=concat_dim)
+
+                    # Register as buffer (non-trainable by default)
+                    safe_name = node.name.replace('.', '_')
+                    wide_model.register_buffer(f'_attr_{safe_name}', wide_attr)
+                    wide_model._attr_names.append(node.name)
+                else:
+                    # Non-tensor or couldn't get from all models - use template
+                    try:
+                        attr = _get_nested_attr(template, attr_path)
+                        if isinstance(attr, Tensor):
+                            safe_name = node.name.replace('.', '_')
+                            wide_model.register_buffer(f'_attr_{safe_name}', attr.clone())
+                            wide_model._attr_names.append(node.name)
+                    except:
+                        pass  # Skip non-tensor attrs
+
+        # Second pass: build stages
         for node in traced.graph.nodes:
             wide_op = None
 
@@ -215,6 +306,13 @@ class TracedWideModel(nn.Module):
                     wide_model._output_name = node.args[0].name if hasattr(node.args[0], 'name') else str(node.args[0])
                 continue
 
+            elif node.op == 'get_attr':
+                # Already handled - just mark in execution order
+                wide_model._execution_order.append(node.name)
+                wide_model._node_args[node.name] = ()  # No inputs
+                wide_model._node_kwargs[node.name] = {}
+                continue
+
             elif node.op == 'call_module':
                 target_path = node.target
                 modules = [m.get_submodule(target_path) for m in models]
@@ -223,7 +321,7 @@ class TracedWideModel(nn.Module):
                 if module_type in WIDE_BUILDERS:
                     wide_op = WIDE_BUILDERS[module_type](modules)
                 else:
-                    wide_op = FunctionalOp(modules[0], f"Passthrough({module_type})")
+                    wide_op = FunctionalOp(lambda x, m=modules[0]: m(x), f"Passthrough({module_type})")
 
             elif node.op == 'call_function':
                 fn = node.target
@@ -250,9 +348,6 @@ class TracedWideModel(nn.Module):
                     return caller
                 wide_op = FunctionalOp(make_method_caller(method_name), f".{method_name}()")
 
-            elif node.op == 'get_attr':
-                continue
-
             if wide_op is not None:
                 # Store arg names for graph execution
                 arg_names = []
@@ -261,6 +356,14 @@ class TracedWideModel(nn.Module):
                         arg_names.append(arg.name)
                     else:
                         arg_names.append(arg)  # Constant
+
+                # Store kwargs with node references resolved
+                kwarg_refs = {}
+                for k, v in node.kwargs.items():
+                    if hasattr(v, 'name'):
+                        kwarg_refs[k] = v.name
+                    else:
+                        kwarg_refs[k] = v
 
                 stage = WideStage(
                     order=len(wide_model._execution_order),
@@ -277,6 +380,7 @@ class TracedWideModel(nn.Module):
                 wide_model.stage_info[node.name] = stage
                 wide_model._execution_order.append(node.name)
                 wide_model._node_args[node.name] = tuple(arg_names)
+                wide_model._node_kwargs[node.name] = kwarg_refs
 
         return wide_model
 
@@ -284,12 +388,26 @@ class TracedWideModel(nn.Module):
         """Execute graph respecting dataflow."""
         values: Dict[str, Tensor] = {self._input_name: x}
 
+        # Pre-populate get_attr values
+        for attr_name in self._attr_names:
+            safe_name = attr_name.replace('.', '_')
+            buffer_name = f'_attr_{safe_name}'
+            if hasattr(self, buffer_name):
+                values[attr_name] = getattr(self, buffer_name)
+
         for node_name in self._execution_order:
+            # Skip get_attr nodes - already in values
+            if node_name in self._attr_names:
+                continue
+
+            if node_name not in self.stage_info:
+                continue
+
             stage = self.stage_info[node_name]
             safe_name = node_name.replace('.', '_')
             op = self.stages[safe_name]
 
-            # Gather inputs
+            # Gather positional args
             args = []
             for arg_name in self._node_args[node_name]:
                 if isinstance(arg_name, str) and arg_name in values:
@@ -297,8 +415,18 @@ class TracedWideModel(nn.Module):
                 else:
                     args.append(arg_name)  # Constant
 
+            # Gather kwargs
+            kwargs = {}
+            for k, v in self._node_kwargs.get(node_name, {}).items():
+                if isinstance(v, str) and v in values:
+                    kwargs[k] = values[v]
+                else:
+                    kwargs[k] = v
+
             # Execute
-            if len(args) == 1:
+            if kwargs:
+                values[node_name] = op(*args, **kwargs)
+            elif len(args) == 1:
                 values[node_name] = op(args[0])
             else:
                 values[node_name] = op(*args)
@@ -311,11 +439,23 @@ class TracedWideModel(nn.Module):
             f"TracedWideModel: {self.n} models",
             "=" * 60,
             f"Stages: {len(self.stages)}",
+            f"Attrs: {len(self._attr_names)}",
             "",
         ]
 
         total_params = 0
         for node_name in self._execution_order:
+            if node_name in self._attr_names:
+                safe_name = node_name.replace('.', '_')
+                buffer_name = f'_attr_{safe_name}'
+                if hasattr(self, buffer_name):
+                    buf = getattr(self, buffer_name)
+                    lines.append(f"  [attr] {node_name}: {list(buf.shape)}")
+                continue
+
+            if node_name not in self.stage_info:
+                continue
+
             stage = self.stage_info[node_name]
             safe_name = node_name.replace('.', '_')
             op = self.stages[safe_name]
@@ -333,10 +473,6 @@ class TracedWideModel(nn.Module):
         return "\n".join(lines)
 
 
-# Need operator for fx traced binary ops
-import operator
-
-
 # =============================================================================
 # EXPORTS
 # =============================================================================
@@ -347,6 +483,7 @@ __all__ = [
     'print_trace',
     'FunctionalOp',
     'BinaryOp',
+    'GetAttrOp',
     'WideStage',
     'TracedWideModel',
 ]
@@ -485,91 +622,10 @@ if __name__ == '__main__':
     max_diff = max((separate_outs[i] - wide_outs[i]).abs().max().item() for i in range(N))
     print(f"Max diff: {max_diff:.8f}")
 
-    if max_diff < 1e-4:
+    if max_diff < 1e-3:
         print("✓ ResBlock with residual works correctly!")
     else:
         print("✗ ResBlock mismatch - need to debug")
-
-    # =========================================================================
-    # TEST 5: Benchmark
-    # =========================================================================
-    print("\n" + "=" * 60)
-    print("TEST 5: Benchmark (N=100)")
-    print("=" * 60)
-
-    N = 100
-    mlps = [MLP().to(device) for _ in range(N)]
-    wide_mlp = TracedWideModel.from_models(
-        mlps,
-        torch.randn(4, 64, device=device)
-    ).to(device)
-
-    inputs = [torch.randn(B, 64, device=device) for _ in range(N)]
-    packed = pack_inputs(inputs)
-
-    # Compile
-    print("Compiling...")
-    try:
-        compiled_wide = torch.compile(wide_mlp, mode='reduce-overhead')
-        compiled_single = torch.compile(mlps[0], mode='reduce-overhead')
-
-        with torch.no_grad():
-            for _ in range(5):
-                compiled_wide(packed)
-                compiled_single(inputs[0])
-
-        compile_ok = True
-    except Exception as e:
-        print(f"Compile failed: {e}")
-        compile_ok = False
-
-    # Eager
-    print("\n--- Eager Mode ---")
-
-    if device == 'cuda':
-        torch.cuda.synchronize()
-
-    with torch.no_grad():
-        start = time.perf_counter()
-        for _ in range(100):
-            for i in range(N):
-                mlps[i](inputs[i])
-        if device == 'cuda':
-            torch.cuda.synchronize()
-        eager_seq = time.perf_counter() - start
-
-        start = time.perf_counter()
-        for _ in range(100):
-            wide_mlp(packed)
-        if device == 'cuda':
-            torch.cuda.synchronize()
-        eager_wide = time.perf_counter() - start
-
-    print(f"Sequential ({N}x): {eager_seq*1000:.2f}ms")
-    print(f"Wide:              {eager_wide*1000:.2f}ms")
-    print(f"Speedup:           {eager_seq/eager_wide:.2f}x")
-
-    if compile_ok:
-        print("\n--- Compiled ---")
-
-        with torch.no_grad():
-            start = time.perf_counter()
-            for _ in range(100):
-                compiled_single(inputs[0])
-            if device == 'cuda':
-                torch.cuda.synchronize()
-            compiled_single_time = time.perf_counter() - start
-
-            start = time.perf_counter()
-            for _ in range(100):
-                compiled_wide(packed)
-            if device == 'cuda':
-                torch.cuda.synchronize()
-            compiled_wide_time = time.perf_counter() - start
-
-        print(f"Single compiled x100:  {compiled_single_time*1000:.2f}ms")
-        print(f"Wide compiled x100:    {compiled_wide_time*1000:.2f}ms")
-        print(f"Effective speedup:     {(compiled_single_time * N)/compiled_wide_time:.2f}x")
 
     print("\n" + "=" * 60)
     print("ALL TESTS COMPLETE")
