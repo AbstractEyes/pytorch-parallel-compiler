@@ -9,10 +9,12 @@ Instead of running N models sequentially:
 outputs = [model(x) for model in models]  # N kernel launches
 ```
 
-WideCompiler fuses them into one:
+Fuse them into one:
 ```python
-wide_model = TracedWideModel.from_models(models, sample)
-output = wide_model(packed_input)  # 1 kernel launch
+import wide_compiler
+
+wide = wide_compiler.compile(models, sample_input)
+output = wide(packed_input)  # 1 kernel launch
 ```
 
 **Speedups:** 2-5x eager, **20-40x compiled** (CUDA)
@@ -20,6 +22,8 @@ output = wide_model(packed_input)  # 1 kernel launch
 ## Installation
 
 ```bash
+git clone https://github.com/AbstractEyes/pytorch-parallel-compiler
+cd pytorch-parallel-compiler
 pip install -e .
 ```
 
@@ -27,9 +31,9 @@ pip install -e .
 
 ```python
 import torch
-from wide_compiler import TracedWideModel, pack_inputs, unpack_outputs
+import wide_compiler
 
-# Your model
+# Define your model
 class MLP(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -39,26 +43,102 @@ class MLP(torch.nn.Module):
     def forward(self, x):
         return self.fc2(torch.nn.functional.relu(self.fc1(x)))
 
-# Create N identical models (different weights)
-N = 100
-models = [MLP().cuda() for _ in range(N)]
-
-# Build wide model (requires sample input for FX tracing)
+# Create N models
+models = [MLP().cuda() for _ in range(100)]
 sample = torch.randn(1, 64).cuda()
-wide_model = TracedWideModel.from_models(models, sample).cuda()
 
-# Prepare inputs
-inputs = [torch.randn(32, 64).cuda() for _ in range(N)]
-packed = pack_inputs(inputs)  # [B, N*C] layout
+# Compile to Wide model
+wide = wide_compiler.compile(models, sample)
 
-# Run
-output = wide_model(packed)
+# Pack inputs and run
+inputs = [torch.randn(32, 64).cuda() for _ in range(100)]
+packed = wide_compiler.pack(inputs)
+output = wide(packed)
 
-# Unpack if needed
-outputs = unpack_outputs(output, N)  # List of N tensors
+# Unpack outputs
+outputs = wide_compiler.unpack(output, n=100)
+```
 
-# Compile for max speed
-compiled = torch.compile(wide_model, mode='reduce-overhead')
+## API
+
+### Main Entry Point
+
+```python
+import wide_compiler
+
+# From list of models
+wide = wide_compiler.compile(models, sample_input)
+
+# From single model (creates N copies with different weights)
+wide = wide_compiler.compile(MyModel(), sample_input, n=100)
+
+# With torch.compile enabled
+wide = wide_compiler.compile(models, sample_input, compile_model=True)
+
+# With validation
+wide = wide_compiler.compile(models, sample_input, validate=True)
+
+# With config
+config = wide_compiler.WideConfig.fast()
+wide = wide_compiler.compile(models, sample_input, config=config)
+```
+
+### Builder Pattern
+
+```python
+wide = (wide_compiler.WideBuilder(models)
+    .with_sample(sample_input)
+    .validate()
+    .compile(mode='reduce-overhead')
+    .build())
+```
+
+### Pack / Unpack
+
+```python
+# Pack N inputs: List[Tensor] → Tensor [B, N*C, ...]
+packed = wide_compiler.pack(inputs)
+
+# Unpack output: Tensor [B, N*C, ...] → List[Tensor]
+outputs = wide_compiler.unpack(output, n=100)
+```
+
+### Configuration
+
+```python
+from wide_compiler import WideConfig
+
+# Presets
+config = WideConfig.default()   # Basic, no compile
+config = WideConfig.fast()      # Compiled, no validation
+config = WideConfig.debug()     # Verbose, strict
+config = WideConfig.safe()      # With validation
+
+# Custom
+config = WideConfig(
+    compile=True,
+    compile_mode='reduce-overhead',  # 'default', 'max-autotune'
+    validate=True,
+    validate_rtol=1e-3,
+    debug=True,
+)
+```
+
+### Custom Primitives
+
+```python
+import wide_compiler
+
+@wide_compiler.register('MyCustomLayer')
+class WideMyCustomLayer(torch.nn.Module):
+    @classmethod
+    def from_modules(cls, modules):
+        # Build wide version from N modules
+        ...
+
+# Check registered primitives
+print(wide_compiler.list_registered())
+# ['Linear', 'Conv2d', 'Conv1d', 'BatchNorm2d', 'BatchNorm1d', 'LayerNorm', 'Embedding', 'MyCustomLayer']
 ```
 
 ## CLI
@@ -67,27 +147,38 @@ compiled = torch.compile(wide_model, mode='reduce-overhead')
 # Run correctness tests
 python -m wide_compiler test
 
-# Show FX trace for a model
-python -m wide_compiler trace --model resblock
-
 # Benchmark speedup
 python -m wide_compiler benchmark --model mlp --n 100 --compile
+
+# Show FX trace
+python -m wide_compiler trace --model resblock
 
 # Show info
 python -m wide_compiler info
 ```
 
-Available test models: `mlp`, `deep_mlp`, `resblock`, `convnet`
+**Available models:** `mlp`, `deep_mlp`, `resblock`, `convnet`
 
-## How it works
+**Benchmark options:**
+```bash
+python -m wide_compiler benchmark \
+    --model mlp \
+    --n 100 \
+    --batch 32 \
+    --iters 100 \
+    --compile \
+    --cpu  # Force CPU
+```
 
-1. **FX Tracing** - Uses `torch.fx.symbolic_trace` to capture the computation graph
-2. **Wide Primitives** - Replaces each layer with grouped equivalents:
+## How it Works
+
+1. **FX Tracing** - `torch.fx.symbolic_trace` captures the computation graph
+2. **Wide Primitives** - Each layer replaced with grouped equivalent:
    - `Linear` → `Conv1d` with `groups=N`
-   - `Conv2d` → `Conv2d` with `groups=N`
+   - `Conv2d` → `Conv2d` with `groups=N`  
    - `BatchNorm` → `BatchNorm` over `N*C` channels
-3. **Graph Execution** - Replays ops in traced order, respecting dataflow (handles residuals)
-4. **Compile-Friendly** - All ops are native PyTorch, no custom CUDA kernels
+3. **Graph Execution** - Replays ops respecting dataflow (handles residuals)
+4. **Compile-Friendly** - All native PyTorch ops, no custom kernels
 
 ## Supported Layers
 
@@ -103,33 +194,56 @@ Available test models: `mlp`, `deep_mlp`, `resblock`, `convnet`
 | `F.relu`, `F.gelu`, etc. | Passthrough | Elementwise ops work directly |
 | `+`, `-`, `*`, `/`, `@` | `BinaryOp` | Captured via FX |
 
-## Limitations
-
-- **Identical architecture required** - All N models must have the same structure
-- **Static shapes** - FX tracing requires fixed tensor shapes
-- **No dynamic control flow** - `if`/`for` based on tensor values won't trace
-- **Attention not yet supported** - MultiheadAttention needs custom Wide version
-
 ## Benchmarks
 
-MLP (N=100, batch=32, CUDA):
+**MLP** (N=100, batch=32, CUDA):
 ```
 Eager:    2-3x speedup
 Compiled: 35-40x speedup
 ```
 
-ResBlock (N=20, batch=8, CUDA):
+**ResBlock** (N=20, batch=8, CUDA):
 ```
 Eager:    ~5x speedup  
 Compiled: ~10x speedup
 ```
 
+## Limitations
+
+- **Identical architecture required** - All N models must have same structure
+- **Static shapes** - FX tracing requires fixed tensor shapes
+- **No dynamic control flow** - `if`/`for` based on tensor values won't trace
+- **Attention not yet supported** - MultiheadAttention needs custom Wide version
+
 ## Use Cases
 
 - **Ensemble models** - Run N ensemble members in parallel
-- **Hyperparameter search** - Evaluate N configurations simultaneously  
+- **Hyperparameter search** - Evaluate N configurations simultaneously
 - **Population-based training** - Evolve N agents together
 - **Monte Carlo dropout** - N stochastic forward passes
+
+## Project Structure
+
+```
+wide_compiler/
+├── __init__.py          # Package exports
+├── __main__.py          # CLI entry point
+├── api.py               # Main API: compile(), WideBuilder
+├── cli.py               # CLI commands: test, benchmark, trace, info
+└── core/
+    ├── config.py        # WideConfig
+    ├── registry.py      # Primitive registration
+    ├── traced_wide.py   # FX tracing + TracedWideModel
+    ├── wide_model.py    # Tree traversal, pack/unpack
+    └── primitives/
+        ├── wide_linear.py
+        ├── wide_conv1d.py
+        ├── wide_conv2d.py
+        ├── wide_batchnorm_1d.py
+        ├── wide_batchnorm_2d.py
+        ├── wide_layernorm.py
+        └── wide_embedding.py
+```
 
 ## License
 

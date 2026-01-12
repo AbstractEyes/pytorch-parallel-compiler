@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wide_compiler"
-version = "0.0.2"
+version = "0.2.0"
 description = "pytorch compilation for parallel wide models."
 readme = "README.md"
 requires-python = ">=3.9"

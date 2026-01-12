@@ -1,65 +1,146 @@
 """
-WideCompiler - Compile-friendly batched model execution.
+WideCompiler.core
 
-Fuse N identical models into a single Wide model for massive speedups.
-
-Usage:
-    from wide_compiler import TracedWideModel, pack_inputs, unpack_outputs
-
-    # Create N identical models
-    models = [MyModel() for _ in range(100)]
-
-    # Build wide model (requires sample input for tracing)
-    sample = torch.randn(1, 64)
-    wide_model = TracedWideModel.from_models(models, sample)
-
-    # Pack inputs: list of [B, C, ...] -> [B, N*C, ...]
-    inputs = [torch.randn(32, 64) for _ in range(100)]
-    packed = pack_inputs(inputs)
-
-    # Run wide model
-    wide_out = wide_model(packed)
-
-    # Unpack outputs: [B, N*C, ...] -> list of [B, C, ...]
-    outputs = unpack_outputs(wide_out, n=100)
+Core components for Wide model compilation.
 
 Copyright 2025 AbstractPhil
-Apache License 2.0
+Apache 2.0 License
 """
 
-from .primitives import (
-    # Wide primitives
-    WideLinear,
-    WideConv2d,
-    WideConv1d,
-    WideBatchNorm2d,
-    WideBatchNorm1d,
-    WideLayerNorm,
-    WideEmbedding,
-)
+try:
+    from .config import (
+        WideConfig,
+        get_default_config,
+        set_default_config,
+    )
+except ImportError:
+    from wide_compiler.core.config import (
+        WideConfig,
+        get_default_config,
+        set_default_config,
+    )
 
-from .wide_model import (
-    pack_inputs,
-    unpack_outputs
-)
+try:
+    from .registry import (
+        WideRegistry,
+        get_registry,
+        register,
+        unregister,
+        get_builder,
+        build_wide,
+        list_registered,
+    )
+except ImportError:
+    from wide_compiler.core.registry import (
+        WideRegistry,
+        get_registry,
+        register,
+        unregister,
+        get_builder,
+        build_wide,
+        list_registered,
+    )
 
-from .traced_wide import (
-    # Main API
-    TracedWideModel,
+try:
+    from .traced_wide import (
+        TracedWideModel,
+        TraceNode,
+        WideStage,
+        FunctionalOp,
+        BinaryOp,
+        analyze_trace,
+        print_trace,
+    )
+except ImportError:
+    from wide_compiler.core.traced_wide import (
+        TracedWideModel,
+        TraceNode,
+        WideStage,
+        FunctionalOp,
+        BinaryOp,
+        analyze_trace,
+        print_trace,
+    )
 
-    # Utilities
-    print_trace,
-    FunctionalOp,
-    BinaryOp,
-)
+try:
+    from .wide_model import (
+        WideModel,
+        TreeNode,
+        traverse,
+        get_leaves,
+        make_wide,
+        align_modules,
+        pack_inputs,
+        unpack_outputs,
+    )
+except ImportError:
+    from wide_compiler.core.wide_model import (
+        WideModel,
+        TreeNode,
+        traverse,
+        get_leaves,
+        make_wide,
+        align_modules,
+        pack_inputs,
+        unpack_outputs,
+    )
+
+try:
+    from .primitives import (
+        WideLinear,
+        WideConv2d,
+        WideConv1d,
+        WideBatchNorm2d,
+        WideBatchNorm1d,
+        WideLayerNorm,
+        WideEmbedding,
+    )
+except ImportError:
+    from wide_compiler.core.primitives import (
+        WideLinear,
+        WideConv2d,
+        WideConv1d,
+        WideBatchNorm2d,
+        WideBatchNorm1d,
+        WideLayerNorm,
+        WideEmbedding,
+    )
 
 __all__ = [
-    # Main API
+    # Config
+    'WideConfig',
+    'get_default_config',
+    'set_default_config',
+
+    # Registry
+    'WideRegistry',
+    'get_registry',
+    'register',
+    'unregister',
+    'get_builder',
+    'build_wide',
+    'list_registered',
+
+    # Traced Wide
     'TracedWideModel',
+    'TraceNode',
+    'WideStage',
+    'FunctionalOp',
+    'BinaryOp',
+    'analyze_trace',
+    'print_trace',
+
+    # Wide Model
+    'WideModel',
+    'TreeNode',
+    'traverse',
+    'get_leaves',
+    'make_wide',
+    'align_modules',
     'pack_inputs',
     'unpack_outputs',
 
-    # Wide primitives (for manual construction)
+    # Primitives
     'WideLinear',
     'WideConv2d',
     'WideConv1d',
@@ -67,9 +148,4 @@ __all__ = [
     'WideBatchNorm1d',
     'WideLayerNorm',
     'WideEmbedding',
-
-    # Utilities
-    'print_trace',
-    'FunctionalOp',
-    'BinaryOp',
 ]
