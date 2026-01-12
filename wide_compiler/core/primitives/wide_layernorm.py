@@ -2,6 +2,7 @@ from typing import List
 
 import torch
 from torch import nn, Tensor
+import torch.nn.functional as F
 
 
 class WideLayerNorm(nn.Module):

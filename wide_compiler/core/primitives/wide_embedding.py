@@ -2,7 +2,7 @@ from typing import List
 
 import torch
 from torch import nn, Tensor
-
+import torch.nn.functional as F
 
 class WideEmbedding(nn.Module):
     """N parallel Embedding tables."""
@@ -23,7 +23,7 @@ class WideEmbedding(nn.Module):
         B, T = x.shape
 
         # Gather from each table: [N, B, T, D]
-        out = F.embedding(x, self.weight[0])  # [B, T, D]
+        out = nn.embedding(x, self.weight[0])  # [B, T, D]
         outs = [F.embedding(x, self.weight[i]) for i in range(self.n)]
 
         # Stack and reshape: [B, T, N*D]
