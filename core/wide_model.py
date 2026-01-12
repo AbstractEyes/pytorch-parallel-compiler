@@ -5,7 +5,7 @@ Tracing-based Wide model construction using torch.fx.
 Trace forward pass → capture all ops → build Wide model.
 
 Copyright 2025 AbstractPhil
-MIT License
+Apache 2.0 License
 """
 
 from __future__ import annotations

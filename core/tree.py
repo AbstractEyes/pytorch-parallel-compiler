@@ -6,7 +6,7 @@ N models as single wide model with grouped ops.
 Input layout: [B, N*C, ...] throughout - no permutes in forward.
 
 Copyright 2025 AbstractPhil
-MIT License
+Apache 2.0 License
 """
 
 from __future__ import annotations
