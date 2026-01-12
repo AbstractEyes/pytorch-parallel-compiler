@@ -19,15 +19,25 @@ import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
 
-from primitives import (
-    WideLinear,
-    WideConv2d,
-    WideConv1d,
-    WideBatchNorm2d,
-    WideBatchNorm1d,
-    WideLayerNorm,
-    WideEmbedding,
-)
+try:
+    from .primitives import (
+        WideLinear,
+        WideConv2d,
+        WideConv1d,
+        WideBatchNorm2d,
+        WideBatchNorm1d,
+        WideLayerNorm,
+        WideEmbedding,
+    )
+except ImportError:
+    # For direct script execution
+    from wide_compiler.core.primitives.wide_linear import WideLinear
+    from wide_compiler.core.primitives.wide_conv2d import WideConv2d
+    from wide_compiler.core.primitives.wide_conv1d import WideConv1d
+    from wide_compiler.core.primitives.wide_batchnorm_2d import WideBatchNorm2d
+    from wide_compiler.core.primitives.wide_batchnorm_1d import WideBatchNorm1d
+    from wide_compiler.core.primitives.wide_layernorm import WideLayerNorm
+    from wide_compiler.core.primitives.wide_embedding import WideEmbedding
 
 
 # =============================================================================

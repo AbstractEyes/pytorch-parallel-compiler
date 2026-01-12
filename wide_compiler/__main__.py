@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.fx as fx
 
-from wide_compiler import (
+from .core import (
     TracedWideModel,
     pack_inputs,
     unpack_outputs,
