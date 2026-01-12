@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pytorch-parallel-compiler"
+name = "wide_compiler"
 version = "0.0.1"
 description = "pytorch compilation for parallel wide models."
 readme = "README.md"
@@ -33,7 +33,7 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://huggingface.co/AbstractPowered"
+Homepage = "https://huggingface.co/AbstractPhil"
 Repository = "https://github.com/AbstractEyes/pytorch-parallel-compiler"
 Issues = "https://github.com/AbstractEyes/pytorch-parallel-compiler/issues"
 
@@ -42,4 +42,4 @@ wide-compiler = "wide_compiler.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["wide_compiler*", "wide_compiler.core*"]
+include = ["wide_compiler*"]

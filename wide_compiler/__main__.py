@@ -20,20 +20,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.fx as fx
 
-try:
-    from .core import (
-        TracedWideModel,
-        pack_inputs,
-        unpack_outputs,
-        print_trace,
-    )
-except ImportError:
-    from wide_compiler.core import (
-        TracedWideModel,
-        pack_inputs,
-        unpack_outputs,
-        print_trace,
-    )
+from wide_compiler import (
+    TracedWideModel,
+    pack_inputs,
+    unpack_outputs,
+    print_trace,
+)
 
 
 # =============================================================================
