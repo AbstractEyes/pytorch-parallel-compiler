@@ -106,6 +106,27 @@ except ImportError:
         WideEmbedding,
     )
 
+try:
+    from .traced_benchmark import (
+        benchmark_model,
+        benchmark_models,
+        profile_with_torch_profiler,
+        BenchmarkResult,
+        TimingResult,
+        StageProfile,
+        MemoryResult,
+    )
+except ImportError:
+    from wide_compiler.core.traced_benchmark import (
+        benchmark_model,
+        benchmark_models,
+        profile_with_torch_profiler,
+        BenchmarkResult,
+        TimingResult,
+        StageProfile,
+        MemoryResult,
+    )
+
 __all__ = [
     # Config
     'WideConfig',
@@ -148,4 +169,13 @@ __all__ = [
     'WideBatchNorm1d',
     'WideLayerNorm',
     'WideEmbedding',
+
+    # Benchmark
+    'benchmark_model',
+    'benchmark_models',
+    'profile_with_torch_profiler',
+    'BenchmarkResult',
+    'TimingResult',
+    'StageProfile',
+    'MemoryResult',
 ]
