@@ -13,7 +13,7 @@ Expected tolerances:
 - NCHW grouped vs sequential: ~1e-6 relative error (IEEE fp32)
 - NHWC grouped vs sequential: 0.0 error (most accurate)
 - With TF32: ~1e-4 relative error
-- Einsum vs sequential linear: ~1e-5 relative error
+- Einsum vs sequential linear: ~1e-6 relative error (fp32)
 
 To disable TF32 globally at script start:
     torch.backends.cudnn.allow_tf32 = False
@@ -23,12 +23,12 @@ WideConv2d Strategies (A100 benchmarks):
 - 'grouped': NCHW format (FASTEST: 2-4x speedup, ~1e-6 error)
 - 'channels_last': NHWC format (most accurate: 0.0 error, but slower)
 - 'sequential': N separate ops (exact, slowest)
-- 'auto': Selects grouped NCHW
+- 'auto': Selects grouped for N >= 8 (ResNet18: 2.49x speedup at N=10)
 
-WideLinear Strategies:
-- 'einsum': Batched matmul (6x+ speedup, ~1e-5 error)
+WideLinear Strategies (A100 benchmarks):
+- 'einsum': Batched matmul (3-13x speedup, ~1e-6 error in fp32)
 - 'sequential': N separate ops (exact, slower)
-- 'auto': Selects einsum for N>=3
+- 'auto': Selects einsum for N>=8 or low B
 
 Copyright 2025 AbstractPhil
 MIT License

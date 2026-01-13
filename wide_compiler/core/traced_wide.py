@@ -648,7 +648,7 @@ if __name__ == '__main__':
     total_time = sum(avg_timings.values())
     for node_name, t in sorted(avg_timings.items(), key=lambda x: -x[1]):
         safe_name = node_name.replace('.', '_')
-        op = wide_mlp.stages.get(safe_name)
+        op = wide_mlp.stages[safe_name] if safe_name in wide_mlp.stages else None
         op_type = type(op).__name__ if op else "?"
         pct = (t / total_time) * 100 if total_time > 0 else 0
         print(f"{node_name:<20} {op_type:<25} {t:<12.4f} {pct:<8.1f}%")
@@ -762,7 +762,7 @@ if __name__ == '__main__':
     total_time = sum(avg_timings.values())
     for node_name, t in sorted(avg_timings.items(), key=lambda x: -x[1]):
         safe_name = node_name.replace('.', '_')
-        op = wide_res.stages.get(safe_name)
+        op = wide_res.stages[safe_name] if safe_name in wide_res.stages else None
         op_type = type(op).__name__ if op else "?"
         pct = (t / total_time) * 100 if total_time > 0 else 0
         print(f"{node_name:<20} {op_type:<25} {t:<12.4f} {pct:<8.1f}%")
@@ -919,6 +919,251 @@ if __name__ == '__main__':
 
     except Exception as e:
         print(f"Graph analysis failed: {e}")
+
+    # =========================================================================
+    # TEST 8: Real ResNet18
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("TEST 8: ResNet18 (Full Model)")
+    print("=" * 70)
+
+    try:
+        from torchvision.models import resnet18
+
+        N, B = 10, 8
+        print(f"\nConfig: N={N}, B={B}, 3×224×224 input")
+
+        # Create N ResNet18 models
+        resnets = [resnet18(weights=None).to(device).eval() for _ in range(N)]
+        sample = torch.randn(B, 3, 224, 224, device=device)
+
+        print("Tracing ResNet18...")
+        try:
+            wide_resnet = TracedWideModel.from_models(resnets, sample).to(device).eval()
+            print("✓ Tracing successful")
+            print(f"\nModel summary (first 20 stages):")
+
+            # Print abbreviated summary
+            lines = wide_resnet.summary().split('\n')
+            for line in lines[:25]:
+                print(line)
+            if len(lines) > 25:
+                print(f"  ... ({len(wide_resnet.stages)} total stages)")
+
+        except Exception as e:
+            print(f"✗ Tracing failed: {e}")
+            import traceback
+            traceback.print_exc()
+            wide_resnet = None
+
+        if wide_resnet is not None:
+            # Correctness check
+            inputs = [torch.randn(B, 3, 224, 224, device=device) for _ in range(N)]
+            packed = pack_inputs(inputs)
+
+            print("\nVerifying correctness...")
+            with torch.inference_mode():
+                ref_outs = [resnets[i](inputs[i]) for i in range(N)]
+                wide_out = wide_resnet(packed)
+                wide_outs = unpack_outputs(wide_out, N)
+
+            max_diff = max((ref_outs[i] - wide_outs[i]).abs().max().item() for i in range(N))
+            print(f"Max diff: {max_diff:.2e} {'✓' if max_diff < 1e-2 else '✗'}")
+
+            # Compile baseline ResNets
+            print("\nCompiling baseline ResNet18s...")
+            torch._dynamo.reset()
+            resnets_compiled = [torch.compile(r, mode='default') for r in resnets]
+
+            # Warmup compiled baselines
+            with torch.inference_mode():
+                for _ in range(3):
+                    _ = [resnets_compiled[i](inputs[i]) for i in range(N)]
+
+            # Compile Wide ResNet
+            print("Compiling Wide ResNet18...")
+            torch._dynamo.reset()
+            try:
+                wide_resnet_compiled = torch.compile(wide_resnet, mode='default')
+                with torch.inference_mode():
+                    for _ in range(5):
+                        _ = wide_resnet_compiled(packed)
+                wide_compile_ok = True
+            except Exception as e:
+                print(f"Wide compile failed: {e}")
+                wide_compile_ok = False
+
+            # Benchmark all variants
+            print("\nBenchmarking...")
+            with torch.inference_mode():
+                # Warmup
+                for _ in range(5):
+                    _ = wide_resnet(packed)
+                    _ = [resnets[i](inputs[i]) for i in range(N)]
+                    _ = [resnets_compiled[i](inputs[i]) for i in range(N)]
+
+                t_baseline_eager = benchmark(
+                    lambda: [resnets[i](inputs[i]) for i in range(N)],
+                    num_iters=20, warmup=5
+                )
+                t_baseline_compiled = benchmark(
+                    lambda: [resnets_compiled[i](inputs[i]) for i in range(N)],
+                    num_iters=20, warmup=5
+                )
+                t_wide_eager = benchmark(
+                    lambda: wide_resnet(packed),
+                    num_iters=20, warmup=5
+                )
+                if wide_compile_ok:
+                    t_wide_compiled = benchmark(
+                        lambda: wide_resnet_compiled(packed),
+                        num_iters=20, warmup=5
+                    )
+                else:
+                    t_wide_compiled = t_wide_eager
+
+            print(f"\n{'Method':<35} {'Time (ms)':<15} {'vs Eager':<12} {'vs Compiled'}")
+            print("-" * 75)
+            print(f"{'N×ResNet18 (eager)':<35} {t_baseline_eager*1000:<15.2f} {'1.00x':<12} {'-'}")
+            print(f"{'N×ResNet18 (compiled)':<35} {t_baseline_compiled*1000:<15.2f} {t_baseline_eager/t_baseline_compiled:<12.2f}x {'1.00x'}")
+            print(f"{'Wide ResNet18 (eager)':<35} {t_wide_eager*1000:<15.2f} {t_baseline_eager/t_wide_eager:<12.2f}x {t_baseline_compiled/t_wide_eager:.2f}x")
+            if wide_compile_ok:
+                print(f"{'Wide ResNet18 (compiled)':<35} {t_wide_compiled*1000:<15.2f} {t_baseline_eager/t_wide_compiled:<12.2f}x {t_baseline_compiled/t_wide_compiled:.2f}x")
+
+            # Verify strategy selection
+            print("\nStrategy check (should be GROUPED now):")
+            from wide_compiler.core.primitives import WideConv2d, ConvStrategy
+            conv_strategies = {}
+            for name, stage in wide_resnet.stages.items():
+                if isinstance(stage, WideConv2d):
+                    conv_strategies[name] = stage.strategy
+
+            # Show first few strategies
+            grouped_count = sum(1 for s in conv_strategies.values() if s == ConvStrategy.GROUPED)
+            seq_count = sum(1 for s in conv_strategies.values() if s == ConvStrategy.SEQUENTIAL)
+            print(f"  GROUPED: {grouped_count}, SEQUENTIAL: {seq_count}")
+            if seq_count > 0:
+                print("  WARNING: Some convs using SEQUENTIAL - check thresholds!")
+                for name, strat in list(conv_strategies.items())[:3]:
+                    print(f"    {name}: {strat.value}")
+
+            # Per-stage breakdown (top 10)
+            print("\nTop 10 slowest stages:")
+            print(f"{'Stage':<25} {'Op Type':<20} {'Time (ms)':<12}")
+            print("-" * 60)
+
+            with torch.inference_mode():
+                for _ in range(3):
+                    _ = wide_resnet(packed)
+                _, timings = profiled_forward(wide_resnet, packed)
+
+            sorted_timings = sorted(timings.items(), key=lambda x: -x[1])[:10]
+            for node_name, t in sorted_timings:
+                safe_name = node_name.replace('.', '_')
+                op = wide_resnet.stages[safe_name] if safe_name in wide_resnet.stages else None
+                op_type = type(op).__name__ if op else "?"
+                print(f"{node_name:<25} {op_type:<20} {t:<12.4f}")
+
+            # Graph break check
+            print("\nGraph break analysis:")
+            torch._dynamo.reset()
+            try:
+                explanation = torch._dynamo.explain(wide_resnet)(packed)
+                print(f"  Graph breaks: {explanation.graph_break_count}")
+                print(f"  Graphs: {explanation.graph_count}")
+                if explanation.graph_break_count > 0:
+                    print("  Break reasons:")
+                    for reason in explanation.break_reasons[:3]:
+                        print(f"    - {reason}")
+            except Exception as e:
+                print(f"  Analysis failed: {e}")
+
+            # torch.profiler detailed breakdown
+            print("\n" + "-" * 70)
+            print("torch.profiler Analysis (Wide ResNet18)")
+            print("-" * 70)
+
+            try:
+                from torch.profiler import profile, ProfilerActivity, record_function
+
+                activities = [ProfilerActivity.CPU]
+                if device == 'cuda':
+                    activities.append(ProfilerActivity.CUDA)
+
+                # Profile Wide ResNet18
+                with torch.inference_mode():
+                    for _ in range(5):
+                        _ = wide_resnet(packed)
+
+                with profile(
+                    activities=activities,
+                    record_shapes=True,
+                    profile_memory=True,
+                ) as prof_wide:
+                    with torch.inference_mode():
+                        for _ in range(5):
+                            with record_function("wide_resnet_forward"):
+                                _ = wide_resnet(packed)
+
+                sort_key = "cuda_time_total" if device == 'cuda' else "cpu_time_total"
+                print("\nWide ResNet18 profile (top 20 ops):")
+                print(prof_wide.key_averages().table(sort_by=sort_key, row_limit=20))
+
+                # Profile baseline for comparison
+                print("\nBaseline N×ResNet18 profile (top 20 ops):")
+
+                with torch.inference_mode():
+                    for _ in range(5):
+                        _ = [resnets[i](inputs[i]) for i in range(N)]
+
+                with profile(
+                    activities=activities,
+                    record_shapes=True,
+                    profile_memory=True,
+                ) as prof_baseline:
+                    with torch.inference_mode():
+                        for _ in range(5):
+                            with record_function("baseline_forward"):
+                                _ = [resnets[i](inputs[i]) for i in range(N)]
+
+                print(prof_baseline.key_averages().table(sort_by=sort_key, row_limit=20))
+
+                # Summary comparison - just rely on the profiler output tables above
+
+            except Exception as e:
+                print(f"torch.profiler failed: {e}")
+
+            # Memory profiling for ResNet18
+            if device == 'cuda':
+                print("\n" + "-" * 70)
+                print("Memory Analysis (ResNet18)")
+                print("-" * 70)
+
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.empty_cache()
+
+                # Wide forward memory
+                with torch.inference_mode():
+                    torch.cuda.reset_peak_memory_stats()
+                    _ = wide_resnet(packed)
+                    mem_wide = torch.cuda.max_memory_allocated() / 1024**2
+
+                # Baseline forward memory
+                with torch.inference_mode():
+                    torch.cuda.reset_peak_memory_stats()
+                    _ = [resnets[i](inputs[i]) for i in range(N)]
+                    mem_baseline = torch.cuda.max_memory_allocated() / 1024**2
+
+                print(f"\n{'Metric':<35} {'Memory (MB)':<15}")
+                print("-" * 55)
+                print(f"{'Wide ResNet18 forward peak':<35} {mem_wide:<15.1f}")
+                print(f"{'N×ResNet18 forward peak':<35} {mem_baseline:<15.1f}")
+                savings = mem_baseline - mem_wide
+                pct = (savings / mem_baseline * 100) if mem_baseline > 0 else 0
+                print(f"{'Memory difference':<35} {savings:<15.1f} ({pct:+.1f}%)")
+
+    except ImportError:
+        print("torchvision not available - skipping ResNet18 test")
 
     # =========================================================================
     # SUMMARY
