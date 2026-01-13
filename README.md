@@ -206,28 +206,50 @@ python -m wide_compiler benchmark \
 
 ## Benchmarks
 
-Speedup depends on model type, N, and whether baseline uses `torch.compile`:
+Speedup depends on model type, N, batch size, and compilation mode.
 
-**MLP** (N=100, batch=32, RTX 4090):
-```
-Eager:           40x speedup (1013ms → 25ms)
-```
+### Benchmark Table
 
-**ResBlock** (N=50, batch=8, RTX 4090):
-```
-Eager:           3.5x speedup (1351ms → 383ms)
-```
+| Model | N | Batch | GPU | Mode | Baseline | Wide | Speedup |
+|-------|---|-------|-----|------|----------|------|---------|
+| MLP (2 layers, d=64) | 100 | 32 | RTX 4090 | eager | 1013ms | 25ms | **40.2x** |
+| MLP (2 layers, d=256) | 20 | 32 | A100 | eager | 1.74ms | 0.29ms | **6.0x** |
+| MLP (2 layers, d=256) | 20 | 32 | A100 | compile default | 0.89ms | 0.28ms | **3.2x** |
+| Deep MLP (8 layers, d=512) | 20 | 32 | A100 | eager | 7.17ms | 1.15ms | **6.2x** |
+| Deep MLP (8 layers, d=512) | 20 | 32 | A100 | compile default | 3.21ms | 1.08ms | **3.0x** |
+| ResBlock (c=64, 32×32) | 50 | 8 | RTX 4090 | eager | 1351ms | 383ms | **3.5x** |
+| ResBlock (c=64, 32×32) | 20 | 8 | A100 | eager | 5.14ms | 1.05ms | **4.9x** |
+| ResBlock (c=64, 32×32) | 20 | 8 | A100 | compile default | 2.89ms | 0.98ms | **2.9x** |
+| ResNet18 (224×224) | 10 | 8 | A100 | eager | 25.4ms | 10.9ms | **2.3x** |
+| ResNet18 (224×224) | 10 | 8 | A100 | compile default | 17.4ms | 9.1ms | **1.9x** |
+| ResNet18 (224×224) | 10 | 8 | A100 | compile reduce-overhead | 9.9ms | 8.7ms | **1.1x** |
 
-**ResNet18** (N=10, batch=8, A100):
-```
-Eager:           2.3x speedup (25ms → 11ms)
-vs Compiled:     1.9x speedup (17ms → 9ms)
-```
+### Key Observations
+
+**By model type:**
+- **MLP**: Best speedups (6-40x). Many small matmuls = massive kernel launch overhead.
+- **Deep MLP**: Still great (3-6x). More ops, each relatively small.
+- **ResBlock**: Good (3-5x). Conv-heavy but still benefits.
+- **ResNet18**: Moderate (1.1-2.3x). Large convs are already GPU-efficient.
+
+**By N:**
+- Higher N = more kernel launches eliminated = bigger speedup
+- N=100 MLPs: 40x eager
+- N=20 MLPs: 6x eager
+- N=10 ResNet18: 2.3x eager
+
+**By compile mode:**
+- **eager**: Wide gives biggest benefit (eliminates launch overhead)
+- **compile default**: Wide still wins (~2x), Inductor helps baseline
+- **compile reduce-overhead**: CUDA graphs help baseline most, Wide benefit drops to ~1.1x
 
 **Why the variance?**
-- **MLP N=100**: 100 models × small ops = massive kernel launch overhead. Wide eliminates this.
-- **ResBlock/ResNet**: Conv-heavy, GPU-bound. Less launch overhead to eliminate.
-- **vs Compiled**: `torch.compile` already reduces launch overhead via CUDA graphs, so Wide's relative benefit is smaller.
+```
+Kernel launch overhead ∝ N × num_ops × (1 / op_compute_time)
+```
+- Small ops (MLP matmuls): launch overhead dominates → Wide wins big
+- Large ops (ResNet convs): compute dominates → Wide wins less
+- CUDA graphs (reduce-overhead): baseline also eliminates launches → gap closes
 
 ## Limitations
 
