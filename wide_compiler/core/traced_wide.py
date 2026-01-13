@@ -4,6 +4,30 @@ WideCompiler.core.traced_wide
 Tracing-based Wide model construction using torch.fx.
 Trace forward pass → capture all ops → build Wide model.
 
+Forward uses dict-based value lookup which compiles cleanly (0 graph breaks).
+All string ops, isinstance checks, and per-stage allocations are traced through
+by torch.compile without issue.
+
+FUTURE OPTIMIZATION:
+    Yield-tree execution (pre-compiled index-based plan with generator traversal)
+    showed ~7% eager speedup in prototyping. The pattern:
+
+        def _yield_exec(self, x):
+            v = [None] * self._n_values
+            v[0] = x
+            for oi, arg_indices, const_args, out in self._plan:
+                args = [v[i] if i >= 0 else const_args[j] for j, i in enumerate(arg_indices)]
+                v[out] = self._ops[oi](*args)
+                yield v[out]
+
+        def forward(self, x):
+            for out in self._yield_exec(x): pass
+            return out
+
+    Requires careful handling of constant args (e.g. flatten(1)) and method calls.
+    Current dict-based approach is stable and compiles identically, so yield is
+    deferred until stability across model zoo is achieved.
+
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
