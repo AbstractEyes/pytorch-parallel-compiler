@@ -17,7 +17,7 @@ wide = wide_compiler.compile(models, sample_input)
 output = wide(packed_input)  # 1 kernel launch
 ```
 
-**Speedups:** 2-5x eager, **20-40x compiled** (CUDA)
+**Speedups:** 3-40x eager (model/N dependent), 1.5-2x vs compiled baseline
 
 ## Installation
 
@@ -124,6 +124,11 @@ config = WideConfig(
 )
 ```
 
+**Compile modes:**
+- `default` - Standard Inductor compilation. Wide gives ~2x vs this baseline.
+- `reduce-overhead` - CUDA graphs. Baseline is faster, so Wide's relative benefit drops to ~1.1-1.2x.
+- No compile (eager) - Wide gives biggest benefit here (3-40x).
+
 ### Custom Primitives
 
 ```python
@@ -174,19 +179,24 @@ python -m wide_compiler benchmark \
 
 1. **FX Tracing** - `torch.fx.symbolic_trace` captures the computation graph
 2. **Wide Primitives** - Each layer replaced with grouped equivalent:
-   - `Linear` → `Conv1d` with `groups=N`
+   - `Linear` → Grouped `Conv1d` or einsum (auto-selected)
    - `Conv2d` → `Conv2d` with `groups=N`  
    - `BatchNorm` → `BatchNorm` over `N*C` channels
-3. **Graph Execution** - Replays ops respecting dataflow (handles residuals)
-4. **Compile-Friendly** - All native PyTorch ops, no custom kernels
+3. **Graph Execution** - Dict-based value lookup replays ops respecting dataflow
+4. **Compile-Friendly** - 0 graph breaks, all native PyTorch ops
+
+**Why it's fast:**
+- N sequential models = N × num_ops kernel launches
+- Wide model = num_ops kernel launches (same ops, bigger tensors)
+- Kernel launch overhead dominates for small ops → Wide wins big
 
 ## Supported Layers
 
-| Layer | Wide Version | Notes |
-|-------|--------------|-------|
-| `nn.Linear` | `WideLinear` | Via grouped Conv1d |
+| Layer | Wide Version | Strategy |
+|-------|--------------|----------|
+| `nn.Linear` | `WideLinear` | Einsum (N<10) or grouped Conv1d (N≥10) |
 | `nn.Conv1d` | `WideConv1d` | Grouped convolution |
-| `nn.Conv2d` | `WideConv2d` | Grouped convolution |
+| `nn.Conv2d` | `WideConv2d` | Grouped (N≥10) or sequential (N<10) |
 | `nn.BatchNorm1d` | `WideBatchNorm1d` | Single BN over N*C |
 | `nn.BatchNorm2d` | `WideBatchNorm2d` | Single BN over N*C |
 | `nn.LayerNorm` | `WideLayerNorm` | Per-group normalization |
@@ -196,17 +206,28 @@ python -m wide_compiler benchmark \
 
 ## Benchmarks
 
-**MLP** (N=100, batch=32, CUDA):
+Speedup depends on model type, N, and whether baseline uses `torch.compile`:
+
+**MLP** (N=100, batch=32, RTX 4090):
 ```
-Eager:    2-3x speedup
-Compiled: 35-40x speedup
+Eager:           40x speedup (1013ms → 25ms)
 ```
 
-**ResBlock** (N=20, batch=8, CUDA):
+**ResBlock** (N=50, batch=8, RTX 4090):
 ```
-Eager:    ~5x speedup  
-Compiled: ~10x speedup
+Eager:           3.5x speedup (1351ms → 383ms)
 ```
+
+**ResNet18** (N=10, batch=8, A100):
+```
+Eager:           2.3x speedup (25ms → 11ms)
+vs Compiled:     1.9x speedup (17ms → 9ms)
+```
+
+**Why the variance?**
+- **MLP N=100**: 100 models × small ops = massive kernel launch overhead. Wide eliminates this.
+- **ResBlock/ResNet**: Conv-heavy, GPU-bound. Less launch overhead to eliminate.
+- **vs Compiled**: `torch.compile` already reduces launch overhead via CUDA graphs, so Wide's relative benefit is smaller.
 
 ## Limitations
 
@@ -214,6 +235,17 @@ Compiled: ~10x speedup
 - **Static shapes** - FX tracing requires fixed tensor shapes
 - **No dynamic control flow** - `if`/`for` based on tensor values won't trace
 - **Attention not yet supported** - MultiheadAttention needs custom Wide version
+- **Method calls with args** - e.g. `x.flatten(1)` requires careful handling in FX
+
+## Known Working Models
+
+| Model | Status | Notes |
+|-------|--------|-------|
+| MLP | ✓ | Best speedups (40x for N=100) |
+| ResBlock | ✓ | 3-5x speedup |
+| ResNet18 | ✓ | 2x speedup, all 69 stages traced |
+| ConvNet | ✓ | Works with BN, pooling |
+| Transformer | ⚠ | Attention not yet supported |
 
 ## Use Cases
 
@@ -236,9 +268,9 @@ wide_compiler/
     ├── traced_wide.py   # FX tracing + TracedWideModel
     ├── wide_model.py    # Tree traversal, pack/unpack
     └── primitives/
-        ├── wide_linear.py
+        ├── wide_linear.py     # Einsum/Conv1d strategies
         ├── wide_conv1d.py
-        ├── wide_conv2d.py
+        ├── wide_conv2d.py     # Grouped/Sequential strategies
         ├── wide_batchnorm_1d.py
         ├── wide_batchnorm_2d.py
         ├── wide_layernorm.py
