@@ -37,13 +37,18 @@ class ConvStrategy(Enum):
     SEQUENTIAL = 'sequential'
 
 
-# Tuned thresholds from A100 benchmarks
+# Tuned thresholds from A100 benchmarks (including ResNet18)
 STRATEGY_THRESHOLDS = {
-    'n_high': 32,             # N >= this: grouped always wins
-    'n_crossover': 16,        # N >= this with B <= b_low: grouped wins
-    'n_low': 4,               # N <= this: sequential (not enough parallelism)
-    'b_low': 8,               # B <= this: grouped helps more
+    'n_high': 16,             # N >= this: grouped always wins
+    'n_crossover': 8,         # N >= this with B <= b_low: grouped wins
+    'n_low': 3,               # N <= this: sequential (not enough parallelism)
+    'b_low': 16,              # B <= this: grouped helps more
 }
+
+# ResNet18 benchmark (N=10, B=8):
+#   Sequential (auto):     20.37ms → 1.12x vs compiled baseline
+#   Grouped (compiled):     9.12ms → 2.49x vs compiled baseline
+# Grouped is clearly better even at N=10!
 
 _WARNED_ABOUT_TUNING = False
 
@@ -63,18 +68,18 @@ def select_strategy(n: int, b: int, c_in: int, c_out: int,
     Heuristic strategy selection based on A100 benchmarks.
 
     A100 Results Summary (actual measured):
-    - NCHW grouped: FASTEST in all tested configs (1.98x to 3.91x speedup)
+    - NCHW grouped: FASTEST in all tested configs (2-4x speedup)
     - NHWC: Slower due to format conversion overhead
-    - Sequential: Only for exact numerical matching
+    - Sequential: Only for exact numerical matching or very low N
 
-    Key findings:
-    - N=50, B=4:   NCHW 1.98x vs NHWC 1.28x
-    - N=100, B=2:  NCHW 3.91x vs NHWC 2.55x
-    - N=20, B=8:   NCHW 1.68x vs NHWC 1.26x (late stage)
-    - Stem layer:  NCHW 1.06x vs NHWC 0.38x (C_in=3)
+    ResNet18 Benchmark (N=10, B=8):
+    - Sequential (auto):     20.37ms → 1.12x vs compiled baseline
+    - Grouped (compiled):     9.12ms → 2.49x vs compiled baseline
+
+    Key: GROUPED wins even at moderate N (8-16). Only use SEQUENTIAL
+    for N <= 3 where kernel launch overhead dominates.
 
     Note: Grouped conv has ~1e-6 numerical difference vs sequential.
-    NHWC has 0.0 error but format conversion makes it slower.
     """
     global _WARNED_ABOUT_TUNING
     if not _WARNED_ABOUT_TUNING:

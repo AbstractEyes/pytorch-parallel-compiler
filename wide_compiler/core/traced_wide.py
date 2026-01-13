@@ -489,32 +489,53 @@ __all__ = [
 ]
 
 
+
 # =============================================================================
-# TESTS
+# TESTS - Profiling focused (this is a compiler library)
 # =============================================================================
 
 if __name__ == '__main__':
     import time
+    import torch._dynamo
+    from contextlib import contextmanager
+
     torch.manual_seed(42)
+    torch._dynamo.config.cache_size_limit = 128
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print("=" * 60)
-    print("TracedWideModel - FX Tracing-Based Wide Construction")
+    print("=" * 70)
+    print("TracedWideModel - Profiling & Bottleneck Analysis")
     print(f"Device: {device}")
-    print("=" * 60)
+    if device == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name()}")
+    print("=" * 70)
+
+    def benchmark(fn, num_iters=100, warmup=20):
+        """Benchmark function, return average time in seconds."""
+        for _ in range(warmup):
+            fn()
+        if device == 'cuda':
+            torch.cuda.synchronize()
+
+        t0 = time.perf_counter()
+        for _ in range(num_iters):
+            fn()
+        if device == 'cuda':
+            torch.cuda.synchronize()
+        return (time.perf_counter() - t0) / num_iters
 
     # =========================================================================
-    # TEST 1: Basic FX tracing
+    # TEST 1: Basic correctness
     # =========================================================================
-    print("\n" + "=" * 60)
-    print("TEST 1: FX Tracing (MLP with F.relu)")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print("TEST 1: Basic Correctness (MLP)")
+    print("=" * 70)
 
     class MLP(nn.Module):
-        def __init__(self):
+        def __init__(self, d=256):
             super().__init__()
-            self.fc1 = nn.Linear(64, 128)
-            self.fc2 = nn.Linear(128, 64)
+            self.fc1 = nn.Linear(d, d*2)
+            self.fc2 = nn.Linear(d*2, d)
 
         def forward(self, x):
             x = self.fc1(x)
@@ -522,55 +543,171 @@ if __name__ == '__main__':
             x = self.fc2(x)
             return x
 
-    mlp = MLP()
-    traced = fx.symbolic_trace(mlp)
-    print(print_trace(traced))
-    try:
-        print("\nGraph:")
-        traced.graph.print_tabular()
-    except ImportError:
-        print("(Install 'tabulate' for detailed graph view)")
+    N, B, D = 50, 32, 256
+    mlps = [MLP(D).to(device).eval() for _ in range(N)]
+    sample = torch.randn(B, D, device=device)
 
-    # =========================================================================
-    # TEST 2: TracedWideModel construction
-    # =========================================================================
-    print("\n" + "=" * 60)
-    print("TEST 2: TracedWideModel Construction")
-    print("=" * 60)
+    wide_mlp = TracedWideModel.from_models(mlps, sample).to(device).eval()
 
-    N = 50
-    mlps = [MLP().to(device) for _ in range(N)]
-
-    sample = torch.randn(4, 64, device=device)
-    wide_mlp = TracedWideModel.from_models(mlps, sample).to(device)
-
-    print(wide_mlp.summary())
-
-    # =========================================================================
-    # TEST 3: Correctness verification
-    # =========================================================================
-    print("\n" + "=" * 60)
-    print("TEST 3: Correctness Verification")
-    print("=" * 60)
-
-    B = 32
-    inputs = [torch.randn(B, 64, device=device) for _ in range(N)]
+    inputs = [torch.randn(B, D, device=device) for _ in range(N)]
     packed = pack_inputs(inputs)
 
-    with torch.no_grad():
-        separate_outs = [mlps[i](inputs[i]) for i in range(N)]
+    with torch.inference_mode():
+        ref_outs = [mlps[i](inputs[i]) for i in range(N)]
         wide_out = wide_mlp(packed)
         wide_outs = unpack_outputs(wide_out, N)
 
-    max_diff = max((separate_outs[i] - wide_outs[i]).abs().max().item() for i in range(N))
-    print(f"Max diff: {max_diff:.8f}")
+    max_diff = max((ref_outs[i] - wide_outs[i]).abs().max().item() for i in range(N))
+    print(f"Max diff: {max_diff:.2e} {'✓' if max_diff < 1e-4 else '✗'}")
+    print(wide_mlp.summary())
 
     # =========================================================================
-    # TEST 4: ResBlock with residual - full test
+    # TEST 2: Forward pass profiling (per-stage breakdown)
     # =========================================================================
-    print("\n" + "=" * 60)
-    print("TEST 4: ResBlock with Residual (graph-based forward)")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print("TEST 2: Per-Stage Time Breakdown")
+    print("=" * 70)
+
+    # Instrument forward to time each stage
+    def profiled_forward(model, x):
+        """Forward with per-stage timing."""
+        values = {model._input_name: x}
+        timings = {}
+
+        # Pre-populate attrs
+        for attr_name in model._attr_names:
+            safe_name = attr_name.replace('.', '_')
+            buffer_name = f'_attr_{safe_name}'
+            if hasattr(model, buffer_name):
+                values[attr_name] = getattr(model, buffer_name)
+
+        for node_name in model._execution_order:
+            if node_name in model._attr_names:
+                continue
+            if node_name not in model.stage_info:
+                continue
+
+            safe_name = node_name.replace('.', '_')
+            op = model.stages[safe_name]
+
+            # Gather args
+            args = []
+            for arg_name in model._node_args[node_name]:
+                if isinstance(arg_name, str) and arg_name in values:
+                    args.append(values[arg_name])
+                else:
+                    args.append(arg_name)
+
+            # Gather kwargs
+            kwargs = {}
+            for k, v in model._node_kwargs.get(node_name, {}).items():
+                if isinstance(v, str) and v in values:
+                    kwargs[k] = values[v]
+                else:
+                    kwargs[k] = v
+
+            # Time this stage
+            if device == 'cuda':
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+            if kwargs:
+                values[node_name] = op(*args, **kwargs)
+            elif len(args) == 1:
+                values[node_name] = op(args[0])
+            else:
+                values[node_name] = op(*args)
+
+            if device == 'cuda':
+                torch.cuda.synchronize()
+            timings[node_name] = (time.perf_counter() - t0) * 1000  # ms
+
+        return values[model._output_name], timings
+
+    # Warmup
+    with torch.inference_mode():
+        for _ in range(20):
+            _ = wide_mlp(packed)
+
+    # Profile multiple runs and average
+    all_timings = []
+    with torch.inference_mode():
+        for _ in range(10):
+            _, timings = profiled_forward(wide_mlp, packed)
+            all_timings.append(timings)
+
+    # Average timings
+    avg_timings = {}
+    for key in all_timings[0].keys():
+        avg_timings[key] = sum(t[key] for t in all_timings) / len(all_timings)
+
+    print(f"\nConfig: N={N}, B={B}, D={D}")
+    print(f"\n{'Stage':<20} {'Op Type':<25} {'Time (ms)':<12} {'%':<8}")
+    print("-" * 70)
+
+    total_time = sum(avg_timings.values())
+    for node_name, t in sorted(avg_timings.items(), key=lambda x: -x[1]):
+        safe_name = node_name.replace('.', '_')
+        op = wide_mlp.stages.get(safe_name)
+        op_type = type(op).__name__ if op else "?"
+        pct = (t / total_time) * 100 if total_time > 0 else 0
+        print(f"{node_name:<20} {op_type:<25} {t:<12.4f} {pct:<8.1f}%")
+
+    print("-" * 70)
+    print(f"{'TOTAL':<20} {'':<25} {total_time:<12.4f} {'100.0%':<8}")
+
+    # =========================================================================
+    # TEST 3: Eager vs Compiled performance
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("TEST 3: Eager vs Compiled Performance")
+    print("=" * 70)
+
+    configs = [
+        (20, 32, 256, "Small MLP"),
+        (50, 16, 512, "Medium MLP"),
+        (100, 8, 256, "High N MLP"),
+    ]
+
+    print(f"\n{'Config':<20} {'N×Model (ms)':<15} {'Wide Eager':<15} {'Wide Compiled':<15} {'Speedup'}")
+    print("-" * 85)
+
+    for N, B, D, desc in configs:
+        torch._dynamo.reset()
+        torch.manual_seed(42)
+
+        mlps = [MLP(D).to(device).eval() for _ in range(N)]
+        sample = torch.randn(B, D, device=device)
+        wide = TracedWideModel.from_models(mlps, sample).to(device).eval()
+
+        inputs = [torch.randn(B, D, device=device) for _ in range(N)]
+        packed = pack_inputs(inputs)
+
+        try:
+            wide_compiled = torch.compile(wide, mode='default')
+            # Warmup
+            with torch.inference_mode():
+                for _ in range(10):
+                    _ = wide_compiled(packed)
+            compile_ok = True
+        except Exception as e:
+            print(f"{desc:<20} COMPILE FAILED: {str(e)[:40]}")
+            continue
+
+        with torch.inference_mode():
+            t_baseline = benchmark(lambda: [mlps[i](inputs[i]) for i in range(N)], num_iters=100)
+            t_eager = benchmark(lambda: wide(packed), num_iters=100)
+            t_compiled = benchmark(lambda: wide_compiled(packed), num_iters=100)
+
+        speedup = t_baseline / t_compiled
+        print(f"{desc:<20} {t_baseline*1000:<15.3f} {t_eager*1000:<15.3f} {t_compiled*1000:<15.3f} {speedup:<.2f}x")
+
+    # =========================================================================
+    # TEST 4: ResBlock profiling
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("TEST 4: ResBlock (Conv2d + BN + Residual)")
+    print("=" * 70)
 
     class ResBlock(nn.Module):
         def __init__(self, channels=64):
@@ -586,47 +723,232 @@ if __name__ == '__main__':
             out = self.bn2(self.conv2(out))
             return F.relu(out + identity)
 
-    resblock = ResBlock()
-    traced = fx.symbolic_trace(resblock)
-    print(print_trace(traced))
-    try:
-        print("\nGraph:")
-        traced.graph.print_tabular()
-    except ImportError:
-        print("(Install 'tabulate' for detailed graph view)")
+    N, B, C, H, W = 20, 8, 64, 32, 32
+    resblocks = [ResBlock(C).to(device).eval() for _ in range(N)]
+    sample = torch.randn(B, C, H, W, device=device)
 
-    # Build wide resblock
-    N = 20
-    C = 64
-    resblocks = [ResBlock().to(device) for _ in range(N)]
-    for rb in resblocks:
-        rb.eval()
+    wide_res = TracedWideModel.from_models(resblocks, sample).to(device).eval()
 
-    sample = torch.randn(4, C, 16, 16, device=device)
-    wide_resblock = TracedWideModel.from_models(resblocks, sample).to(device)
-    wide_resblock.eval()
-
-    print("\n" + wide_resblock.summary())
-
-    # Verify correctness
-    print("\nVerifying correctness...")
-    B = 8
-    inputs = [torch.randn(B, C, 16, 16, device=device) for _ in range(N)]
+    inputs = [torch.randn(B, C, H, W, device=device) for _ in range(N)]
     packed = pack_inputs(inputs)
 
-    with torch.no_grad():
-        separate_outs = [resblocks[i](inputs[i]) for i in range(N)]
-        wide_out = wide_resblock(packed)
+    # Correctness
+    with torch.inference_mode():
+        ref_outs = [resblocks[i](inputs[i]) for i in range(N)]
+        wide_out = wide_res(packed)
         wide_outs = unpack_outputs(wide_out, N)
 
-    max_diff = max((separate_outs[i] - wide_outs[i]).abs().max().item() for i in range(N))
-    print(f"Max diff: {max_diff:.8f}")
+    max_diff = max((ref_outs[i] - wide_outs[i]).abs().max().item() for i in range(N))
+    print(f"\nCorrectness: max_diff = {max_diff:.2e} {'✓' if max_diff < 1e-3 else '✗'}")
 
-    if max_diff < 1e-3:
-        print("✓ ResBlock with residual works correctly!")
+    # Per-stage breakdown
+    with torch.inference_mode():
+        for _ in range(10):
+            _ = wide_res(packed)
+
+        all_timings = []
+        for _ in range(5):
+            _, timings = profiled_forward(wide_res, packed)
+            all_timings.append(timings)
+
+    avg_timings = {}
+    for key in all_timings[0].keys():
+        avg_timings[key] = sum(t[key] for t in all_timings) / len(all_timings)
+
+    print(f"\nConfig: N={N}, B={B}, C={C}, H×W={H}×{W}")
+    print(f"\n{'Stage':<20} {'Op Type':<25} {'Time (ms)':<12} {'%':<8}")
+    print("-" * 70)
+
+    total_time = sum(avg_timings.values())
+    for node_name, t in sorted(avg_timings.items(), key=lambda x: -x[1]):
+        safe_name = node_name.replace('.', '_')
+        op = wide_res.stages.get(safe_name)
+        op_type = type(op).__name__ if op else "?"
+        pct = (t / total_time) * 100 if total_time > 0 else 0
+        print(f"{node_name:<20} {op_type:<25} {t:<12.4f} {pct:<8.1f}%")
+
+    print("-" * 70)
+    print(f"{'TOTAL':<20} {'':<25} {total_time:<12.4f} {'100.0%':<8}")
+
+    # Compiled comparison
+    print("\nCompiled performance:")
+    with torch.inference_mode():
+        t_baseline = benchmark(lambda: [resblocks[i](inputs[i]) for i in range(N)], num_iters=50)
+        t_eager = benchmark(lambda: wide_res(packed), num_iters=50)
+
+    try:
+        torch._dynamo.reset()
+        wide_res_compiled = torch.compile(wide_res, mode='default')
+        with torch.inference_mode():
+            for _ in range(10):
+                _ = wide_res_compiled(packed)
+            t_compiled = benchmark(lambda: wide_res_compiled(packed), num_iters=50)
+    except Exception as e:
+        print(f"Compile failed: {e}")
+        t_compiled = t_eager
+
+    print(f"\n{'Method':<25} {'Time (ms)':<15} {'Speedup'}")
+    print("-" * 55)
+    print(f"{'N×ResBlock (baseline)':<25} {t_baseline*1000:<15.3f} {'1.00x'}")
+    print(f"{'Wide (eager)':<25} {t_eager*1000:<15.3f} {t_baseline/t_eager:.2f}x")
+    print(f"{'Wide (compiled)':<25} {t_compiled*1000:<15.3f} {t_baseline/t_compiled:.2f}x")
+
+    # =========================================================================
+    # TEST 5: torch.profiler detailed breakdown
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("TEST 5: torch.profiler Detailed Analysis")
+    print("=" * 70)
+
+    try:
+        from torch.profiler import profile, ProfilerActivity, record_function
+
+        N, B, D = 50, 32, 256
+        mlps = [MLP(D).to(device).eval() for _ in range(N)]
+        sample = torch.randn(B, D, device=device)
+        wide = TracedWideModel.from_models(mlps, sample).to(device).eval()
+
+        inputs = [torch.randn(B, D, device=device) for _ in range(N)]
+        packed = pack_inputs(inputs)
+
+        # Warmup
+        with torch.inference_mode():
+            for _ in range(20):
+                _ = wide(packed)
+
+        activities = [ProfilerActivity.CPU]
+        if device == 'cuda':
+            activities.append(ProfilerActivity.CUDA)
+
+        print(f"\nProfiling Wide MLP: N={N}, B={B}, D={D}")
+        print("-" * 70)
+
+        with profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+        ) as prof:
+            with torch.inference_mode():
+                for _ in range(10):
+                    with record_function("wide_forward"):
+                        _ = wide(packed)
+
+        sort_key = "cuda_time_total" if device == 'cuda' else "cpu_time_total"
+        print(prof.key_averages().table(sort_by=sort_key, row_limit=15))
+
+    except Exception as e:
+        print(f"torch.profiler failed: {e}")
+
+    # =========================================================================
+    # TEST 6: Memory profiling
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("TEST 6: Memory Analysis")
+    print("=" * 70)
+
+    if device == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+
+        N, B, D = 50, 32, 512
+
+        # Measure N×Model memory
+        mlps = [MLP(D).to(device).eval() for _ in range(N)]
+        mem_n_models = torch.cuda.max_memory_allocated() / 1024**2
+
+        # Measure Wide memory
+        torch.cuda.reset_peak_memory_stats()
+        sample = torch.randn(B, D, device=device)
+        wide = TracedWideModel.from_models(mlps, sample).to(device).eval()
+        mem_wide = torch.cuda.max_memory_allocated() / 1024**2
+
+        # Forward memory
+        inputs = [torch.randn(B, D, device=device) for _ in range(N)]
+        packed = pack_inputs(inputs)
+
+        torch.cuda.reset_peak_memory_stats()
+        with torch.inference_mode():
+            _ = wide(packed)
+        mem_wide_fwd = torch.cuda.max_memory_allocated() / 1024**2
+
+        torch.cuda.reset_peak_memory_stats()
+        with torch.inference_mode():
+            _ = [mlps[i](inputs[i]) for i in range(N)]
+        mem_baseline_fwd = torch.cuda.max_memory_allocated() / 1024**2
+
+        print(f"\nConfig: N={N}, B={B}, D={D}")
+        print(f"\n{'Metric':<35} {'Memory (MB)':<15}")
+        print("-" * 55)
+        print(f"{'N×Model parameters':<35} {mem_n_models:<15.1f}")
+        print(f"{'Wide model construction':<35} {mem_wide:<15.1f}")
+        print(f"{'Wide forward peak':<35} {mem_wide_fwd:<15.1f}")
+        print(f"{'N×Model forward peak':<35} {mem_baseline_fwd:<15.1f}")
+
+        savings = mem_baseline_fwd - mem_wide_fwd
+        print(f"\n{'Memory saved (forward)':<35} {savings:<15.1f} ({savings/mem_baseline_fwd*100:.1f}%)")
     else:
-        print("✗ ResBlock mismatch - need to debug")
+        print("Memory profiling requires CUDA")
 
-    print("\n" + "=" * 60)
-    print("ALL TESTS COMPLETE")
-    print("=" * 60)
+    # =========================================================================
+    # TEST 7: Graph break analysis
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("TEST 7: Graph Break Analysis")
+    print("=" * 70)
+
+    N, B, D = 20, 32, 256
+    mlps = [MLP(D).to(device).eval() for _ in range(N)]
+    sample = torch.randn(B, D, device=device)
+    wide = TracedWideModel.from_models(mlps, sample).to(device).eval()
+
+    packed = torch.randn(B, N * D, device=device)
+
+    torch._dynamo.reset()
+
+    try:
+        explanation = torch._dynamo.explain(wide)(packed)
+        print(f"\nGraph breaks: {explanation.graph_break_count}")
+        print(f"Graphs compiled: {explanation.graph_count}")
+
+        if explanation.graph_break_count > 0:
+            print("\nBreak reasons:")
+            for i, reason in enumerate(explanation.break_reasons[:5]):
+                print(f"  {i+1}. {reason}")
+        else:
+            print("✓ No graph breaks - optimal compilation")
+
+    except Exception as e:
+        print(f"Graph analysis failed: {e}")
+
+    # =========================================================================
+    # SUMMARY
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("PROFILING SUMMARY")
+    print("=" * 70)
+    print("""
+Bottleneck identification:
+
+1. Per-stage timing shows which Wide ops are slowest
+   - WideLinear/WideConv2d should dominate (compute bound)
+   - FunctionalOp overhead should be <5%
+   
+2. Compiled vs Eager
+   - Expect 1.5-3x speedup from torch.compile
+   - No speedup = possible graph breaks
+   
+3. Memory analysis
+   - Wide should use similar or less memory
+   - Peak during forward is key metric
+
+4. Graph breaks
+   - 0 breaks = full graph fusion
+   - Breaks = find and fix dynamic ops
+
+Next steps if bottlenecked:
+- FunctionalOp slow: Fuse into WideFunctional batch op
+- Graph breaks: Replace dynamic control with static
+- Memory high: Check intermediate tensor accumulation
+- WideConv2d slow: Tune grouped vs channels_last
+- WideLinear slow: Tune einsum threshold
+""")
