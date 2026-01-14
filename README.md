@@ -1,6 +1,6 @@
-# pytorch-parallel-compiler
+# WideCompiler
 
-### Version 0.3.0
+### Version 0.4.0
 
 Compile-friendly batched model execution. Fuse N identical models into a single Wide model for massive speedups.
 
@@ -19,7 +19,14 @@ wide = wide_compiler.compile(models, sample_input)
 output = wide(packed_input)  # 1 kernel launch
 ```
 
-**Speedups:** 3-40x eager (model/N dependent), 1.5-2x vs compiled baseline
+**Speedups:** 2-40x depending on model type, N, and compilation mode.
+
+## What's New in 0.4.0
+
+- **WideAttention** - N parallel attention in single Flash Attention call (**11x speedup**)
+- **Benchmark System** - Per-primitive benchmarking with strategy comparison
+- **Improved WideEmbedding** - Batched indexing strategy (**6x speedup**)
+- **Strategy Selection** - Each primitive auto-selects optimal execution strategy
 
 ## Installation
 
@@ -126,196 +133,170 @@ config = WideConfig(
 )
 ```
 
-**Compile modes:**
-- `default` - Standard Inductor compilation. Wide gives ~2x vs this baseline.
-- `reduce-overhead` - CUDA graphs. Baseline is faster, so Wide's relative benefit drops to ~1.1-1.2x.
-- No compile (eager) - Wide gives biggest benefit here (3-40x).
+## CLI
 
-### Custom Primitives
+### Benchmark Primitives
 
-```python
-import wide_compiler
+```bash
+# List available primitives
+wide_compiler benchmark
 
-@wide_compiler.register('MyCustomLayer')
-class WideMyCustomLayer(torch.nn.Module):
-    @classmethod
-    def from_modules(cls, modules):
-        # Build wide version from N modules
-        ...
+# Benchmark specific primitive
+wide_compiler benchmark attention
+wide_compiler benchmark conv2d
+wide_compiler benchmark linear
 
-# Check registered primitives
-print(wide_compiler.list_registered())
-# ['Linear', 'Conv2d', 'Conv1d', 'BatchNorm2d', 'BatchNorm1d', 'LayerNorm', 'Embedding', 'MyCustomLayer']
+# Benchmark all primitives
+wide_compiler benchmark all
+
+# With options
+wide_compiler benchmark attention -p quick    # Quick preset (fewer configs)
+wide_compiler benchmark attention -p full     # Full sweep (default)
+wide_compiler benchmark attention -p ci       # CI preset (minimal)
+
+wide_compiler benchmark conv1d -t 20          # Show top 20 results
+wide_compiler benchmark conv1d -q             # Quiet mode (no progress)
+wide_compiler benchmark conv1d -s             # Auto-save with timestamp
+wide_compiler benchmark conv1d -o results.json  # Save to specific file
+
+wide_compiler benchmark all -q -s             # All primitives, quiet, auto-save
 ```
 
-## CLI
+### Other Commands
 
 ```bash
 # Run correctness tests
-python -m wide_compiler test
+wide_compiler test
 
-# Benchmark speedup
-python -m wide_compiler benchmark --model mlp --n 100 --compile
+# Show FX trace for built-in models
+wide_compiler trace -m mlp
+wide_compiler trace -m resblock
 
-# Show FX trace
-python -m wide_compiler trace --model resblock
-
-# Show info
-python -m wide_compiler info
+# Show library info
+wide_compiler info
 ```
 
-**Available models:** `mlp`, `deep_mlp`, `resblock`, `convnet`
+## Supported Layers
 
-**Benchmark options:**
-```bash
-python -m wide_compiler benchmark \
-    --model mlp \
-    --n 100 \
-    --batch 32 \
-    --iters 100 \
-    --compile \
-    --cpu  # Force CPU
-```
+| Layer | Wide Version | Strategies | Best Speedup |
+|-------|--------------|------------|--------------|
+| `nn.MultiheadAttention` | `WideAttention` | fused, sequential | **11.4x** |
+| `nn.Linear` | `WideLinear` | einsum, sequential | **12.8x** |
+| `nn.Embedding` | `WideEmbedding` | indexed, gather, sequential | **6.4x** |
+| `nn.Conv1d` | `WideConv1d` | grouped, sequential | **3.2x** |
+| `nn.Conv2d` | `WideConv2d` | grouped, channels_last, sequential | **2.5x** |
+| `nn.LayerNorm` | `WideLayerNorm` | wide | **1.8x** |
+| `nn.BatchNorm1d` | `WideBatchNorm1d` | wide | **1.5x** |
+| `nn.BatchNorm2d` | `WideBatchNorm2d` | wide | **1.5x** |
+| `F.relu`, `F.gelu`, etc. | Passthrough | — | — |
+| `+`, `-`, `*`, `/`, `@` | `BinaryOp` | — | — |
+
+## Primitive Benchmarks (A100)
+
+### Attention (NEW in 0.4.0)
+
+| N | Fused | Sequential | Baseline |
+|---|-------|------------|----------|
+| 4 | **3.91x** | 1.72x | 1.0x |
+| 8 | **8.33x** | 1.77x | 1.0x |
+| 16 | **11.23x** | 1.72x | 1.0x |
+| 32 | **11.40x** | 1.80x | 1.0x |
+
+### Embedding (Improved in 0.4.0)
+
+| N | Indexed | Gather | Sequential |
+|---|---------|--------|------------|
+| 4 | **1.29x** | 1.09x | 0.85x |
+| 8 | **2.38x** | 2.30x | 0.87x |
+| 16 | 4.35x | **4.41x** | 0.88x |
+| 32 | **6.42x** | 5.93x | 0.92x |
+
+### Linear
+
+| N | Einsum | Sequential |
+|---|--------|------------|
+| 20 | **3.0x** | 1.0x |
+| 50 | **5.1x** | 1.0x |
+| 100 | **12.8x** | 1.0x |
+
+### Conv2d
+
+| N | Grouped | Channels Last | Sequential |
+|---|---------|---------------|------------|
+| 8+ | **2-2.5x** | ~2x | 1.0x |
+
+## End-to-End Benchmarks
+
+| Model | N | Batch | Mode | Speedup |
+|-------|---|-------|------|---------|
+| **MLP** (2 linear) | 100 | 32 | eager | **40x** |
+| **MLP** (2 linear) | 20 | 32 | compile | **3.2x** |
+| **Deep MLP** (8 linear) | 20 | 32 | eager | **6.2x** |
+| **ResBlock** | 20 | 8 | eager | **4.9x** |
+| **ResBlock** | 20 | 8 | compile | **2.9x** |
+| **ResNet18** | 10 | 8 | eager | **2.3x** |
+| **ResNet18** | 10 | 8 | compile | **1.9x** |
 
 ## How it Works
 
 1. **FX Tracing** - `torch.fx.symbolic_trace` captures the computation graph
-2. **Wide Primitives** - Each layer replaced with grouped equivalent:
-   - `Linear` → Grouped `Conv1d` or einsum (auto-selected)
-   - `Conv2d` → `Conv2d` with `groups=N`  
-   - `BatchNorm` → `BatchNorm` over `N*C` channels
-3. **Graph Execution** - Dict-based value lookup replays ops respecting dataflow
+2. **Wide Primitives** - Each layer replaced with fused equivalent:
+   - `Linear` → Batched einsum
+   - `Conv2d` → Grouped convolution  
+   - `Attention` → Reshape N→batch, single Flash Attention call
+   - `BatchNorm` → Single BN over N*C channels
+3. **Strategy Selection** - Each primitive auto-selects optimal strategy based on N
 4. **Compile-Friendly** - 0 graph breaks, all native PyTorch ops
 
-**Why it's fast:**
-- N sequential models = N × num_ops kernel launches
-- Wide model = num_ops kernel launches (same ops, bigger tensors)
-- Kernel launch overhead dominates for small ops → Wide wins big
-
-## Supported Layers
-
-| Layer | Wide Version | Strategy |
-|-------|--------------|----------|
-| `nn.Linear` | `WideLinear` | Einsum (N<10) or grouped Conv1d (N≥10) |
-| `nn.Conv1d` | `WideConv1d` | Grouped convolution |
-| `nn.Conv2d` | `WideConv2d` | Grouped (N≥10) or sequential (N<10) |
-| `nn.BatchNorm1d` | `WideBatchNorm1d` | Single BN over N*C |
-| `nn.BatchNorm2d` | `WideBatchNorm2d` | Single BN over N*C |
-| `nn.LayerNorm` | `WideLayerNorm` | Per-group normalization |
-| `nn.Embedding` | `WideEmbedding` | Concatenated tables |
-| `F.relu`, `F.gelu`, etc. | Passthrough | Elementwise ops work directly |
-| `+`, `-`, `*`, `/`, `@` | `BinaryOp` | Captured via FX |
-
-## Benchmarks
-
-Speedup depends on model type, N, batch size, and compilation mode.
-
-### Benchmark Table
-
-| Model / Block | N | Batch | GPU | Mode | Baseline | Wide | Speedup |
-|---------------|---|-------|-----|------|----------|------|---------|
-| **MLP / FFN Block** (2 linear, d=64) | 100 | 32 | RTX 4090 | eager | 1013ms | 25ms | **40.2x** |
-| **MLP / FFN Block** (2 linear, d=256) | 20 | 32 | A100 | eager | 1.74ms | 0.29ms | **6.0x** |
-| **MLP / FFN Block** (2 linear, d=256) | 20 | 32 | A100 | compile | 0.89ms | 0.28ms | **3.2x** |
-| **Deep FFN** (8 linear layers, d=512) | 20 | 32 | A100 | eager | 7.17ms | 1.15ms | **6.2x** |
-| **Deep FFN** (8 linear layers, d=512) | 20 | 32 | A100 | compile | 3.21ms | 1.08ms | **3.0x** |
-| **ConvBN Block** (conv3x3 + BN + ReLU) | 20 | 8 | A100 | eager | 2.1ms | 0.42ms | **5.0x** |
-| **ResBlock** (2×conv3x3 + 2×BN + skip) | 50 | 8 | RTX 4090 | eager | 1351ms | 383ms | **3.5x** |
-| **ResBlock** (2×conv3x3 + 2×BN + skip) | 20 | 8 | A100 | eager | 5.14ms | 1.05ms | **4.9x** |
-| **ResBlock** (2×conv3x3 + 2×BN + skip) | 20 | 8 | A100 | compile | 2.89ms | 0.98ms | **2.9x** |
-| **Bottleneck** (1×1→3×3→1×1 + skip) | 20 | 8 | A100 | eager | 4.8ms | 1.1ms | **4.4x** |
-| **ResNet18** (69 ops, full model) | 10 | 8 | A100 | eager | 25.4ms | 10.9ms | **2.3x** |
-| **ResNet18** (69 ops, full model) | 10 | 8 | A100 | compile | 17.4ms | 9.1ms | **1.9x** |
-| **ResNet18** (69 ops, full model) | 10 | 8 | A100 | reduce-overhead | 9.9ms | 8.7ms | **1.1x** |
-
-### Practical Use Cases
-
-These blocks appear everywhere in real architectures:
-
-| Block Pattern | Where It's Used | Expected Speedup |
-|---------------|-----------------|------------------|
-| **FFN / MLP Block** | Transformer FFN, MLP-Mixer, ViT | 6-40x |
-| **ConvBN Block** | Every CNN backbone | 4-5x |
-| **ResBlock** | ResNet, ResNeXt, RegNet | 3-5x |
-| **Bottleneck** | ResNet-50+, EfficientNet | 3-5x |
-| **Inverted Residual** | MobileNet, EfficientNet | 4-6x |
-| **SE Block** | SENet, EfficientNet | 5-8x |
-| **Depthwise Separable** | MobileNet, Xception | 4-6x |
-
-### Key Observations
-
-**By block complexity:**
-- **FFN/MLP blocks**: Best speedups (6-40x). Small matmuls = massive launch overhead.
-- **ConvBN blocks**: Great (4-5x). Multiple small ops fused.
-- **ResBlocks**: Good (3-5x). Conv-heavy but many ops.
-- **Full models**: Moderate (2-3x). Large convs are already GPU-efficient.
-
-**By N:**
-- Higher N = more kernel launches eliminated = bigger speedup
-- N=100 FFN blocks: 40x eager
-- N=20 FFN blocks: 6x eager
-- N=10 ResNet18: 2.3x eager
-
-**By compile mode:**
-- **eager**: Wide gives biggest benefit (eliminates launch overhead)
-- **compile default**: Wide still wins (~2x), Inductor helps baseline
-- **compile reduce-overhead**: CUDA graphs help baseline most, Wide benefit drops to ~1.1x
-
-**Why it matters:**
+**Why WideAttention is so fast:**
+```python
+# Reshape: [N, B, H, T, D] → [N*B, H, T, D]
+# Run single F.scaled_dot_product_attention (Flash Attention)
+# All N models processed in ONE kernel call
 ```
-Kernel launch overhead ∝ N × num_ops × (1 / op_compute_time)
+
+## Project Structure
+
 ```
-- Small ops (FFN matmuls): launch overhead dominates → Wide wins big
-- Large ops (ResNet convs): compute dominates → Wide wins less
-- CUDA graphs (reduce-overhead): baseline also eliminates launches → gap closes
+wide_compiler/
+├── __init__.py
+├── __main__.py
+├── api.py                    # compile(), WideBuilder
+├── cli.py                    # CLI commands
+└── core/
+    ├── config.py             # WideConfig
+    ├── registry.py           # Primitive registration
+    ├── traced_wide.py        # FX tracing + TracedWideModel
+    ├── benchmark/            # NEW: Benchmark system
+    │   ├── __init__.py
+    │   ├── benchmark_api.py
+    │   ├── benchmark_runner.py
+    │   ├── benchmark_schema.py
+    │   └── benchmark_registry.py
+    └── primitives/
+        ├── wide_attention.py   # NEW: 11x speedup
+        ├── wide_linear.py
+        ├── wide_conv1d.py
+        ├── wide_conv2d.py
+        ├── wide_batchnorm_1d.py
+        ├── wide_batchnorm_2d.py
+        ├── wide_layernorm.py
+        └── wide_embedding.py
+```
 
 ## Limitations
 
 - **Identical architecture required** - All N models must have same structure
 - **Static shapes** - FX tracing requires fixed tensor shapes
 - **No dynamic control flow** - `if`/`for` based on tensor values won't trace
-- **Attention not yet supported** - MultiheadAttention needs custom Wide version
-- **Method calls with args** - e.g. `x.flatten(1)` requires careful handling in FX
-
-## Known Working Models
-
-| Model | Status | Notes |
-|-------|--------|-------|
-| MLP | ✓ | Best speedups (40x for N=100) |
-| ResBlock | ✓ | 3-5x speedup |
-| ResNet18 | ✓ | 2x speedup, all 69 stages traced |
-| ConvNet | ✓ | Works with BN, pooling |
-| Transformer | ⚠ | Attention not yet supported |
 
 ## Use Cases
 
 - **Ensemble models** - Run N ensemble members in parallel
-- **Hyperparameter search** - Evaluate N configurations simultaneously
+- **Hyperparameter search** - Evaluate N configurations simultaneously  
 - **Population-based training** - Evolve N agents together
 - **Monte Carlo dropout** - N stochastic forward passes
-
-## Project Structure
-
-```
-wide_compiler/
-├── __init__.py          # Package exports
-├── __main__.py          # CLI entry point
-├── api.py               # Main API: compile(), WideBuilder
-├── cli.py               # CLI commands: test, benchmark, trace, info
-└── core/
-    ├── config.py        # WideConfig
-    ├── registry.py      # Primitive registration
-    ├── traced_wide.py   # FX tracing + TracedWideModel
-    ├── wide_model.py    # Tree traversal, pack/unpack
-    └── primitives/
-        ├── wide_linear.py     # Einsum/Conv1d strategies
-        ├── wide_conv1d.py
-        ├── wide_conv2d.py     # Grouped/Sequential strategies
-        ├── wide_batchnorm_1d.py
-        ├── wide_batchnorm_2d.py
-        ├── wide_layernorm.py
-        └── wide_embedding.py
-```
+- **Transformer ensembles** - N attention heads across models (NEW)
 
 ## License
 
