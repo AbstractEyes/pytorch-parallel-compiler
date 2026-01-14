@@ -1,14 +1,14 @@
 # CLAUDE.md - WideCompiler Quick Reference
 
-VERSION = 0.2.0
+VERSION = 0.4.0
 
 Read this first when working on this codebase.
 
 ## What This Project Does
 
-Fuses N identical PyTorch models into ONE wide model. Instead of N sequential forward passes, one batched forward pass using grouped convolutions.
+Fuses N identical PyTorch models into ONE wide model. Instead of N sequential forward passes, one batched forward pass using grouped operations.
 
-**Key insight:** `nn.Conv1d(groups=N)` processes N independent channels in one kernel launch.
+**Key insight:** Reshape N models into batch dimension, run single fused kernel.
 
 ## Core Concept
 
@@ -20,7 +20,7 @@ N separate models:        Wide model:
 [Model_N] → out_N
 ```
 
-**Memory layout:** `[B, N*C, ...]` - N models' channels interleaved.
+**Memory layout:** `[B, N*C, ...]` - N models' channels concatenated.
 
 ## Entry Point
 
@@ -37,19 +37,30 @@ All roads lead to `TracedWideModel.from_models()` in `core/traced_wide.py`.
 
 ```
 wide_compiler/
-├── __init__.py      → Package exports (try/except for inline debug)
-├── api.py           → compile(), WideBuilder, pack(), unpack()
-├── cli.py           → CLI commands (test, benchmark, trace, info)
-├── __main__.py      → Delegates to cli.main()
+├── __init__.py          → Package exports
+├── api.py               → compile(), WideBuilder, pack(), unpack()
+├── cli.py               → CLI commands (test, benchmark, trace, info)
+├── __main__.py          → Delegates to cli.main()
 └── core/
-    ├── config.py    → WideConfig dataclass
-    ├── registry.py  → Maps 'Linear' → WideLinear.from_modules
+    ├── config.py        → WideConfig dataclass
+    ├── registry.py      → Maps 'Linear' → WideLinear.from_modules
     ├── traced_wide.py   → FX tracing, graph execution (THE CORE)
     ├── wide_model.py    → pack_inputs(), unpack_outputs(), tree utils
+    ├── benchmark/       → Primitive benchmarking system (NEW)
+    │   ├── __init__.py
+    │   ├── benchmark_api.py      → run_benchmark(), list_primitives()
+    │   ├── benchmark_runner.py   → Execution engine
+    │   ├── benchmark_schema.py   → BenchmarkJob, SweepParams, results
+    │   └── benchmark_registry.py → Auto-discovers primitives
     └── primitives/      → One file per Wide op
-        ├── wide_linear.py      → Linear via grouped Conv1d
+        ├── wide_attention.py   → MHA via batched SDPA (11x speedup)
+        ├── wide_linear.py      → Linear via einsum
+        ├── wide_conv1d.py      → Conv1d with groups=N
         ├── wide_conv2d.py      → Conv2d with groups=N
-        └── ...
+        ├── wide_embedding.py   → Batched index lookup (6x speedup)
+        ├── wide_layernorm.py   → Per-group normalization
+        ├── wide_batchnorm_1d.py
+        └── wide_batchnorm_2d.py
 ```
 
 ## How It Works
@@ -58,7 +69,6 @@ wide_compiler/
 ```python
 traced = fx.symbolic_trace(template_model)
 # Captures: call_module, call_function, call_method
-# Graph shows dataflow including residual connections
 ```
 
 ### 2. Build Wide Ops
@@ -66,10 +76,10 @@ traced = fx.symbolic_trace(template_model)
 for node in traced.graph.nodes:
     if node.op == 'call_module':
         modules = [m.get_submodule(path) for m in models]
-        wide_op = WIDE_BUILDERS[module_type](modules)  # e.g., WideLinear.from_modules
+        wide_op = WIDE_BUILDERS[module_type](modules)
 ```
 
-### 3. Graph Execution (handles residuals)
+### 3. Graph Execution
 ```python
 def forward(self, x):
     values = {self._input_name: x}
@@ -85,68 +95,120 @@ Every primitive follows this pattern:
 
 ```python
 class WideLinear(nn.Module):
-    def __init__(self, n, in_features, out_features):
-        # Build grouped op in __init__, NOT reshape in forward
-        self.op = nn.Conv1d(n * in_features, n * out_features, 1, groups=n)
+    """N parallel Linear layers fused."""
+    
+    def __init__(self, n, in_features, out_features, strategy='auto'):
+        self.weight = nn.Parameter(torch.empty(n, out_features, in_features))
+        self._strategy = strategy
     
     def forward(self, x):
-        return self.op(x)  # No reshapes!
+        # x: [B, N*D_in] → [B, N*D_out]
+        if self._use_einsum:
+            return self._forward_einsum(x)
+        return self._forward_sequential(x)
     
     @classmethod
-    def from_modules(cls, modules: List[nn.Linear]) -> 'WideLinear':
-        # Stack weights from N modules into grouped conv
+    def from_modules(cls, modules: List[nn.Linear], strategy='auto'):
+        # Stack weights from N modules
 ```
 
-**Critical:** All reshaping happens at construction. Forward is just `self.op(x)`.
+**Critical:** Each primitive has multiple strategies. AUTO selects the fastest.
 
-## Registry
+## Strategy Pattern (NEW in 0.4.0)
+
+Each primitive defines strategies with different performance tradeoffs:
+
+| Primitive | Strategies | Default |
+|-----------|------------|---------|
+| WideAttention | fused, sequential | fused |
+| WideLinear | einsum, sequential | einsum |
+| WideEmbedding | indexed, gather, sequential | indexed |
+| WideConv1d | grouped, sequential | grouped |
+| WideConv2d | grouped, channels_last, sequential | grouped |
 
 ```python
-# Auto-registers on import via auto_register_primitives()
-WIDE_BUILDERS = {
-    'Linear': WideLinear.from_modules,
-    'Conv2d': WideConv2d.from_modules,
-    ...
-}
+# Override strategy
+wide = WideLinear.from_modules(modules, strategy='einsum')
+```
 
-# User can add custom:
-@wide_compiler.register('MyOp')
-class WideMyOp:
+## Benchmark System (NEW in 0.4.0)
+
+Each primitive defines its own benchmark interface:
+
+```python
+class WideAttention(nn.Module):
+    BENCHMARK_STRATEGIES = ['baseline', 'fused', 'sequential']
+    BENCHMARK_SWEEPS = {
+        'quick': SweepParams(n_values=[4,8,16,32], ...),
+        'full': SweepParams(n_values=[2,4,8,16,32,64], ...),
+    }
+    
     @classmethod
-    def from_modules(cls, modules): ...
+    def benchmark_job(cls, preset='full'):
+        return BenchmarkJob(...)
+    
+    @staticmethod
+    def _bench_model(**params): ...
+    @staticmethod
+    def _bench_input(**params): ...
+    @classmethod
+    def _bench_wide(cls, modules, strategy): ...
+```
+
+Run via CLI:
+```bash
+wide_compiler benchmark attention -p quick
+wide_compiler benchmark all -s  # Save results
+```
+
+## Key Speedups
+
+| Primitive | Best Speedup | Why |
+|-----------|--------------|-----|
+| **WideAttention** | 11.4x | Batched Flash Attention |
+| **WideLinear** | 12.8x | Fused einsum |
+| **WideEmbedding** | 6.4x | Batched index lookup |
+| **WideConv1d** | 3.2x | Grouped convolution |
+| **WideConv2d** | 2.5x | Grouped convolution |
+
+## CLI
+
+```bash
+# Benchmark primitives
+wide_compiler benchmark              # List available
+wide_compiler benchmark attention    # Benchmark one
+wide_compiler benchmark all          # Benchmark all
+wide_compiler benchmark conv2d -p quick -s  # Quick preset, save results
+
+# Other commands
+wide_compiler test                   # Correctness tests
+wide_compiler trace -m resblock      # Show FX graph
+wide_compiler info                   # Library info
 ```
 
 ## Pack / Unpack
 
 ```python
 # Pack: List of [B, C, ...] → [B, N*C, ...]
-packed = pack_inputs(inputs)  # torch.stack then reshape
+packed = wide_compiler.pack(inputs)
 
 # Unpack: [B, N*C, ...] → List of [B, C, ...]
-outputs = unpack_outputs(output, n)  # reshape then index
+outputs = wide_compiler.unpack(output, n)
 ```
 
 ## Config
 
 ```python
 WideConfig(
-    compile=True,           # torch.compile the result
+    compile=True,
     compile_mode='reduce-overhead',
-    validate=True,          # Check outputs match
-    debug=True,             # Print build info
+    validate=True,
+    debug=True,
 )
 
 # Presets
 WideConfig.fast()   # Compiled, no validation
 WideConfig.debug()  # Verbose, strict
-```
-
-## CLI
-
-```bash
-python -m wide_compiler test                    # Correctness tests
-python -m wide_compiler benchmark -n 100 -c     # Benchmark with compile
-python -m wide_compiler trace --model resblock  # Show FX graph
 ```
 
 ## Key Classes
@@ -156,68 +218,59 @@ python -m wide_compiler trace --model resblock  # Show FX graph
 | `TracedWideModel` | traced_wide.py | Main output - the fused model |
 | `WideConfig` | config.py | Configuration dataclass |
 | `WideRegistry` | registry.py | Maps module types to builders |
-| `WideLinear` etc. | primitives/ | Grouped op implementations |
+| `BenchmarkJob` | benchmark_schema.py | Defines a benchmark sweep |
+| `WideAttention` | wide_attention.py | N parallel MHA (11x speedup) |
+
+## Adding a New Primitive
+
+1. Create `primitives/wide_foo.py`:
+```python
+class WideFoo(nn.Module):
+    BENCHMARK_STRATEGIES = ['baseline', 'fast', 'sequential']
+    BENCHMARK_SWEEPS = {...}
+    
+    def __init__(self, n, ...): ...
+    def forward(self, x): ...
+    
+    @classmethod
+    def from_modules(cls, modules): ...
+    
+    @classmethod
+    def benchmark_job(cls, preset='full'): ...
+```
+
+2. Add to `primitives/__init__.py`
+3. Add to `benchmark_registry.py` imports
+4. Register in `registry.py`
 
 ## Debugging
 
-1. **Trace not working?** Model has dynamic control flow. FX can't trace `if tensor.sum() > 0`.
-
-2. **Wrong outputs?** Check `pack_inputs` produces `[B, N*C, ...]`. Print shapes.
-
-3. **Slow compiled?** First few runs are warmup. Benchmark after 5+ iterations.
-
-4. **Unknown module type?** Either:
-   - Register it: `@wide_compiler.register('MyModule')`
-   - Set `fallback_passthrough=True` in config (wraps as FunctionalOp)
-
-## Speedup Sources
-
-1. **Kernel launch overhead** - 1 launch vs N launches
-2. **Memory coalescing** - Grouped conv accesses memory efficiently
-3. **torch.compile** - Fuses ops, uses CUDA graphs
-
-Typical: **2-5x eager, 20-40x compiled**
-
-## Extension Points
-
-1. **New primitive:** Add to `primitives/`, register in `registry.py`
-2. **New config option:** Add field to `WideConfig`
-3. **Graph optimization:** Transform `traced.graph` before building
-4. **Custom backend:** Use `strategy/` folder (placeholder for inductor hooks)
-
-## Import Pattern
-
-All files use try/except for inline debugging:
-
-```python
-try:
-    from .core import TracedWideModel
-except ImportError:
-    from wide_compiler.core import TracedWideModel
-```
-
-This allows running files directly: `python wide_compiler/cli.py test`
+1. **Benchmark errors?** Run with verbose to see stack trace
+2. **Wrong outputs?** Check `pack_inputs` produces `[B, N*C, ...]`
+3. **Strategy selection?** Print `wide.strategy` to see which was chosen
+4. **Slow first run?** Warmup iterations. Benchmark after 5+ runs.
 
 ## Quick Test
 
 ```python
 import torch
-import wide_compiler
+from wide_compiler.core.primitives import WideAttention
 
-class MLP(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc1 = torch.nn.Linear(64, 128)
-        self.fc2 = torch.nn.Linear(128, 64)
-    def forward(self, x):
-        return self.fc2(torch.nn.functional.relu(self.fc1(x)))
+# Create N attention modules
+n, d_model, n_heads = 8, 256, 8
+modules = [torch.nn.MultiheadAttention(d_model, n_heads, batch_first=True).cuda() 
+           for _ in range(n)]
 
-models = [MLP() for _ in range(10)]
-sample = torch.randn(1, 64)
-wide = wide_compiler.compile(models, sample)
-print(wide.summary())
+# Fuse them
+wide = WideAttention.from_modules(modules, strategy='fused')
+print(wide)  # WideAttention(8x[d=256, h=8], strategy=fused)
+
+# Test
+x = torch.randn(4, 128, n * d_model).cuda()  # [B, T, N*D]
+out = wide(x)
+print(out.shape)  # [4, 128, 2048]
 ```
 
 ---
 
-**TL;DR:** `wide_compiler.compile(models, sample)` → FX traces → builds Wide ops from registry → returns `TracedWideModel` with graph-based forward.
+**TL;DR:** `wide_compiler.compile(models, sample)` → FX traces → builds Wide ops with auto-selected strategies → returns `TracedWideModel`. Each primitive benchmarks itself via `wide_compiler benchmark <name>`.
