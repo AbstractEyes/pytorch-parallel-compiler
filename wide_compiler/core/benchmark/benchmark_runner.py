@@ -179,7 +179,10 @@ def run(
 
                 except Exception as e:
                     if verbose:
-                        print(f"[ERR:{strategy}]", end=" ", flush=True)
+                        import traceback
+                        print(f"\n[ERROR] {strategy} failed:")
+                        traceback.print_exc()
+                        print()
 
         # Print best speedup for this N
         if verbose:
@@ -208,7 +211,7 @@ def _generate_param_combos(sweep) -> List[dict]:
     param_values = []
 
     for attr in ['batch_sizes', 'channels', 'kernel_sizes', 'seq_lengths',
-                 'heights', 'widths', 'd_model', 'vocab_sizes', 'embedding_dims']:
+                 'heights', 'widths', 'd_model', 'n_heads', 'vocab_sizes', 'embedding_dims']:
         vals = getattr(sweep, attr, None)
         if vals:
             param_names.append(attr)  # Keep original name

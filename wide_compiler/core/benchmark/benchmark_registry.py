@@ -37,6 +37,7 @@ def _auto_register():
             WideBatchNorm2d,
             WideLayerNorm,
             WideEmbedding,
+            WideAttention,
         )
         primitives_module = True
     except ImportError as e1:
@@ -50,6 +51,7 @@ def _auto_register():
                 WideBatchNorm2d,
                 WideLayerNorm,
                 WideEmbedding,
+                WideAttention,
             )
             primitives_module = True
         except ImportError as e2:
@@ -70,6 +72,7 @@ def _auto_register():
         'batchnorm2d': WideBatchNorm2d,
         'layernorm': WideLayerNorm,
         'embedding': WideEmbedding,
+        'attention': WideAttention,
     }
 
     # Register those with benchmark interface

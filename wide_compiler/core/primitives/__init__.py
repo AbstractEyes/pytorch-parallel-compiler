@@ -56,7 +56,14 @@ from .wide_conv1d import (
 from .wide_batchnorm_2d import WideBatchNorm2d
 from .wide_batchnorm_1d import WideBatchNorm1d
 from .wide_layernorm import WideLayerNorm
-from .wide_embedding import WideEmbedding
+from .wide_embedding import (
+    WideEmbedding,
+    EmbeddingStrategy,
+)
+from .wide_attention import (
+    WideAttention,
+    AttentionStrategy,
+)
 
 
 __all__ = [
@@ -79,4 +86,9 @@ __all__ = [
     'WideBatchNorm1d',
     'WideLayerNorm',
     'WideEmbedding',
+    'EmbeddingStrategy',
+
+    # Attention
+    'WideAttention',
+    'AttentionStrategy',
 ]

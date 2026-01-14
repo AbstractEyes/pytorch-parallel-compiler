@@ -34,8 +34,11 @@ class SweepParams:
     heights: List[int] = field(default_factory=list)
     widths: List[int] = field(default_factory=list)
 
-    # Linear/Embedding
+    # Linear/Embedding/Attention
     d_model: List[int] = field(default_factory=list)
+
+    # Attention specific
+    n_heads: List[int] = field(default_factory=list)
 
     # Embedding specific
     vocab_sizes: List[int] = field(default_factory=list)
