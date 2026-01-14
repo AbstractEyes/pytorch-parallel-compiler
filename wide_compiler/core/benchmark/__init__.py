@@ -34,7 +34,18 @@ from .benchmark_schema import (
 # Runner
 from .benchmark_runner import run, run_single, time_fn
 
-# API
+# Registry (import triggers auto-registration)
+from .benchmark_registry import (
+    register,
+    register_primitive,
+    get_primitive,
+    list_primitives,
+    has_primitive,
+    get_import_errors,
+    debug_registration,
+)
+
+# API (must come after registry)
 from .benchmark_api import (
     benchmark,
     benchmark_multi,
@@ -42,14 +53,8 @@ from .benchmark_api import (
     benchmark_custom,
 )
 
-# Registry
-from .benchmark_registry import (
-    register,
-    register_primitive,
-    get_primitive,
-    list_primitives,
-    has_primitive,
-)
+# Force registration on import
+list_primitives()
 
 __all__ = [
     # Schema
@@ -75,4 +80,6 @@ __all__ = [
     'get_primitive',
     'list_primitives',
     'has_primitive',
+    'get_import_errors',
+    'debug_registration',
 ]

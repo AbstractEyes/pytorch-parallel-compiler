@@ -1,8 +1,6 @@
 """
 WideLinear - N parallel Linear operations fused into a single module.
 
-All tests use torch.compile (this is a compiler library).
-
 Key findings from A100 benchmarks:
 1. Compiled einsum achieves 3-13x speedup vs N×Linear baseline
 2. Einsum has ~1e-6 numerical error in fp32 (acceptable)
@@ -17,9 +15,12 @@ Speedup examples (compiled, A100):
 - N=20, B=32:  3.0x
 - N=50, B=16:  5.1x
 - N=100, B=8:  12.8x
+
+Copyright 2025 AbstractPhil
+Apache 2.0 License
 """
 
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Dict, Any
 from enum import Enum
 
 import torch
@@ -49,12 +50,6 @@ def select_linear_strategy(n: int, b: int, in_features: int, out_features: int) 
     Einsum wins in most cases. Sequential only for edge cases:
     - Very small N with high B (not enough parallel work to offset overhead)
     - Very large output dimensions (vocab projections)
-
-    A100 Results:
-    - N=5, B=128:  einsum 0.69x (LOSES) -> use sequential
-    - N=10, B=64:  einsum 1.41x (wins)
-    - N=20, B=32:  einsum 2.84x (wins)
-    - N=100, B=8:  einsum 12.81x (wins big)
     """
     T = LINEAR_THRESHOLDS
 
@@ -129,7 +124,6 @@ class WideLinear(nn.Module):
     def _reset_parameters(self):
         """Initialize parameters like nn.Linear."""
         import math
-        # Kaiming uniform for each sub-weight
         for i in range(self.n):
             nn.init.kaiming_uniform_(self.weight[i], a=math.sqrt(5))
             if self.bias is not None:
@@ -145,11 +139,7 @@ class WideLinear(nn.Module):
             return self._forward_sequential(x)
 
     def _forward_einsum(self, x: Tensor) -> Tensor:
-        """
-        Batched matrix multiply via einsum.
-
-        Most efficient for N>=3, provides best numerical accuracy (~8e-5 error).
-        """
+        """Batched matrix multiply via einsum."""
         input_2d = x.dim() == 2
 
         if input_2d:
@@ -226,398 +216,143 @@ class WideLinear(nn.Module):
         return wide
 
     def __repr__(self):
-        return f"WideLinear({self.n}x[{self.in_features}→{self.out_features}], strategy={self._strategy.value})"
-
-
-# =============================================================================
-# TESTS - All tests use torch.compile (this is a compiler library)
-# =============================================================================
-
-if __name__ == '__main__':
-    import time
-    import torch._dynamo
-
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Device: {device}")
-    if device == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name()}")
-
-    torch._dynamo.config.cache_size_limit = 128
-
-    def benchmark(fn, num_iters=100, warmup=20):
-        """Benchmark a function, return average time in seconds."""
-        for _ in range(warmup):
-            fn()
-        if device == 'cuda':
-            torch.cuda.synchronize()
-
-        t0 = time.perf_counter()
-        for _ in range(num_iters):
-            fn()
-        if device == 'cuda':
-            torch.cuda.synchronize()
-        return (time.perf_counter() - t0) / num_iters
-
-    def compile_model(model, mode='default'):
-        """Compile and return model."""
-        return torch.compile(model, mode=mode)
+        return (
+            f"WideLinear({self.n}x[{self.in_features}->{self.out_features}], "
+            f"strategy={self._strategy.value})"
+        )
 
     # =========================================================================
-    # TEST 1: COMPILED MODEL ACCURACY (all strategies, all dtypes)
+    # BENCHMARK INTERFACE
     # =========================================================================
-    print("\n" + "=" * 70)
-    print("TEST 1: COMPILED MODEL ACCURACY")
-    print("=" * 70)
-    print("\nComparing compiled WideLinear strategies against N×Linear baseline.")
 
-    N, B, in_f, out_f = 20, 32, 512, 256
+    BENCHMARK_STRATEGIES = ['baseline', 'einsum', 'sequential']
 
-    dtypes_to_test = [torch.float32]
-    if device == 'cuda':
-        dtypes_to_test.extend([torch.float16, torch.bfloat16])
-
-    strategies = ['einsum', 'sequential']
-
-    print(f"\nConfig: N={N}, B={B}, {in_f}→{out_f}")
-    print(f"\n{'Strategy':<15} {'dtype':<10} {'vs Baseline':<12} {'Compiled OK':<12} {'Status'}")
-    print("-" * 65)
-
-    for dtype in dtypes_to_test:
-        torch._dynamo.reset()
-        torch.manual_seed(42)
-
-        # Baseline: N individual Linear (not compiled - this is the reference)
-        linears = [nn.Linear(in_f, out_f).to(device, dtype).eval() for _ in range(N)]
-        x_list = [torch.randn(B, in_f, device=device, dtype=dtype) for _ in range(N)]
-        x_packed = torch.cat(x_list, dim=1)  # [B, N*in]
-
-        with torch.inference_mode():
-            baseline_out = torch.cat([linears[i](x_list[i]) for i in range(N)], dim=1)
-
-        for strategy in strategies:
-            torch._dynamo.reset()
-
-            try:
-                # Create and compile
-                wide = WideLinear.from_modules(linears, strategy=strategy).eval()
-                wide_compiled = compile_model(wide)
-
-                # Warmup
-                with torch.inference_mode():
-                    for _ in range(5):
-                        _ = wide_compiled(x_packed)
-
-                # Test compiled output
-                with torch.inference_mode():
-                    out_compiled = wide_compiled(x_packed)
-
-                    # Compare to baseline
-                    diff_vs_baseline = (baseline_out - out_compiled).abs().max().item()
-
-                    # Verify compile didn't change output
-                    out_eager = wide(x_packed)
-                    diff_compile = (out_eager - out_compiled).abs().max().item()
-
-                # Tolerances based on dtype
-                if dtype == torch.float32:
-                    tol = 1e-4
-                elif dtype == torch.float16:
-                    tol = 1e-2
-                else:  # bf16 has lower precision
-                    tol = 2e-2
-                compile_ok = diff_compile < 1e-6
-                accuracy_ok = diff_vs_baseline < tol
-
-                status = "✓" if (compile_ok and accuracy_ok) else "✗"
-                dtype_str = str(dtype).replace("torch.", "")
-                print(f"{strategy:<15} {dtype_str:<10} {diff_vs_baseline:<12.2e} {diff_compile:<12.2e} {status}")
-
-            except Exception as e:
-                dtype_str = str(dtype).replace("torch.", "")
-                print(f"{strategy:<15} {dtype_str:<10} FAILED: {str(e)[:30]}")
-
-    # =========================================================================
-    # TEST 2: COMPILED SPEED BENCHMARKS
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("TEST 2: COMPILED SPEED BENCHMARKS")
-    print("=" * 70)
-    print("\nAll WideLinear models are torch.compile'd. Comparing to N×Linear baseline.")
-
-    configs = [
-        (20, 32, 512, 256, "Standard MLP"),
-        (50, 16, 768, 768, "Transformer FFN"),
-        (100, 8, 256, 256, "Very High N"),
-        (10, 64, 256, 1024, "Expansion layer"),
-        (20, 32, 1024, 128, "Compression layer"),
-        (5, 128, 512, 512, "Low N, High B"),
-    ]
-
-    for N, B, in_f, out_f, desc in configs:
-        print(f"\n--- {desc}: N={N}, B={B}, {in_f}→{out_f} ---")
-
-        torch._dynamo.reset()
-        torch.manual_seed(42)
-
-        linears = [nn.Linear(in_f, out_f).to(device).eval() for _ in range(N)]
-        x_list = [torch.randn(B, in_f, device=device) for _ in range(N)]
-        x_packed = torch.cat(x_list, dim=1)
-
-        # Baseline: N×Linear (not compiled)
-        with torch.inference_mode():
-            t_baseline = benchmark(lambda: [linears[i](x_list[i]) for i in range(N)], num_iters=100)
-
-        print(f"{'Strategy':<20} {'Compiled (ms)':<15} {'vs N×Linear':<12} {'Status'}")
-        print("-" * 55)
-        print(f"{'N×Linear (baseline)':<20} {t_baseline*1000:<15.3f} {'1.00x':<12}")
-
-        for strategy in ['einsum', 'sequential', 'auto']:
-            torch._dynamo.reset()
-
-            try:
-                wide = WideLinear.from_modules(linears, strategy=strategy).eval()
-                wide_compiled = compile_model(wide)
-
-                # Warmup compiled
-                with torch.inference_mode():
-                    for _ in range(10):
-                        _ = wide_compiled(x_packed)
-                if device == 'cuda':
-                    torch.cuda.synchronize()
-
-                with torch.inference_mode():
-                    t_compiled = benchmark(lambda: wide_compiled(x_packed), num_iters=100)
-
-                speedup = t_baseline / t_compiled
-                status = "✓" if speedup > 1.1 else ("" if speedup > 0.9 else "✗")
-
-                label = strategy
-                if strategy == 'auto':
-                    label = f"auto→{wide.strategy.value}"
-
-                print(f"{label:<20} {t_compiled*1000:<15.3f} {speedup:<12.2f}x {status}")
-
-            except Exception as e:
-                print(f"{strategy:<20} FAILED: {str(e)[:35]}")
-
-    # =========================================================================
-    # TEST 3: COMPILE MODES
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("TEST 3: COMPILE MODES")
-    print("=" * 70)
-
-    N, B, in_f, out_f = 50, 16, 768, 768
-    print(f"\nConfig: N={N}, B={B}, {in_f}→{out_f}")
-
-    torch.manual_seed(42)
-    linears = [nn.Linear(in_f, out_f).to(device).eval() for _ in range(N)]
-    x_list = [torch.randn(B, in_f, device=device) for _ in range(N)]
-    x_packed = torch.cat(x_list, dim=1)
-
-    # Baseline
-    with torch.inference_mode():
-        t_baseline = benchmark(lambda: [linears[i](x_list[i]) for i in range(N)], num_iters=100)
-
-    compile_modes = ['default', 'reduce-overhead']
-
-    print(f"\n{'Mode':<20} {'Strategy':<15} {'Time (ms)':<12} {'vs N×Linear':<12} {'Status'}")
-    print("-" * 70)
-    print(f"{'N×Linear baseline':<20} {'-':<15} {t_baseline*1000:<12.3f} {'1.00x':<12}")
-
-    for mode in compile_modes:
-        for strategy in ['einsum', 'sequential']:
-            torch._dynamo.reset()
-
-            try:
-                wide = WideLinear.from_modules(linears, strategy=strategy).eval()
-                wide_compiled = torch.compile(wide, mode=mode)
-
-                # Warmup
-                with torch.inference_mode():
-                    for _ in range(15):
-                        _ = wide_compiled(x_packed)
-                if device == 'cuda':
-                    torch.cuda.synchronize()
-
-                with torch.inference_mode():
-                    t = benchmark(lambda: wide_compiled(x_packed), num_iters=100)
-
-                speedup = t_baseline / t
-                status = "✓" if speedup > 1.1 else ""
-                print(f"{mode:<20} {strategy:<15} {t*1000:<12.3f} {speedup:<12.2f}x {status}")
-
-            except Exception as e:
-                print(f"{mode:<20} {strategy:<15} FAILED: {str(e)[:25]}")
-
-    # =========================================================================
-    # TEST 4: DTYPE + COMPILE SPEED
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("TEST 4: DTYPE + COMPILE SPEED")
-    print("=" * 70)
-
-    N, B, in_f, out_f = 50, 16, 768, 768
-    print(f"\nConfig: N={N}, B={B}, {in_f}→{out_f}, strategy=einsum")
-
-    dtypes_speed = [torch.float32]
-    if device == 'cuda':
-        dtypes_speed.extend([torch.float16, torch.bfloat16])
-
-    print(f"\n{'dtype':<12} {'Compiled (ms)':<15} {'N×Linear (ms)':<15} {'Speedup':<12} {'Status'}")
-    print("-" * 65)
-
-    for dtype in dtypes_speed:
-        torch._dynamo.reset()
-        torch.manual_seed(42)
-
+    @classmethod
+    def _get_sweep_params_class(cls):
+        """Get SweepParams class with multiple import attempts."""
         try:
-            linears = [nn.Linear(in_f, out_f).to(device, dtype).eval() for _ in range(N)]
-            x_list = [torch.randn(B, in_f, device=device, dtype=dtype) for _ in range(N)]
-            x_packed = torch.cat(x_list, dim=1)
-
-            wide = WideLinear.from_modules(linears, strategy='einsum').eval()
-            wide_compiled = compile_model(wide)
-
-            # Warmup
-            with torch.inference_mode():
-                for _ in range(10):
-                    _ = wide_compiled(x_packed)
-            if device == 'cuda':
-                torch.cuda.synchronize()
-
-            with torch.inference_mode():
-                t_baseline = benchmark(lambda: [linears[i](x_list[i]) for i in range(N)], num_iters=100)
-                t_compiled = benchmark(lambda: wide_compiled(x_packed), num_iters=100)
-
-            speedup = t_baseline / t_compiled
-            status = "✓" if speedup > 1.5 else ""
-            dtype_str = str(dtype).replace("torch.", "")
-            print(f"{dtype_str:<12} {t_compiled*1000:<15.3f} {t_baseline*1000:<15.3f} {speedup:<12.2f}x {status}")
-
-        except Exception as e:
-            dtype_str = str(dtype).replace("torch.", "")
-            print(f"{dtype_str:<12} FAILED: {str(e)[:40]}")
-
-    # =========================================================================
-    # TEST 5: GRAPH BREAK DETECTION
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("TEST 5: GRAPH BREAK DETECTION")
-    print("=" * 70)
-    print("\nVerifying no graph breaks in compiled models.")
-
-    N, B, in_f, out_f = 20, 32, 512, 256
-
-    torch.manual_seed(42)
-    linears = [nn.Linear(in_f, out_f).to(device).eval() for _ in range(N)]
-    x_packed = torch.randn(B, N * in_f, device=device)
-
-    print(f"\n{'Strategy':<20} {'Graph Breaks':<15} {'Status'}")
-    print("-" * 50)
-
-    for strategy in ['einsum', 'sequential']:
-        torch._dynamo.reset()
-
+            from ..benchmark.benchmark_schema import SweepParams
+            return SweepParams
+        except ImportError:
+            pass
         try:
-            wide = WideLinear.from_modules(linears, strategy=strategy).eval()
+            from wide_compiler.core.benchmark.benchmark_schema import SweepParams
+            return SweepParams
+        except ImportError:
+            pass
+        return None
 
-            # Use explain to check for graph breaks
-            explanation = torch._dynamo.explain(wide)(x_packed)
-            num_breaks = explanation.graph_break_count
-
-            status = "✓" if num_breaks == 0 else f"✗ ({num_breaks} breaks)"
-            print(f"{strategy:<20} {num_breaks:<15} {status}")
-
-        except Exception as e:
-            print(f"{strategy:<20} FAILED: {str(e)[:30]}")
-
-    # =========================================================================
-    # TEST 6: TRAINING MODE (compiled backward pass)
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("TEST 6: TRAINING MODE (compiled backward)")
-    print("=" * 70)
-
-    N, B, in_f, out_f = 20, 32, 512, 256
-
-    print(f"\nConfig: N={N}, B={B}, {in_f}→{out_f}")
-    print(f"\n{'Strategy':<15} {'Fwd (ms)':<12} {'Bwd (ms)':<12} {'Total (ms)':<12} {'Status'}")
-    print("-" * 60)
-
-    for strategy in ['einsum', 'sequential']:
-        torch._dynamo.reset()
-        torch.manual_seed(42)
-
+    @classmethod
+    def _get_benchmark_job_class(cls):
+        """Get BenchmarkJob class with multiple import attempts."""
         try:
-            linears = [nn.Linear(in_f, out_f).to(device) for _ in range(N)]
-            wide = WideLinear.from_modules(linears, strategy=strategy).train()
-            wide_compiled = torch.compile(wide, mode='default')
+            from ..benchmark.benchmark_schema import BenchmarkJob
+            return BenchmarkJob
+        except ImportError:
+            pass
+        try:
+            from wide_compiler.core.benchmark.benchmark_schema import BenchmarkJob
+            return BenchmarkJob
+        except ImportError:
+            pass
+        return None
 
-            x_packed = torch.randn(B, N * in_f, device=device, requires_grad=True)
+    BENCHMARK_SWEEPS: Dict[str, Any] = {}
+    _SWEEPS_INITIALIZED = False
 
-            # Warmup
-            for _ in range(5):
-                out = wide_compiled(x_packed)
-                loss = out.sum()
-                loss.backward()
-                wide.zero_grad()
-                if x_packed.grad is not None:
-                    x_packed.grad.zero_()
-            if device == 'cuda':
-                torch.cuda.synchronize()
+    @classmethod
+    def _init_benchmark_sweeps(cls):
+        """Initialize sweep configs (called once on first access)."""
+        if cls._SWEEPS_INITIALIZED:
+            return
+        cls._SWEEPS_INITIALIZED = True
 
-            # Benchmark forward
-            def fwd():
-                return wide_compiled(x_packed)
+        SweepParams = cls._get_sweep_params_class()
+        if SweepParams is None:
+            return
 
-            # Benchmark forward + backward
-            def fwd_bwd():
-                out = wide_compiled(x_packed)
-                loss = out.sum()
-                loss.backward()
-                wide.zero_grad()
-                if x_packed.grad is not None:
-                    x_packed.grad.zero_()
+        cls.BENCHMARK_SWEEPS = {
+            'quick': SweepParams(
+                n_values=[4, 8, 16, 32],
+                batch_sizes=[16],
+                d_model=[256],
+            ),
+            'full': SweepParams(
+                n_values=[2, 4, 6, 8, 10, 12, 16, 20, 32, 64, 100],
+                batch_sizes=[8, 16, 32, 64],
+                d_model=[128, 256, 512, 768],
+            ),
+            'ci': SweepParams(
+                n_values=[4, 16],
+                batch_sizes=[16],
+                d_model=[256],
+            ),
+        }
 
-            t_fwd = benchmark(fwd, num_iters=100, warmup=10)
-            t_total = benchmark(fwd_bwd, num_iters=100, warmup=10)
-            t_bwd = t_total - t_fwd
+    @classmethod
+    def benchmark_job(cls, preset: str = 'full', **overrides) -> Any:
+        """Get benchmark job for WideLinear."""
+        cls._init_benchmark_sweeps()
 
-            print(f"{strategy:<15} {t_fwd*1000:<12.3f} {t_bwd*1000:<12.3f} {t_total*1000:<12.3f} ✓")
+        BenchmarkJob = cls._get_benchmark_job_class()
+        if BenchmarkJob is None:
+            raise ImportError("Could not import BenchmarkJob from benchmark_schema")
 
-        except Exception as e:
-            print(f"{strategy:<15} FAILED: {str(e)[:40]}")
+        sweep = cls.BENCHMARK_SWEEPS.get(preset)
+        if sweep is None:
+            raise ValueError(f"Unknown preset '{preset}'. Available: {list(cls.BENCHMARK_SWEEPS.keys())}")
 
-    # =========================================================================
-    # SUMMARY
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("SUMMARY")
-    print("=" * 70)
-    print("""
-All tests use torch.compile (this is a compiler library).
+        if overrides:
+            sweep = sweep.with_overrides(**overrides)
 
-Key Results (A100):
-1. ACCURACY: All strategies compile correctly with minimal numerical drift
-   - fp32: ~1e-6 error
-   - fp16: ~1e-3 error  
-   - bf16: ~1e-2 error
+        return BenchmarkJob(
+            name=f'linear_{preset}',
+            primitive='linear',
+            strategies=cls.BENCHMARK_STRATEGIES,
+            sweep=sweep,
+            model_factory=cls._bench_model,
+            input_factory=cls._bench_input,
+            wide_factory=cls._bench_wide,
+            pack_fn=cls._bench_pack,
+            unpack_fn=cls._bench_unpack,
+        )
 
-2. SPEED (compiled einsum vs N×Linear baseline):
-   - Standard MLP (N=20, B=32):     3.0x speedup
-   - Transformer FFN (N=50, B=16):  5.1x speedup
-   - Very High N (N=100, B=8):      12.8x speedup
-   - Low N, High B (N=5, B=128):    0.7x (use baseline)
+    @staticmethod
+    def _bench_model(d_model: int, **_) -> nn.Linear:
+        """Create single Linear for benchmarking."""
+        return nn.Linear(d_model, d_model)
 
-3. GRAPH BREAKS: None detected in any strategy
+    @staticmethod
+    def _bench_input(n: int, batch_sizes: int, d_model: int, device: str = 'cpu', **_) -> Tensor:
+        """Create single input tensor."""
+        return torch.randn(batch_sizes, d_model, device=device)
 
-4. TRAINING: Forward and backward pass both compile successfully
+    @classmethod
+    def _bench_wide(cls, modules: List[nn.Linear], strategy: str) -> 'WideLinear':
+        """Create WideLinear with specific strategy."""
+        strat_map = {
+            'einsum': LinearStrategy.EINSUM,
+            'sequential': LinearStrategy.SEQUENTIAL,
+        }
+        strat = strat_map.get(strategy, LinearStrategy.EINSUM)
+        return cls.from_modules(modules, strategy=strat)
 
-5. COMPILE MODES: reduce-overhead gives additional ~10% speedup
+    @staticmethod
+    def _bench_pack(inputs: List[Tensor]) -> Tensor:
+        """Pack N inputs into wide format."""
+        return torch.cat(inputs, dim=1)  # [B, N*d]
 
-Recommended:
-- Use strategy='einsum' for N >= 8 (fastest)
-- Use strategy='auto' for automatic selection
-- Low N with High B: baseline N×Linear may be faster
-""")
+    @staticmethod
+    def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
+        """Unpack wide output to N outputs."""
+        B = output.shape[0]
+        d = output.shape[1] // n
+        return [output[:, i*d:(i+1)*d] for i in range(n)]
+
+
+__all__ = [
+    'WideLinear',
+    'LinearStrategy',
+    'select_linear_strategy',
+    'LINEAR_THRESHOLDS',
+]

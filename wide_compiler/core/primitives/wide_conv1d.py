@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from enum import Enum, auto
 from typing import List, Optional, Dict, Any
-from dataclasses import replace
 
 import torch
 from torch import nn, Tensor
@@ -196,25 +195,59 @@ class WideConv1d(nn.Module):
     # BENCHMARK INTERFACE
     # =========================================================================
 
-    # Import here to avoid circular imports
-    try:
-        from ..benchmark.benchmark_schema import SweepParams, BenchmarkJob
-    except ImportError:
-        SweepParams = None
-        BenchmarkJob = None
-
-    BENCHMARK_SWEEPS: Dict[str, Any] = {}
     BENCHMARK_STRATEGIES = ['baseline', 'grouped', 'sequential']
+
+    @classmethod
+    def _get_sweep_params_class(cls):
+        """Get SweepParams class with multiple import attempts."""
+        # Try relative import
+        try:
+            from ..benchmark.benchmark_schema import SweepParams
+            return SweepParams
+        except ImportError:
+            pass
+
+        # Try absolute import
+        try:
+            from wide_compiler.core.benchmark.benchmark_schema import SweepParams
+            return SweepParams
+        except ImportError:
+            pass
+
+        return None
+
+    @classmethod
+    def _get_benchmark_job_class(cls):
+        """Get BenchmarkJob class with multiple import attempts."""
+        # Try relative import
+        try:
+            from ..benchmark.benchmark_schema import BenchmarkJob
+            return BenchmarkJob
+        except ImportError:
+            pass
+
+        # Try absolute import
+        try:
+            from wide_compiler.core.benchmark.benchmark_schema import BenchmarkJob
+            return BenchmarkJob
+        except ImportError:
+            pass
+
+        return None
+
+    # Sweep configurations - populated on first access
+    BENCHMARK_SWEEPS: Dict[str, Any] = {}
+    _SWEEPS_INITIALIZED = False
 
     @classmethod
     def _init_benchmark_sweeps(cls):
         """Initialize sweep configs (called once on first access)."""
-        if cls.BENCHMARK_SWEEPS:
+        if cls._SWEEPS_INITIALIZED:
             return
+        cls._SWEEPS_INITIALIZED = True
 
-        try:
-            from ..benchmark.benchmark_schema import SweepParams
-        except ImportError:
+        SweepParams = cls._get_sweep_params_class()
+        if SweepParams is None:
             return
 
         cls.BENCHMARK_SWEEPS = {
@@ -242,7 +275,7 @@ class WideConv1d(nn.Module):
         }
 
     @classmethod
-    def benchmark_job(cls, preset: str = 'full', **overrides) -> 'BenchmarkJob':
+    def benchmark_job(cls, preset: str = 'full', **overrides) -> Any:
         """
         Get benchmark job for WideConv1d.
 
@@ -255,7 +288,9 @@ class WideConv1d(nn.Module):
         """
         cls._init_benchmark_sweeps()
 
-        from ..benchmark.benchmark_schema import SweepParams, BenchmarkJob
+        BenchmarkJob = cls._get_benchmark_job_class()
+        if BenchmarkJob is None:
+            raise ImportError("Could not import BenchmarkJob from benchmark_schema")
 
         sweep = cls.BENCHMARK_SWEEPS.get(preset)
         if sweep is None:

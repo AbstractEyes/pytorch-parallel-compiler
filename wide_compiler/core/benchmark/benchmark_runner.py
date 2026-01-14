@@ -1,37 +1,37 @@
 """
 WideCompiler.core.benchmark.benchmark_runner
 
-Generic benchmark execution engine.
-
-Knows nothing about specific primitives - just runs BenchmarkJob and produces BenchmarkResult.
+Execute benchmark jobs and time functions.
 
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
 
-from __future__ import annotations
-
 import time
-from datetime import datetime
-from typing import List, Dict, Any, Callable, Optional
-
+from typing import Callable, List, Optional
 import torch
-import torch.nn as nn
+from torch import Tensor
 
-from .benchmark_schema import BenchmarkJob, BenchmarkResult, SingleResult, SweepParams
+from .benchmark_schema import BenchmarkJob, BenchmarkResult, SingleResult
 
 
 def time_fn(
-        fn: Callable,
-        warmup: int,
-        iters: int,
-        device: str,
+    fn: Callable,
+    iterations: int = 10,
+    warmup: int = 3,
+    device: str = 'cuda',
 ) -> float:
     """
-    Time a function.
+    Time a function with warmup and synchronization.
+
+    Args:
+        fn: Function to time (no args)
+        iterations: Number of timed iterations
+        warmup: Warmup iterations (not timed)
+        device: 'cuda' or 'cpu'
 
     Returns:
-        Mean time in milliseconds
+        Average time in milliseconds
     """
     # Warmup
     for _ in range(warmup):
@@ -40,279 +40,188 @@ def time_fn(
     if device == 'cuda':
         torch.cuda.synchronize()
 
-    # Timed runs
-    t0 = time.perf_counter()
-    for _ in range(iters):
+    # Time
+    start = time.perf_counter()
+    for _ in range(iterations):
         fn()
-
     if device == 'cuda':
         torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
 
-    return (time.perf_counter() - t0) / iters * 1000
+    return (elapsed / iterations) * 1000  # ms
 
 
-def check_correctness(
-        ref_outputs: List[torch.Tensor],
-        test_output: torch.Tensor,
-        unpack_fn: Callable,
-        n: int,
-        rtol: float,
-        atol: float,
-) -> tuple[bool, float]:
+def run_single(
+    job: BenchmarkJob,
+    n: int,
+    strategy: str,
+    params: dict,
+    device: str = 'cuda',
+    warmup: int = 3,
+    iterations: int = 10,
+) -> SingleResult:
     """
-    Check if wide output matches reference.
+    Run a single benchmark configuration.
+
+    Args:
+        job: BenchmarkJob with factories
+        n: Number of parallel models
+        strategy: Strategy name ('baseline', 'grouped', etc.)
+        params: Sweep params for this run
+        device: 'cuda' or 'cpu'
+        warmup: Warmup iterations
+        iterations: Timing iterations
 
     Returns:
-        (correct, max_error)
+        SingleResult with timing
     """
-    test_outputs = unpack_fn(test_output, n)
+    # Create N models
+    models = [job.model_factory(**params).to(device).eval() for _ in range(n)]
 
-    max_error = 0.0
-    for ref, test in zip(ref_outputs, test_outputs):
-        diff = (ref - test).abs().max().item()
-        max_error = max(max_error, diff)
+    # Create input
+    sample = job.input_factory(n=n, device=device, **params)
+    inputs = [sample.clone() for _ in range(n)]
 
-    correct = max_error < atol + rtol * max(
-        max(o.abs().max().item() for o in ref_outputs),
-        1e-6
+    # Baseline: sequential execution
+    def baseline_fn():
+        for i, m in enumerate(models):
+            m(inputs[i])
+
+    baseline_ms = time_fn(baseline_fn, iterations=iterations, warmup=warmup, device=device)
+
+    # Strategy-specific
+    if strategy == 'baseline':
+        return SingleResult(
+            n=n,
+            strategy='baseline',
+            params=params,
+            time_ms=baseline_ms,
+            baseline_ms=baseline_ms,
+            speedup=1.0,
+        )
+
+    # Build wide model with strategy
+    wide_model = job.wide_factory(models, strategy).to(device).eval()
+    packed = job.pack_fn(inputs)
+
+    def wide_fn():
+        wide_model(packed)
+
+    wide_ms = time_fn(wide_fn, iterations=iterations, warmup=warmup, device=device)
+    speedup = baseline_ms / wide_ms if wide_ms > 0 else 0
+
+    return SingleResult(
+        n=n,
+        strategy=strategy,
+        params=params,
+        time_ms=wide_ms,
+        baseline_ms=baseline_ms,
+        speedup=speedup,
     )
-
-    return correct, max_error
 
 
 def run(
-        job: BenchmarkJob,
-        verbose: bool = True,
+    job: BenchmarkJob,
+    device: str = 'cuda',
+    verbose: bool = True,
+    warmup: int = 3,
+    iterations: int = 10,
 ) -> BenchmarkResult:
     """
-    Execute a benchmark job.
+    Run complete benchmark sweep.
 
     Args:
-        job: BenchmarkJob with sweep params and factories
-        verbose: Print progress
+        job: BenchmarkJob defining the sweep
+        device: 'cuda' or 'cpu'
+        verbose: Print progress (True=progress updates, False=silent)
+        warmup: Warmup iterations per config
+        iterations: Timing iterations per config
 
     Returns:
         BenchmarkResult with all measurements
     """
-    device = job.device
     if device == 'cuda' and not torch.cuda.is_available():
-        device = 'cpu'
         if verbose:
-            print("CUDA not available, using CPU")
-
-    if verbose:
-        print(f"Benchmark: {job.name}")
-        print(f"Primitive: {job.primitive}")
-        print(f"Device: {device}")
-        print(f"Strategies: {job.strategies}")
-        print("=" * 60)
-
-    started_at = datetime.now().isoformat()
-    t_start = time.perf_counter()
+            print("CUDA not available, falling back to CPU")
+        device = 'cpu'
 
     results: List[SingleResult] = []
-    errors: List[str] = []
+    sweep = job.sweep
 
-    # Iterate sweep
-    n_values = job.sweep.n_values
-    param_combos = list(job.sweep.param_grid())
-    total = len(n_values) * len(param_combos)
+    # Generate all param combinations
+    param_combos = _generate_param_combos(sweep)
 
-    idx = 0
-    for n in n_values:
-        for params in param_combos:
-            idx += 1
-
-            if verbose:
-                params_str = ", ".join(f"{k}={v}" for k, v in params.items())
-                print(f"[{idx}/{total}] N={n}, {params_str}...", end=" ", flush=True)
-
-            try:
-                result = run_single(job, n, params, device)
-                results.append(result)
-
-                if verbose:
-                    best = result.best_strategy
-                    speedup = result.best_speedup
-                    print(f"{best}={speedup:.2f}x")
-
-            except Exception as e:
-                error_msg = f"N={n}, {params}: {e}"
-                errors.append(error_msg)
-                if verbose:
-                    print(f"ERROR: {e}")
-
-    # Compute summary
-    duration_s = time.perf_counter() - t_start
-    completed_at = datetime.now().isoformat()
-
-    strategy_wins = count_strategy_wins(results)
-    crossover_n = find_crossover(results, job.strategies)
-    best_speedup, best_config = find_best(results)
-
-    # Determine recommended threshold
-    # If grouped starts winning at crossover_n, recommend that
-    recommended = crossover_n if crossover_n else job.sweep.n_values[0]
-
-    result = BenchmarkResult(
-        name=job.name,
-        primitive=job.primitive,
-        strategies=job.strategies,
-        sweep=job.sweep,
-        results=results,
-        crossover_n=crossover_n,
-        recommended_threshold=recommended,
-        strategy_wins=strategy_wins,
-        best_speedup=best_speedup,
-        best_config=best_config,
-        device=device if device == 'cpu' else torch.cuda.get_device_name(),
-        started_at=started_at,
-        completed_at=completed_at,
-        duration_s=duration_s,
-        errors=errors,
-    )
+    total_configs = len(sweep.n_values) * len(job.strategies) * len(param_combos)
+    current = 0
 
     if verbose:
-        print("=" * 60)
-        print(result.summary())
+        print(f"Running {job.name}: {total_configs} configs")
 
-    return result
+    for n in sweep.n_values:
+        if verbose:
+            print(f"  N={n}", end=" ", flush=True)
 
+        n_results = []
 
-def run_single(
-        job: BenchmarkJob,
-        n: int,
-        params: Dict[str, Any],
-        device: str,
-) -> SingleResult:
-    """
-    Run benchmark for single (n, params) configuration.
-    """
-    # Merge params with device
-    full_params = {**params, 'device': device}
+        for params in param_combos:
+            for strategy in job.strategies:
+                current += 1
 
-    # Create N modules
-    modules = [job.model_factory(**params).to(device).eval() for _ in range(n)]
+                try:
+                    result = run_single(
+                        job, n, strategy, params,
+                        device=device,
+                        warmup=warmup,
+                        iterations=iterations,
+                    )
+                    results.append(result)
+                    n_results.append(result)
 
-    # Create single inputs for baseline
-    # Input factory should return shape for ONE model (will be replicated)
-    sample_input = job.input_factory(1, **full_params)
-    single_shape = sample_input.shape
-    single_inputs = [torch.randn(*single_shape, device=device) for _ in range(n)]
+                except Exception as e:
+                    if verbose:
+                        print(f"[ERR:{strategy}]", end=" ", flush=True)
 
-    # Create packed input for wide
-    packed_input = job.pack_fn(single_inputs)
+        # Print best speedup for this N
+        if verbose:
+            non_baseline = [r for r in n_results if r.strategy != 'baseline']
+            if non_baseline:
+                best = max(non_baseline, key=lambda r: r.speedup)
+                print(f"→ {best.speedup:.2f}x ({best.strategy})")
+            else:
+                print()
 
-    timings: Dict[str, float] = {}
-
-    with torch.no_grad():
-        # Baseline: N separate forward passes
-        timings['baseline'] = time_fn(
-            lambda: [m(x) for m, x in zip(modules, single_inputs)],
-            job.warmup,
-            job.iters,
-            device,
-        )
-
-        # Reference outputs for correctness
-        ref_outputs = [m(x) for m, x in zip(modules, single_inputs)]
-
-        # Each strategy (skip baseline)
-        correct = True
-        max_error = 0.0
-
-        for strategy in job.strategies:
-            if strategy == 'baseline':
-                continue
-
-            wide = job.wide_factory(modules, strategy).to(device).eval()
-
-            timings[strategy] = time_fn(
-                lambda w=wide, x=packed_input: w(x),
-                job.warmup,
-                job.iters,
-                device,
-            )
-
-            # Check correctness (once per strategy)
-            test_output = wide(packed_input)
-            strat_correct, strat_error = check_correctness(
-                ref_outputs, test_output, job.unpack_fn, n,
-                job.rtol, job.atol
-            )
-            correct = correct and strat_correct
-            max_error = max(max_error, strat_error)
-
-    # Compute speedups
-    baseline_ms = timings['baseline']
-    speedups = {s: baseline_ms / t for s, t in timings.items()}
-
-    # Find best non-baseline strategy
-    non_baseline = {s: sp for s, sp in speedups.items() if s != 'baseline'}
-    if non_baseline:
-        best_strategy = max(non_baseline, key=non_baseline.get)
-        best_speedup = non_baseline[best_strategy]
-    else:
-        best_strategy = 'baseline'
-        best_speedup = 1.0
-
-    return SingleResult(
-        n=n,
-        params=params,
-        timings=timings,
-        speedups=speedups,
-        best_strategy=best_strategy,
-        best_speedup=best_speedup,
-        correct=correct,
-        max_error=max_error,
+    return BenchmarkResult(
+        name=job.name,
+        primitive=job.primitive,
+        device=device,
+        results=results,
     )
 
 
-def count_strategy_wins(results: List[SingleResult]) -> Dict[str, int]:
-    """Count how many times each strategy was best."""
-    wins: Dict[str, int] = {}
-    for r in results:
-        s = r.best_strategy
-        wins[s] = wins.get(s, 0) + 1
-    return wins
+def _generate_param_combos(sweep) -> List[dict]:
+    """Generate all parameter combinations from sweep."""
+    import itertools
+
+    # Get all sweep attributes except n_values
+    # Keep plural names to match factory function signatures
+    param_names = []
+    param_values = []
+
+    for attr in ['batch_sizes', 'channels', 'kernel_sizes', 'seq_lengths',
+                 'heights', 'widths', 'd_model', 'vocab_sizes', 'embedding_dims']:
+        vals = getattr(sweep, attr, None)
+        if vals:
+            param_names.append(attr)  # Keep original name
+            param_values.append(vals)
+
+    if not param_names:
+        return [{}]
+
+    combos = []
+    for values in itertools.product(*param_values):
+        combos.append(dict(zip(param_names, values)))
+
+    return combos
 
 
-def find_crossover(
-        results: List[SingleResult],
-        strategies: List[str],
-) -> Optional[int]:
-    """
-    Find N where strategy changes from one to another.
-
-    Looks for first N where a non-sequential strategy wins.
-    """
-    # Sort by n
-    sorted_results = sorted(results, key=lambda r: r.n)
-
-    # Find first result where grouped/einsum wins over sequential
-    for r in sorted_results:
-        if r.best_strategy in ('grouped', 'einsum'):
-            return r.n
-
-    return None
-
-
-def find_best(results: List[SingleResult]) -> tuple[float, Dict[str, Any]]:
-    """Find best speedup and its config."""
-    if not results:
-        return 1.0, {}
-
-    best = max(results, key=lambda r: r.best_speedup)
-    return best.best_speedup, {'n': best.n, **best.params}
-
-
-# =============================================================================
-# EXPORTS
-# =============================================================================
-
-__all__ = [
-    'run',
-    'run_single',
-    'time_fn',
-    'check_correctness',
-]
+__all__ = ['run', 'run_single', 'time_fn']

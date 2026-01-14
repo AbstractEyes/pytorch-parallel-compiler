@@ -4,12 +4,15 @@ WideCompiler CLI
 Benchmark and debug utilities for Wide model compilation.
 
 Usage:
-    python -m wide_compiler test
-    python -m wide_compiler benchmark conv1d
-    python -m wide_compiler benchmark conv1d --preset quick
-    python -m wide_compiler benchmark all
-    python -m wide_compiler trace --model resblock
-    python -m wide_compiler info
+    python -m wide_compiler benchmark              # List available primitives
+    python -m wide_compiler benchmark conv1d       # Benchmark conv1d
+    python -m wide_compiler benchmark conv1d -p quick  # Quick preset
+    python -m wide_compiler benchmark all          # Benchmark ALL primitives
+    python -m wide_compiler benchmark all -s       # Benchmark all + auto-save
+    python -m wide_compiler benchmark conv1d -q    # Quiet mode
+    python -m wide_compiler test                   # Run correctness tests
+    python -m wide_compiler trace --model resblock # Show FX trace
+    python -m wide_compiler info                   # Show library info
 
 Copyright 2025 AbstractPhil
 Apache 2.0 License
@@ -199,37 +202,91 @@ def cmd_trace(args):
 def cmd_benchmark(args):
     """Benchmark primitive strategies."""
     try:
-        from .core.benchmark import benchmark, benchmark_all, list_primitives
+        from .core.benchmark import benchmark, benchmark_all, list_primitives, get_import_errors
     except ImportError:
-        from wide_compiler.core.benchmark import benchmark, benchmark_all, list_primitives
+        from wide_compiler.core.benchmark import benchmark, benchmark_all, list_primitives, get_import_errors
+
+    import datetime
 
     device = 'cpu' if args.cpu else 'cuda'
     available = list_primitives()
 
+    # No primitive specified - show list and usage
+    if args.primitive is None:
+        print("WideCompiler Benchmark")
+        print("=" * 60)
+        print()
+
+        if available:
+            print("Available primitives:")
+            for name in sorted(available):
+                print(f"  - {name}")
+        else:
+            print("No primitives registered with benchmark interface.")
+            errors = get_import_errors()
+            if errors:
+                print("\nRegistration errors:")
+                for err in errors:
+                    print(f"  - {err}")
+
+        print()
+        print("Usage:")
+        print("  wide_compiler benchmark <primitive>     # Benchmark one primitive")
+        print("  wide_compiler benchmark conv1d          # Example: benchmark conv1d")
+        print("  wide_compiler benchmark conv1d -p quick # Use quick preset")
+        print("  wide_compiler benchmark all             # Benchmark ALL primitives")
+        print("  wide_compiler benchmark all -s          # Benchmark all + auto-save")
+        print()
+        print("Options:")
+        print("  -p, --preset   Sweep preset: quick, full (default), ci")
+        print("  -t, --top      Number of top results to show (default: 10)")
+        print("  -q, --quiet    Suppress progress output")
+        print("  -s, --save     Auto-save results with timestamp")
+        print("  -o, --output   Save to specific file")
+        return 0
+
     # Handle 'all'
     if args.primitive == 'all':
+        if not available:
+            print("No primitives registered with benchmark interface.")
+            errors = get_import_errors()
+            if errors:
+                print("\nRegistration errors:")
+                for err in errors:
+                    print(f"  - {err}")
+            return 1
+
         results = benchmark_all(
             preset=args.preset,
             device=device,
-            verbose=True,
+            verbose=not args.quiet,
         )
 
-        # Summary
-        print("\n" + "=" * 60)
-        print("SUMMARY")
-        print("=" * 60)
-        for name, result in results.items():
-            print(f"\n{name}:")
-            print(f"  Crossover N: {result.crossover_n}")
-            print(f"  Best speedup: {result.best_speedup:.2f}x")
-            print(f"  Strategy wins: {result.strategy_wins}")
+        if not results:
+            print("No benchmarks run.")
+            return 0
 
+        # Print summary for each
+        for name, result in results.items():
+            print(result.summary())
+            print(result.top_table(args.top))
+            print()
+
+        # Auto-save if requested or default
         if args.output:
+            output_path = args.output
+        elif args.save:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = f"benchmark_all_{timestamp}.json"
+        else:
+            output_path = None
+
+        if output_path:
             import json
             combined = {name: r.to_dict() for name, r in results.items()}
-            with open(args.output, 'w') as f:
+            with open(output_path, 'w') as f:
                 json.dump(combined, f, indent=2)
-            print(f"\nSaved to {args.output}")
+            print(f"Saved to {output_path}")
 
         return 0
 
@@ -255,17 +312,26 @@ def cmd_benchmark(args):
         primitive,
         preset=args.preset,
         device=device,
-        verbose=True,
+        verbose=not args.quiet,
         **overrides,
     )
 
-    # Print table
-    print("\n" + result.table())
+    # Print summary + top results
+    print(result.summary())
+    print(result.top_table(args.top))
 
     # Save if requested
     if args.output:
-        result.save(args.output)
-        print(f"\nSaved to {args.output}")
+        output_path = args.output
+    elif args.save:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = f"benchmark_{primitive}_{timestamp}.json"
+    else:
+        output_path = None
+
+    if output_path:
+        result.save(output_path)
+        print(f"\nSaved to {output_path}")
 
     return 0
 
@@ -302,11 +368,14 @@ def cmd_info(args):
             print()
 
     print("Usage:")
-    print("  wide_compiler test              # Run correctness tests")
-    print("  wide_compiler benchmark conv1d  # Benchmark Conv1d strategies")
-    print("  wide_compiler benchmark all     # Benchmark all primitives")
-    print("  wide_compiler trace -m mlp      # Show FX trace")
-    print("  wide_compiler info              # This help")
+    print("  wide_compiler benchmark            # List available primitives")
+    print("  wide_compiler benchmark conv1d     # Benchmark conv1d")
+    print("  wide_compiler benchmark all        # Benchmark ALL primitives")
+    print("  wide_compiler benchmark all -s     # Benchmark all + auto-save")
+    print("  wide_compiler benchmark conv1d -q  # Quiet mode (no progress)")
+    print("  wide_compiler test                 # Run correctness tests")
+    print("  wide_compiler trace -m mlp         # Show FX trace")
+    print("  wide_compiler info                 # This help")
     print()
     print("GitHub: https://github.com/AbstractEyes/pytorch-parallel-compiler")
     return 0
@@ -336,14 +405,20 @@ def main():
 
     # benchmark - positional primitive argument
     bench_parser = subparsers.add_parser('benchmark', help='Benchmark primitive strategies')
-    bench_parser.add_argument('primitive', nargs='?', default='all',
-                             help='Primitive to benchmark (conv1d, conv2d, linear, all)')
+    bench_parser.add_argument('primitive', nargs='?', default=None,
+                             help='Primitive to benchmark (conv1d, conv2d, linear, or "all")')
     bench_parser.add_argument('--preset', '-p', default='full',
                              help='Sweep preset (quick, full, ci)')
     bench_parser.add_argument('--n-values', '-n',
                              help='Override N values (comma-separated, e.g., "4,8,16,32")')
     bench_parser.add_argument('--output', '-o',
-                             help='Save results to JSON file')
+                             help='Save results to specific JSON file')
+    bench_parser.add_argument('--save', '-s', action='store_true',
+                             help='Auto-save results with timestamp')
+    bench_parser.add_argument('--top', '-t', type=int, default=10,
+                             help='Number of top results to display (default: 10)')
+    bench_parser.add_argument('--quiet', '-q', action='store_true',
+                             help='Suppress progress output')
     bench_parser.add_argument('--cpu', action='store_true', help='Force CPU')
 
     # info

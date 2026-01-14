@@ -12,9 +12,12 @@ Strategies:
 - 'channels_last': Grouped conv in NHWC format (most accurate, slower)
 - 'sequential': N separate F.conv2d (exact, slowest)
 - 'auto': Heuristic selection (prefers grouped NCHW)
+
+Copyright 2025 AbstractPhil
+Apache 2.0 License
 """
 
-from typing import List, Literal, Optional, Union, Tuple
+from typing import List, Optional, Union, Tuple, Dict, Any
 from enum import Enum
 
 import torch
@@ -45,11 +48,6 @@ STRATEGY_THRESHOLDS = {
     'b_low': 16,              # B <= this: grouped helps more
 }
 
-# ResNet18 benchmark (N=10, B=8):
-#   Sequential (auto):     20.37ms → 1.12x vs compiled baseline
-#   Grouped (compiled):     9.12ms → 2.49x vs compiled baseline
-# Grouped is clearly better even at N=10!
-
 _WARNED_ABOUT_TUNING = False
 
 
@@ -67,19 +65,8 @@ def select_strategy(n: int, b: int, c_in: int, c_out: int,
     """
     Heuristic strategy selection based on A100 benchmarks.
 
-    A100 Results Summary (actual measured):
-    - NCHW grouped: FASTEST in all tested configs (2-4x speedup)
-    - NHWC: Slower due to format conversion overhead
-    - Sequential: Only for exact numerical matching or very low N
-
-    ResNet18 Benchmark (N=10, B=8):
-    - Sequential (auto):     20.37ms → 1.12x vs compiled baseline
-    - Grouped (compiled):     9.12ms → 2.49x vs compiled baseline
-
     Key: GROUPED wins even at moderate N (8-16). Only use SEQUENTIAL
     for N <= 3 where kernel launch overhead dominates.
-
-    Note: Grouped conv has ~1e-6 numerical difference vs sequential.
     """
     global _WARNED_ABOUT_TUNING
     if not _WARNED_ABOUT_TUNING:
@@ -97,15 +84,11 @@ def select_strategy(n: int, b: int, c_in: int, c_out: int,
         return ConvStrategy.SEQUENTIAL
 
     # Check if grouped provides benefit
-    # Grouped wins when: high N with low B, or very high N
     use_grouped = (n >= T['n_crossover'] and b <= T['b_low']) or n >= T['n_high']
 
     if use_grouped:
-        # NCHW grouped is fastest in all tested configs on A100
-        # NHWC has format conversion overhead that makes it slower
         return ConvStrategy.GROUPED
 
-    # Medium N, high B: baseline wins, use sequential
     return ConvStrategy.SEQUENTIAL
 
 
@@ -150,12 +133,11 @@ class WideConv2d(nn.Module):
             strategy = ConvStrategy(strategy)
 
         if strategy == ConvStrategy.AUTO:
-            # Resolve with default assumptions (B=8, 56x56 spatial)
             strategy = select_strategy(n, 8, in_channels, out_channels, 56, 56)
 
         self._strategy = strategy
 
-        # Booleans for compile-friendly forward (no method delegation)
+        # Booleans for compile-friendly forward
         self._use_grouped = (strategy == ConvStrategy.GROUPED)
         self._use_channels_last = (strategy == ConvStrategy.CHANNELS_LAST)
 
@@ -190,18 +172,10 @@ class WideConv2d(nn.Module):
             return self._forward_sequential(x)
 
     def _forward_channels_last(self, x: Tensor) -> Tensor:
-        """Execute grouped conv in NHWC format (channels_last).
-
-        Note: .to(memory_format=channels_last) is just a stride change, not a copy.
-        We don't cache weights because:
-        1. It breaks CUDA graphs (reduce-overhead mode)
-        2. It breaks autograd (backward pass)
-        """
-        # Convert input and weights to NHWC (cheap stride change)
+        """Execute grouped conv in NHWC format (channels_last)."""
         x_nhwc = x.to(memory_format=torch.channels_last)
         w_nhwc = self.grouped_conv.weight.to(memory_format=torch.channels_last)
 
-        # Run grouped conv in NHWC
         out = F.conv2d(
             x_nhwc,
             w_nhwc,
@@ -212,28 +186,7 @@ class WideConv2d(nn.Module):
             groups=self.n
         )
 
-        # Return in original format (contiguous NCHW)
         return out.contiguous()
-
-    def _get_weight_views(self) -> List[Tensor]:
-        """Get per-model weight views (lazy creation)."""
-        if self._weight_views is None:
-            self._weight_views = [
-                self.grouped_conv.weight[i*self.out_channels:(i+1)*self.out_channels]
-                for i in range(self.n)
-            ]
-        return self._weight_views
-
-    def _get_bias_views(self) -> Optional[List[Tensor]]:
-        """Get per-model bias views (lazy creation)."""
-        if self.grouped_conv.bias is None:
-            return None
-        if self._bias_views is None:
-            self._bias_views = [
-                self.grouped_conv.bias[i*self.out_channels:(i+1)*self.out_channels]
-                for i in range(self.n)
-            ]
-        return self._bias_views
 
     def _forward_sequential(self, x: Tensor) -> Tensor:
         """N separate convolutions, concatenated."""
@@ -243,11 +196,10 @@ class WideConv2d(nn.Module):
         # Reshape input: [B, N*C_in, H, W] -> [B, N, C_in, H, W]
         x_reshaped = x.view(B, self.n, self.in_channels, H, W)
 
-        # Get weight/bias views and ensure dtype matches input
         weight = self.grouped_conv.weight
         bias = self.grouped_conv.bias
 
-        # Cast to input dtype if needed (handles mixed precision scenarios)
+        # Cast to input dtype if needed
         if weight.dtype != x.dtype:
             weight = weight.to(x.dtype)
         if bias is not None and bias.dtype != x.dtype:
@@ -255,7 +207,7 @@ class WideConv2d(nn.Module):
 
         outputs = []
         for i in range(self.n):
-            xi = x_reshaped[:, i]  # [B, C_in, H, W]
+            xi = x_reshaped[:, i]
             wi = weight[i*self.out_channels:(i+1)*self.out_channels]
             bi = bias[i*self.out_channels:(i+1)*self.out_channels] if bias is not None else None
             out = F.conv2d(xi, wi, bi,
@@ -263,10 +215,8 @@ class WideConv2d(nn.Module):
                           dilation=self.dilation)
             outputs.append(out)
 
-        # Stack and reshape: [N, B, C_out, H', W'] -> [B, N*C_out, H', W']
-        stacked = torch.stack(outputs, dim=1)  # [B, N, C_out, H', W']
+        stacked = torch.stack(outputs, dim=1)
         return stacked.view(B, -1, stacked.shape[3], stacked.shape[4])
-
 
     @classmethod
     def from_modules(
@@ -274,20 +224,10 @@ class WideConv2d(nn.Module):
         modules: List[nn.Conv2d],
         strategy: Union[str, ConvStrategy] = 'auto'
     ) -> 'WideConv2d':
-        """
-        Create WideConv2d from N existing Conv2d modules.
-
-        Args:
-            modules: List of N Conv2d modules with same architecture
-            strategy: Execution strategy ('auto', 'grouped', 'sequential')
-
-        Returns:
-            WideConv2d instance with fused weights
-        """
+        """Create WideConv2d from N existing Conv2d modules."""
         n = len(modules)
-        t = modules[0]  # Template
+        t = modules[0]
 
-        # Extract config (handle tuple vs int)
         def to_tuple(x):
             return x if isinstance(x, tuple) else (x, x)
 
@@ -308,10 +248,9 @@ class WideConv2d(nn.Module):
             strategy=strategy,
         )
 
-        # Move to same device/dtype as source modules
+        # Preserve device and dtype
         wide = wide.to(device=t.weight.device, dtype=t.weight.dtype)
 
-        # Copy weights
         with torch.no_grad():
             for i, m in enumerate(modules):
                 start = i * t.out_channels
@@ -324,406 +263,165 @@ class WideConv2d(nn.Module):
 
     def __repr__(self):
         return (
-            f"WideConv2d({self.n}x[{self.in_channels}→{self.out_channels}], "
+            f"WideConv2d({self.n}x[{self.in_channels}->{self.out_channels}], "
             f"k={self.kernel_size}, strategy={self._strategy.value})"
         )
 
+    # =========================================================================
+    # BENCHMARK INTERFACE
+    # =========================================================================
 
-# =============================================================================
-# Convenience functions
-# =============================================================================
+    BENCHMARK_STRATEGIES = ['baseline', 'grouped', 'channels_last', 'sequential']
 
+    @classmethod
+    def _get_sweep_params_class(cls):
+        """Get SweepParams class with multiple import attempts."""
+        try:
+            from ..benchmark.benchmark_schema import SweepParams
+            return SweepParams
+        except ImportError:
+            pass
+        try:
+            from wide_compiler.core.benchmark.benchmark_schema import SweepParams
+            return SweepParams
+        except ImportError:
+            pass
+        return None
+
+    @classmethod
+    def _get_benchmark_job_class(cls):
+        """Get BenchmarkJob class with multiple import attempts."""
+        try:
+            from ..benchmark.benchmark_schema import BenchmarkJob
+            return BenchmarkJob
+        except ImportError:
+            pass
+        try:
+            from wide_compiler.core.benchmark.benchmark_schema import BenchmarkJob
+            return BenchmarkJob
+        except ImportError:
+            pass
+        return None
+
+    BENCHMARK_SWEEPS: Dict[str, Any] = {}
+    _SWEEPS_INITIALIZED = False
+
+    @classmethod
+    def _init_benchmark_sweeps(cls):
+        """Initialize sweep configs (called once on first access)."""
+        if cls._SWEEPS_INITIALIZED:
+            return
+        cls._SWEEPS_INITIALIZED = True
+
+        SweepParams = cls._get_sweep_params_class()
+        if SweepParams is None:
+            return
+
+        cls.BENCHMARK_SWEEPS = {
+            'quick': SweepParams(
+                n_values=[4, 8, 16, 32],
+                batch_sizes=[8],
+                channels=[64],
+                kernel_sizes=[3],
+                heights=[32],
+                widths=[32],
+            ),
+            'full': SweepParams(
+                n_values=[2, 4, 6, 8, 10, 12, 16, 20, 32, 64],
+                batch_sizes=[4, 8, 16],
+                channels=[32, 64, 128],
+                kernel_sizes=[1, 3, 5],
+                heights=[16, 32, 56],
+                widths=[16, 32, 56],
+            ),
+            'ci': SweepParams(
+                n_values=[4, 16],
+                batch_sizes=[8],
+                channels=[64],
+                kernel_sizes=[3],
+                heights=[32],
+                widths=[32],
+            ),
+        }
+
+    @classmethod
+    def benchmark_job(cls, preset: str = 'full', **overrides) -> Any:
+        """Get benchmark job for WideConv2d."""
+        cls._init_benchmark_sweeps()
+
+        BenchmarkJob = cls._get_benchmark_job_class()
+        if BenchmarkJob is None:
+            raise ImportError("Could not import BenchmarkJob from benchmark_schema")
+
+        sweep = cls.BENCHMARK_SWEEPS.get(preset)
+        if sweep is None:
+            raise ValueError(f"Unknown preset '{preset}'. Available: {list(cls.BENCHMARK_SWEEPS.keys())}")
+
+        if overrides:
+            sweep = sweep.with_overrides(**overrides)
+
+        return BenchmarkJob(
+            name=f'conv2d_{preset}',
+            primitive='conv2d',
+            strategies=cls.BENCHMARK_STRATEGIES,
+            sweep=sweep,
+            model_factory=cls._bench_model,
+            input_factory=cls._bench_input,
+            wide_factory=cls._bench_wide,
+            pack_fn=cls._bench_pack,
+            unpack_fn=cls._bench_unpack,
+        )
+
+    @staticmethod
+    def _bench_model(channels: int, kernel_sizes: int, **_) -> nn.Conv2d:
+        """Create single Conv2d for benchmarking."""
+        return nn.Conv2d(channels, channels, kernel_sizes, padding=kernel_sizes // 2)
+
+    @staticmethod
+    def _bench_input(n: int, batch_sizes: int, channels: int, heights: int, widths: int, device: str = 'cpu', **_) -> Tensor:
+        """Create single input tensor."""
+        return torch.randn(batch_sizes, channels, heights, widths, device=device)
+
+    @classmethod
+    def _bench_wide(cls, modules: List[nn.Conv2d], strategy: str) -> 'WideConv2d':
+        """Create WideConv2d with specific strategy."""
+        strat_map = {
+            'grouped': ConvStrategy.GROUPED,
+            'channels_last': ConvStrategy.CHANNELS_LAST,
+            'sequential': ConvStrategy.SEQUENTIAL,
+        }
+        strat = strat_map.get(strategy, ConvStrategy.GROUPED)
+        return cls.from_modules(modules, strategy=strat)
+
+    @staticmethod
+    def _bench_pack(inputs: List[Tensor]) -> Tensor:
+        """Pack N inputs into wide format."""
+        stacked = torch.stack(inputs, dim=1)  # [B, N, C, H, W]
+        B, N, C, H, W = stacked.shape
+        return stacked.view(B, N * C, H, W)
+
+    @staticmethod
+    def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
+        """Unpack wide output to N outputs."""
+        B, NC, H, W = output.shape
+        C = NC // n
+        reshaped = output.view(B, n, C, H, W)
+        return [reshaped[:, i] for i in range(n)]
+
+
+# Convenience function
 def create_wide_conv2d(
-    n: int,
-    in_channels: int,
-    out_channels: int,
-    kernel_size: int,
-    strategy: str = 'auto',
-    **kwargs
+    modules: List[nn.Conv2d],
+    strategy: str = 'auto'
 ) -> WideConv2d:
-    """Factory function for creating WideConv2d."""
-    return WideConv2d(n, in_channels, out_channels, kernel_size, strategy=strategy, **kwargs)
-
-
-
-# =============================================================================
-# TESTS - All tests use torch.compile (this is a compiler library)
-# =============================================================================
-
-if __name__ == '__main__':
-    import time
-    import torch._dynamo
-
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Device: {device}")
-    if device == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name()}")
-
-    torch._dynamo.config.cache_size_limit = 128
-
-    def benchmark(fn, num_iters=100, warmup=20):
-        """Benchmark a function, return average time in seconds."""
-        for _ in range(warmup):
-            fn()
-        if device == 'cuda':
-            torch.cuda.synchronize()
-
-        t0 = time.perf_counter()
-        for _ in range(num_iters):
-            fn()
-        if device == 'cuda':
-            torch.cuda.synchronize()
-        return (time.perf_counter() - t0) / num_iters
-
-    def compile_model(model, mode='default'):
-        """Compile and return model."""
-        return torch.compile(model, mode=mode)
-
-    K = 3  # kernel size for all tests
-
-    # =========================================================================
-    # TEST 1: COMPILED MODEL ACCURACY (all strategies, all dtypes)
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("TEST 1: COMPILED MODEL ACCURACY")
-    print("=" * 70)
-    print("\nComparing compiled WideConv2d strategies against N×conv2d baseline.")
-
-    N, B, C_in, C_out, H, W = 20, 8, 64, 64, 32, 32
-
-    dtypes_to_test = [torch.float32]
-    if device == 'cuda':
-        dtypes_to_test.extend([torch.float16, torch.bfloat16])
-
-    strategies = ['grouped', 'channels_last', 'sequential']
-
-    print(f"\nConfig: N={N}, B={B}, C={C_in}→{C_out}, H×W={H}×{W}")
-    print(f"\n{'Strategy':<15} {'dtype':<10} {'vs Baseline':<12} {'Compiled OK':<12} {'Status'}")
-    print("-" * 65)
-
-    for dtype in dtypes_to_test:
-        torch._dynamo.reset()
-        torch.manual_seed(42)
-
-        # Baseline: N individual conv2d (not compiled - this is the reference)
-        convs = [nn.Conv2d(C_in, C_out, K, padding=1).to(device, dtype).eval()
-                 for _ in range(N)]
-        x_list = [torch.randn(B, C_in, H, W, device=device, dtype=dtype) for _ in range(N)]
-        x_packed = torch.cat([x.unsqueeze(1) for x in x_list], dim=1).view(B, N*C_in, H, W)
-
-        with torch.inference_mode():
-            baseline_outs = [convs[i](x_list[i]) for i in range(N)]
-            baseline_packed = torch.stack(baseline_outs, dim=1)  # [B, N, C_out, H, W]
-
-        for strategy in strategies:
-            torch._dynamo.reset()
-
-            try:
-                # Create and compile
-                wide = WideConv2d.from_modules(convs, strategy=strategy).eval()
-                wide_compiled = compile_model(wide)
-
-                # Warmup
-                with torch.inference_mode():
-                    for _ in range(5):
-                        _ = wide_compiled(x_packed)
-
-                # Test compiled output
-                with torch.inference_mode():
-                    out_compiled = wide_compiled(x_packed)
-                    out_compiled_unpacked = out_compiled.view(B, N, C_out, H, W)
-
-                    # Compare to baseline
-                    diff_vs_baseline = (baseline_packed - out_compiled_unpacked).abs().max().item()
-
-                    # Verify compile didn't change output
-                    out_eager = wide(x_packed)
-                    diff_compile = (out_eager - out_compiled).abs().max().item()
-
-                # Tolerances based on dtype
-                tol = 1e-4 if dtype == torch.float32 else 1e-2
-                compile_ok = diff_compile < 1e-6
-                accuracy_ok = diff_vs_baseline < tol
-
-                status = "✓" if (compile_ok and accuracy_ok) else "✗"
-                dtype_str = str(dtype).replace("torch.", "")
-                print(f"{strategy:<15} {dtype_str:<10} {diff_vs_baseline:<12.2e} {diff_compile:<12.2e} {status}")
-
-            except Exception as e:
-                dtype_str = str(dtype).replace("torch.", "")
-                print(f"{strategy:<15} {dtype_str:<10} FAILED: {str(e)[:30]}")
-
-    # =========================================================================
-    # TEST 2: COMPILED SPEED BENCHMARKS (compiled vs N×baseline)
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("TEST 2: COMPILED SPEED BENCHMARKS")
-    print("=" * 70)
-    print("\nAll WideConv2d models are torch.compile'd. Comparing to N×conv2d baseline.")
-
-    configs = [
-        (50, 4, 64, 64, 56, 56, "High N, Low B"),
-        (100, 2, 64, 64, 56, 56, "Very High N"),
-        (20, 8, 256, 256, 14, 14, "Late stage"),
-        (20, 8, 3, 64, 224, 224, "Stem layer"),
-        (10, 32, 64, 64, 56, 56, "Medium N/B"),
-    ]
-
-    for N, B, C_in, C_out, H, W, desc in configs:
-        print(f"\n--- {desc}: N={N}, B={B}, C={C_in}→{C_out}, {H}×{W} ---")
-
-        torch._dynamo.reset()
-        torch.manual_seed(42)
-
-        convs = [nn.Conv2d(C_in, C_out, K, padding=1).to(device).eval() for _ in range(N)]
-        x_list = [torch.randn(B, C_in, H, W, device=device) for _ in range(N)]
-        x_packed = torch.cat([x.unsqueeze(1) for x in x_list], dim=1).view(B, N*C_in, H, W)
-
-        # Baseline: N×conv (not compiled)
-        with torch.inference_mode():
-            t_baseline = benchmark(lambda: [convs[i](x_list[i]) for i in range(N)], num_iters=50)
-
-        print(f"{'Strategy':<20} {'Compiled (ms)':<15} {'vs N×conv':<12} {'Status'}")
-        print("-" * 55)
-        print(f"{'N×conv (baseline)':<20} {t_baseline*1000:<15.2f} {'1.00x':<12}")
-
-        for strategy in ['grouped', 'channels_last', 'sequential', 'auto']:
-            torch._dynamo.reset()
-
-            try:
-                wide = WideConv2d.from_modules(convs, strategy=strategy).eval()
-                wide_compiled = compile_model(wide)
-
-                # Warmup compiled
-                with torch.inference_mode():
-                    for _ in range(10):
-                        _ = wide_compiled(x_packed)
-                if device == 'cuda':
-                    torch.cuda.synchronize()
-
-                with torch.inference_mode():
-                    t_compiled = benchmark(lambda: wide_compiled(x_packed), num_iters=50)
-
-                speedup = t_baseline / t_compiled
-                status = "✓" if speedup > 1.1 else ("" if speedup > 0.9 else "✗")
-
-                label = strategy
-                if strategy == 'auto':
-                    label = f"auto→{wide.strategy.value}"
-
-                print(f"{label:<20} {t_compiled*1000:<15.2f} {speedup:<12.2f}x {status}")
-
-            except Exception as e:
-                print(f"{strategy:<20} FAILED: {str(e)[:35]}")
-
-    # =========================================================================
-    # TEST 3: COMPILE MODES (default, reduce-overhead)
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("TEST 3: COMPILE MODES")
-    print("=" * 70)
-
-    N, B, C_in, C_out, H, W = 50, 4, 64, 64, 56, 56
-    print(f"\nConfig: N={N}, B={B}, C={C_in}→{C_out}")
-
-    torch.manual_seed(42)
-    convs = [nn.Conv2d(C_in, C_out, K, padding=1).to(device).eval() for _ in range(N)]
-    x_list = [torch.randn(B, C_in, H, W, device=device) for _ in range(N)]
-    x_packed = torch.cat([x.unsqueeze(1) for x in x_list], dim=1).view(B, N*C_in, H, W)
-
-    # Baseline
-    with torch.inference_mode():
-        t_baseline = benchmark(lambda: [convs[i](x_list[i]) for i in range(N)], num_iters=50)
-
-    compile_modes = ['default', 'reduce-overhead']
-
-    print(f"\n{'Mode':<20} {'Strategy':<15} {'Time (ms)':<12} {'vs N×conv':<12} {'Status'}")
-    print("-" * 70)
-    print(f"{'N×conv baseline':<20} {'-':<15} {t_baseline*1000:<12.2f} {'1.00x':<12}")
-
-    for mode in compile_modes:
-        for strategy in ['grouped', 'channels_last']:
-            torch._dynamo.reset()
-
-            try:
-                wide = WideConv2d.from_modules(convs, strategy=strategy).eval()
-                wide_compiled = torch.compile(wide, mode=mode)
-
-                # Warmup
-                with torch.inference_mode():
-                    for _ in range(15):
-                        _ = wide_compiled(x_packed)
-                if device == 'cuda':
-                    torch.cuda.synchronize()
-
-                with torch.inference_mode():
-                    t = benchmark(lambda: wide_compiled(x_packed), num_iters=50)
-
-                speedup = t_baseline / t
-                status = "✓" if speedup > 1.1 else ""
-                print(f"{mode:<20} {strategy:<15} {t*1000:<12.2f} {speedup:<12.2f}x {status}")
-
-            except Exception as e:
-                print(f"{mode:<20} {strategy:<15} FAILED: {str(e)[:25]}")
-
-    # =========================================================================
-    # TEST 4: DTYPE + COMPILE SPEED
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("TEST 4: DTYPE + COMPILE SPEED")
-    print("=" * 70)
-
-    N, B, C_in, C_out, H, W = 50, 4, 64, 64, 56, 56
-    print(f"\nConfig: N={N}, B={B}, C={C_in}→{C_out}, strategy=grouped")
-
-    dtypes_speed = [torch.float32]
-    if device == 'cuda':
-        dtypes_speed.extend([torch.float16, torch.bfloat16])
-
-    print(f"\n{'dtype':<12} {'Compiled (ms)':<15} {'N×conv (ms)':<15} {'Speedup':<12} {'Status'}")
-    print("-" * 65)
-
-    for dtype in dtypes_speed:
-        torch._dynamo.reset()
-        torch.manual_seed(42)
-
-        try:
-            convs = [nn.Conv2d(C_in, C_out, K, padding=1).to(device, dtype).eval()
-                     for _ in range(N)]
-            x_list = [torch.randn(B, C_in, H, W, device=device, dtype=dtype) for _ in range(N)]
-            x_packed = torch.cat([x.unsqueeze(1) for x in x_list], dim=1).view(B, N*C_in, H, W)
-
-            wide = WideConv2d.from_modules(convs, strategy='grouped').eval()
-            wide_compiled = compile_model(wide)
-
-            # Warmup
-            with torch.inference_mode():
-                for _ in range(10):
-                    _ = wide_compiled(x_packed)
-            if device == 'cuda':
-                torch.cuda.synchronize()
-
-            with torch.inference_mode():
-                t_baseline = benchmark(lambda: [convs[i](x_list[i]) for i in range(N)], num_iters=50)
-                t_compiled = benchmark(lambda: wide_compiled(x_packed), num_iters=50)
-
-            speedup = t_baseline / t_compiled
-            status = "✓" if speedup > 1.5 else ""
-            dtype_str = str(dtype).replace("torch.", "")
-            print(f"{dtype_str:<12} {t_compiled*1000:<15.2f} {t_baseline*1000:<15.2f} {speedup:<12.2f}x {status}")
-
-        except Exception as e:
-            dtype_str = str(dtype).replace("torch.", "")
-            print(f"{dtype_str:<12} FAILED: {str(e)[:40]}")
-
-    # =========================================================================
-    # TEST 5: GRAPH BREAK DETECTION
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("TEST 5: GRAPH BREAK DETECTION")
-    print("=" * 70)
-    print("\nVerifying no graph breaks in compiled models.")
-
-    N, B, C_in, C_out, H, W = 20, 8, 64, 64, 32, 32
-
-    torch.manual_seed(42)
-    convs = [nn.Conv2d(C_in, C_out, K, padding=1).to(device).eval() for _ in range(N)]
-    x_packed = torch.randn(B, N*C_in, H, W, device=device)
-
-    print(f"\n{'Strategy':<20} {'Graph Breaks':<15} {'Status'}")
-    print("-" * 50)
-
-    for strategy in ['grouped', 'channels_last', 'sequential']:
-        torch._dynamo.reset()
-
-        try:
-            wide = WideConv2d.from_modules(convs, strategy=strategy).eval()
-
-            # Use explain to check for graph breaks
-            explanation = torch._dynamo.explain(wide)(x_packed)
-            num_breaks = explanation.graph_break_count
-
-            status = "✓" if num_breaks == 0 else f"✗ ({num_breaks} breaks)"
-            print(f"{strategy:<20} {num_breaks:<15} {status}")
-
-        except Exception as e:
-            print(f"{strategy:<20} FAILED: {str(e)[:30]}")
-
-    # =========================================================================
-    # TEST 6: TRAINING MODE (compiled backward pass)
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("TEST 6: TRAINING MODE (compiled backward)")
-    print("=" * 70)
-
-    N, B, C_in, C_out, H, W = 20, 4, 64, 64, 32, 32
-
-    print(f"\nConfig: N={N}, B={B}, C={C_in}→{C_out}")
-    print(f"\n{'Strategy':<15} {'Fwd (ms)':<12} {'Bwd (ms)':<12} {'Total (ms)':<12} {'Status'}")
-    print("-" * 60)
-
-    for strategy in ['grouped', 'channels_last', 'sequential']:
-        torch._dynamo.reset()
-        torch.manual_seed(42)
-
-        try:
-            convs = [nn.Conv2d(C_in, C_out, K, padding=1).to(device) for _ in range(N)]
-            wide = WideConv2d.from_modules(convs, strategy=strategy).train()
-            wide_compiled = torch.compile(wide, mode='default')
-
-            x_packed = torch.randn(B, N*C_in, H, W, device=device, requires_grad=True)
-
-            # Warmup
-            for _ in range(5):
-                out = wide_compiled(x_packed)
-                loss = out.sum()
-                loss.backward()
-                wide.zero_grad()
-                if x_packed.grad is not None:
-                    x_packed.grad.zero_()
-            if device == 'cuda':
-                torch.cuda.synchronize()
-
-            # Benchmark forward
-            def fwd():
-                return wide_compiled(x_packed)
-
-            # Benchmark forward + backward
-            def fwd_bwd():
-                out = wide_compiled(x_packed)
-                loss = out.sum()
-                loss.backward()
-                wide.zero_grad()
-                if x_packed.grad is not None:
-                    x_packed.grad.zero_()
-
-            t_fwd = benchmark(fwd, num_iters=50, warmup=10)
-            t_total = benchmark(fwd_bwd, num_iters=50, warmup=10)
-            t_bwd = t_total - t_fwd
-
-            print(f"{strategy:<15} {t_fwd*1000:<12.2f} {t_bwd*1000:<12.2f} {t_total*1000:<12.2f} ✓")
-
-        except Exception as e:
-            print(f"{strategy:<15} FAILED: {str(e)[:40]}")
-
-    # =========================================================================
-    # SUMMARY
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("SUMMARY")
-    print("=" * 70)
-    print("""
-All tests use torch.compile (this is a compiler library).
-
-Key Results:
-1. ACCURACY: All strategies compile correctly with no numerical drift
-2. SPEED: Compiled grouped achieves 2-4x speedup vs N×conv baseline
-3. GRAPH BREAKS: None detected in any strategy  
-4. TRAINING: Forward and backward pass both compile successfully
-5. DTYPES: fp16/bf16 provide additional speedup with compile
-
-Recommended:
-- Use strategy='grouped' (fastest compiled performance)
-- Use strategy='auto' for automatic selection
-- All strategies are torch.compile compatible
-""")
+    """Create WideConv2d from existing Conv2d modules."""
+    return WideConv2d.from_modules(modules, strategy=strategy)
+
+
+__all__ = [
+    'WideConv2d',
+    'ConvStrategy',
+    'select_strategy',
+    'create_wide_conv2d',
+    'STRATEGY_THRESHOLDS',
+]
