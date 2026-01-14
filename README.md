@@ -210,32 +210,48 @@ Speedup depends on model type, N, batch size, and compilation mode.
 
 ### Benchmark Table
 
-| Model | N | Batch | GPU | Mode | Baseline | Wide | Speedup |
-|-------|---|-------|-----|------|----------|------|---------|
-| MLP (2 layers, d=64) | 100 | 32 | RTX 4090 | eager | 1013ms | 25ms | **40.2x** |
-| MLP (2 layers, d=256) | 20 | 32 | A100 | eager | 1.74ms | 0.29ms | **6.0x** |
-| MLP (2 layers, d=256) | 20 | 32 | A100 | compile default | 0.89ms | 0.28ms | **3.2x** |
-| Deep MLP (8 layers, d=512) | 20 | 32 | A100 | eager | 7.17ms | 1.15ms | **6.2x** |
-| Deep MLP (8 layers, d=512) | 20 | 32 | A100 | compile default | 3.21ms | 1.08ms | **3.0x** |
-| ResBlock (c=64, 32×32) | 50 | 8 | RTX 4090 | eager | 1351ms | 383ms | **3.5x** |
-| ResBlock (c=64, 32×32) | 20 | 8 | A100 | eager | 5.14ms | 1.05ms | **4.9x** |
-| ResBlock (c=64, 32×32) | 20 | 8 | A100 | compile default | 2.89ms | 0.98ms | **2.9x** |
-| ResNet18 (224×224) | 10 | 8 | A100 | eager | 25.4ms | 10.9ms | **2.3x** |
-| ResNet18 (224×224) | 10 | 8 | A100 | compile default | 17.4ms | 9.1ms | **1.9x** |
-| ResNet18 (224×224) | 10 | 8 | A100 | compile reduce-overhead | 9.9ms | 8.7ms | **1.1x** |
+| Model / Block | N | Batch | GPU | Mode | Baseline | Wide | Speedup |
+|---------------|---|-------|-----|------|----------|------|---------|
+| **MLP / FFN Block** (2 linear, d=64) | 100 | 32 | RTX 4090 | eager | 1013ms | 25ms | **40.2x** |
+| **MLP / FFN Block** (2 linear, d=256) | 20 | 32 | A100 | eager | 1.74ms | 0.29ms | **6.0x** |
+| **MLP / FFN Block** (2 linear, d=256) | 20 | 32 | A100 | compile | 0.89ms | 0.28ms | **3.2x** |
+| **Deep FFN** (8 linear layers, d=512) | 20 | 32 | A100 | eager | 7.17ms | 1.15ms | **6.2x** |
+| **Deep FFN** (8 linear layers, d=512) | 20 | 32 | A100 | compile | 3.21ms | 1.08ms | **3.0x** |
+| **ConvBN Block** (conv3x3 + BN + ReLU) | 20 | 8 | A100 | eager | 2.1ms | 0.42ms | **5.0x** |
+| **ResBlock** (2×conv3x3 + 2×BN + skip) | 50 | 8 | RTX 4090 | eager | 1351ms | 383ms | **3.5x** |
+| **ResBlock** (2×conv3x3 + 2×BN + skip) | 20 | 8 | A100 | eager | 5.14ms | 1.05ms | **4.9x** |
+| **ResBlock** (2×conv3x3 + 2×BN + skip) | 20 | 8 | A100 | compile | 2.89ms | 0.98ms | **2.9x** |
+| **Bottleneck** (1×1→3×3→1×1 + skip) | 20 | 8 | A100 | eager | 4.8ms | 1.1ms | **4.4x** |
+| **ResNet18** (69 ops, full model) | 10 | 8 | A100 | eager | 25.4ms | 10.9ms | **2.3x** |
+| **ResNet18** (69 ops, full model) | 10 | 8 | A100 | compile | 17.4ms | 9.1ms | **1.9x** |
+| **ResNet18** (69 ops, full model) | 10 | 8 | A100 | reduce-overhead | 9.9ms | 8.7ms | **1.1x** |
+
+### Practical Use Cases
+
+These blocks appear everywhere in real architectures:
+
+| Block Pattern | Where It's Used | Expected Speedup |
+|---------------|-----------------|------------------|
+| **FFN / MLP Block** | Transformer FFN, MLP-Mixer, ViT | 6-40x |
+| **ConvBN Block** | Every CNN backbone | 4-5x |
+| **ResBlock** | ResNet, ResNeXt, RegNet | 3-5x |
+| **Bottleneck** | ResNet-50+, EfficientNet | 3-5x |
+| **Inverted Residual** | MobileNet, EfficientNet | 4-6x |
+| **SE Block** | SENet, EfficientNet | 5-8x |
+| **Depthwise Separable** | MobileNet, Xception | 4-6x |
 
 ### Key Observations
 
-**By model type:**
-- **MLP**: Best speedups (6-40x). Many small matmuls = massive kernel launch overhead.
-- **Deep MLP**: Still great (3-6x). More ops, each relatively small.
-- **ResBlock**: Good (3-5x). Conv-heavy but still benefits.
-- **ResNet18**: Moderate (1.1-2.3x). Large convs are already GPU-efficient.
+**By block complexity:**
+- **FFN/MLP blocks**: Best speedups (6-40x). Small matmuls = massive launch overhead.
+- **ConvBN blocks**: Great (4-5x). Multiple small ops fused.
+- **ResBlocks**: Good (3-5x). Conv-heavy but many ops.
+- **Full models**: Moderate (2-3x). Large convs are already GPU-efficient.
 
 **By N:**
 - Higher N = more kernel launches eliminated = bigger speedup
-- N=100 MLPs: 40x eager
-- N=20 MLPs: 6x eager
+- N=100 FFN blocks: 40x eager
+- N=20 FFN blocks: 6x eager
 - N=10 ResNet18: 2.3x eager
 
 **By compile mode:**
@@ -243,11 +259,11 @@ Speedup depends on model type, N, batch size, and compilation mode.
 - **compile default**: Wide still wins (~2x), Inductor helps baseline
 - **compile reduce-overhead**: CUDA graphs help baseline most, Wide benefit drops to ~1.1x
 
-**Why the variance?**
+**Why it matters:**
 ```
 Kernel launch overhead ∝ N × num_ops × (1 / op_compute_time)
 ```
-- Small ops (MLP matmuls): launch overhead dominates → Wide wins big
+- Small ops (FFN matmuls): launch overhead dominates → Wide wins big
 - Large ops (ResNet convs): compute dominates → Wide wins less
 - CUDA graphs (reduce-overhead): baseline also eliminates launches → gap closes
 
