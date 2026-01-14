@@ -2,14 +2,60 @@
 WideCompiler.core.benchmark.benchmark_schema
 
 Data classes for benchmark configuration and results.
+Includes compilation clause support for torch.compile optimization.
 
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
 
 from dataclasses import dataclass, field, replace
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Union
+from enum import Enum
 import json
+import torch
+
+
+class CompilationMode(Enum):
+    """Compilation modes for benchmarking."""
+    EAGER = 'eager'                       # No compilation
+    INDUCTOR = 'inductor'                 # torch.compile with inductor backend
+    REDUCE_OVERHEAD = 'reduce-overhead'   # Optimized for low latency
+    MAX_AUTOTUNE = 'max-autotune'         # Maximum optimization (slower compile)
+    AUTO = 'auto'                         # Try compiled, fallback to eager
+
+
+def compilation_available() -> bool:
+    """Check if torch.compile is available and functional."""
+    try:
+        major = int(torch.__version__.split('.')[0])
+        if major < 2:
+            return False
+        # Quick sanity check
+        @torch.compile(backend='inductor')
+        def _test(x):
+            return x + 1
+        _test(torch.tensor(1.0))
+        return True
+    except Exception:
+        return False
+
+
+def get_compile_fn(mode: CompilationMode) -> Optional[Callable]:
+    """Get compile function for given mode, or None for eager/unavailable."""
+    if mode == CompilationMode.EAGER:
+        return None
+    if not compilation_available():
+        return None
+
+    if mode == CompilationMode.INDUCTOR:
+        return lambda m: torch.compile(m, backend='inductor')
+    elif mode == CompilationMode.REDUCE_OVERHEAD:
+        return lambda m: torch.compile(m, mode='reduce-overhead')
+    elif mode == CompilationMode.MAX_AUTOTUNE:
+        return lambda m: torch.compile(m, mode='max-autotune')
+    elif mode == CompilationMode.AUTO:
+        return lambda m: torch.compile(m, mode='reduce-overhead')
+    return None
 
 
 @dataclass
@@ -62,6 +108,11 @@ class BenchmarkJob:
 
     Contains sweep params and factory functions for creating
     models, inputs, and wide versions.
+
+    Compilation settings apply to BOTH Wide and baseline models
+    for fair comparison. The compilation clause is critical:
+    Wide models with torch.compile can achieve massive speedups
+    that aren't visible in eager mode.
     """
     name: str
     primitive: str
@@ -78,6 +129,14 @@ class BenchmarkJob:
     # Optional validation function
     validate_fn: Optional[Callable[..., Any]] = None  # (wide_out, baseline_outs) -> (bool, str)
 
+    # Compilation settings
+    compilation: CompilationMode = CompilationMode.AUTO
+    compile_warmup_extra: int = 5  # Extra warmup iterations for compiled models
+
+    # Validation settings
+    validate: bool = True  # Run consistency check
+    fail_on_invalid: bool = False  # Raise exception vs mark invalid
+
 
 @dataclass
 class SingleResult:
@@ -88,6 +147,7 @@ class SingleResult:
     time_ms: float
     baseline_ms: float
     speedup: float
+    compiled: bool = False  # Whether torch.compile was used
     valid: bool = True
     validation_msg: str = "OK"
 
@@ -99,6 +159,7 @@ class SingleResult:
             'time_ms': self.time_ms,
             'baseline_ms': self.baseline_ms,
             'speedup': self.speedup,
+            'compiled': self.compiled,
             'valid': self.valid,
             'validation_msg': self.validation_msg,
         }
@@ -176,11 +237,16 @@ class BenchmarkResult:
         valid = len(self.valid_results)
         invalid = len(self.invalid_results)
 
+        # Check if results were compiled
+        compiled_results = [r for r in self.results if r.compiled]
+        compiled_str = "compiled" if compiled_results else "eager"
+
         lines = [
             f"{'='*60}",
             f"  {self.name.upper()}",
             f"{'='*60}",
             f"  Device:       {self.device}",
+            f"  Mode:         {compiled_str}",
             f"  Configs run:  {valid}" + (f" ({invalid} invalid)" if invalid else ""),
             f"  Crossover N:  {self.crossover_n or 'N/A'}",
             f"  Best speedup: {self.best_speedup:.2f}x",
@@ -286,6 +352,9 @@ class BenchmarkResult:
 
 
 __all__ = [
+    'CompilationMode',
+    'compilation_available',
+    'get_compile_fn',
     'SweepParams',
     'BenchmarkJob',
     'SingleResult',

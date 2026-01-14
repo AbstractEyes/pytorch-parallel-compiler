@@ -4,21 +4,26 @@ WideCompiler CLI
 Benchmark and debug utilities for Wide model compilation.
 
 Usage:
-    python -m wide_compiler benchmark              # List available primitives
-    python -m wide_compiler benchmark conv1d       # Benchmark conv1d
-    python -m wide_compiler benchmark conv1d -p quick  # Quick preset
-    python -m wide_compiler benchmark all          # Benchmark ALL primitives
-    python -m wide_compiler benchmark all -s       # Benchmark all + auto-save
-    python -m wide_compiler benchmark conv1d -q    # Quiet mode
-    python -m wide_compiler test                   # Run correctness tests
-    python -m wide_compiler trace --model resblock # Show FX trace
-    python -m wide_compiler info                   # Show library info
+    # Benchmark primitives (with compilation support)
+    python -m wide_compiler benchmark gru -p quick
+    python -m wide_compiler benchmark gru -p quick --compile reduce-overhead
+    python -m wide_compiler benchmark linear -p full --compile auto
+
+    # Legacy model benchmark
+    python -m wide_compiler benchmark mlp --n 100
+    python -m wide_compiler benchmark resblock --n 50 --compile auto
+
+    # Other commands
+    python -m wide_compiler test
+    python -m wide_compiler trace --model resblock
+    python -m wide_compiler info
 
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
 
 import argparse
+import time
 import sys
 
 import torch
@@ -29,26 +34,27 @@ import torch.fx as fx
 try:
     from .core import (
         TracedWideModel,
+        pack_inputs,
+        unpack_outputs,
         print_trace,
     )
-    from .core.ensemble_util import pack_inputs, unpack_outputs
     from .core.registry import list_registered
 except ImportError:
     from wide_compiler.core import (
         TracedWideModel,
+        pack_inputs,
+        unpack_outputs,
         print_trace,
     )
-    from wide_compiler.core.ensemble_util import pack_inputs, unpack_outputs
     from wide_compiler.core.registry import list_registered
 
 
 # =============================================================================
-# SAMPLE MODELS (for test/trace commands)
+# SAMPLE MODELS
 # =============================================================================
 
 class MLP(nn.Module):
     """Simple MLP for testing."""
-
     def __init__(self, d_in=64, d_hidden=128, d_out=64):
         super().__init__()
         self.fc1 = nn.Linear(d_in, d_hidden)
@@ -60,7 +66,6 @@ class MLP(nn.Module):
 
 class DeepMLP(nn.Module):
     """Deeper MLP."""
-
     def __init__(self, d=64, layers=4):
         super().__init__()
         self.layers = nn.ModuleList([
@@ -75,7 +80,6 @@ class DeepMLP(nn.Module):
 
 class ResBlock(nn.Module):
     """ResBlock with skip connection."""
-
     def __init__(self, channels=64):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
@@ -92,7 +96,6 @@ class ResBlock(nn.Module):
 
 class ConvNet(nn.Module):
     """Simple ConvNet."""
-
     def __init__(self, channels=32):
         super().__init__()
         self.conv1 = nn.Conv2d(3, channels, 3, padding=1)
@@ -154,14 +157,14 @@ def cmd_test(args):
             max_diff = max((separate[i] - wide_outs[i]).abs().max().item() for i in range(N))
 
             if max_diff < 1e-3:
-                print(f"  OK {name}: max_diff={max_diff:.8f}")
+                print(f"  ✓ {name}: max_diff={max_diff:.8f}")
                 passed += 1
             else:
-                print(f"  FAIL {name}: max_diff={max_diff:.8f} (too high)")
+                print(f"  ✗ {name}: max_diff={max_diff:.8f} (too high)")
                 failed += 1
 
         except Exception as e:
-            print(f"  FAIL {name}: {e}")
+            print(f"  ✗ {name}: {e}")
             failed += 1
 
     print("\n" + "=" * 60)
@@ -200,138 +203,242 @@ def cmd_trace(args):
 
 
 def cmd_benchmark(args):
-    """Benchmark primitive strategies."""
-    try:
-        from .core.benchmark import benchmark, benchmark_all, list_primitives, get_import_errors
-    except ImportError:
-        from wide_compiler.core.benchmark import benchmark, benchmark_all, list_primitives, get_import_errors
+    """Benchmark Wide primitives or legacy models."""
+    device = 'cuda' if torch.cuda.is_available() and not args.cpu else 'cpu'
 
-    import datetime
-
-    device = 'cpu' if args.cpu else 'cuda'
-    available = list_primitives()
-
-    # No primitive specified - show list and usage
-    if args.primitive is None:
-        print("WideCompiler Benchmark")
-        print("=" * 60)
-        print()
-
-        if available:
-            print("Available primitives:")
-            for name in sorted(available):
-                print(f"  - {name}")
-        else:
-            print("No primitives registered with benchmark interface.")
-            errors = get_import_errors()
-            if errors:
-                print("\nRegistration errors:")
-                for err in errors:
-                    print(f"  - {err}")
-
-        print()
-        print("Usage:")
-        print("  wide_compiler benchmark <primitive>     # Benchmark one primitive")
-        print("  wide_compiler benchmark conv1d          # Example: benchmark conv1d")
-        print("  wide_compiler benchmark conv1d -p quick # Use quick preset")
-        print("  wide_compiler benchmark all             # Benchmark ALL primitives")
-        print("  wide_compiler benchmark all -s          # Benchmark all + auto-save")
-        print()
-        print("Options:")
-        print("  -p, --preset   Sweep preset: quick, full (default), ci")
-        print("  -t, --top      Number of top results to show (default: 10)")
-        print("  -q, --quiet    Suppress progress output")
-        print("  -s, --save     Auto-save results with timestamp")
-        print("  -o, --output   Save to specific file")
-        return 0
-
-    # Handle 'all'
-    if args.primitive == 'all':
-        if not available:
-            print("No primitives registered with benchmark interface.")
-            errors = get_import_errors()
-            if errors:
-                print("\nRegistration errors:")
-                for err in errors:
-                    print(f"  - {err}")
-            return 1
-
-        results = benchmark_all(
-            preset=args.preset,
-            device=device,
-            verbose=not args.quiet,
-        )
-
-        if not results:
-            print("No benchmarks run.")
-            return 0
-
-        # Print summary for each
-        for name, result in results.items():
-            print(result.summary())
-            print(result.top_table(args.top))
-            print()
-
-        # Auto-save if requested or default
-        if args.output:
-            output_path = args.output
-        elif args.save:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = f"benchmark_all_{timestamp}.json"
-        else:
-            output_path = None
-
-        if output_path:
-            import json
-            combined = {name: r.to_dict() for name, r in results.items()}
-            with open(output_path, 'w') as f:
-                json.dump(combined, f, indent=2)
-            print(f"Saved to {output_path}")
-
-        return 0
-
-    # Single primitive
+    # Check if this is a primitive benchmark or legacy model benchmark
     primitive = args.primitive
+    PRIMITIVES = ['gru', 'lstm', 'linear', 'conv2d', 'attention', 'conv1d', 'embedding']
 
-    if primitive not in available:
-        print(f"Unknown primitive: '{primitive}'")
-        if available:
-            print(f"Available: {', '.join(sorted(available))}")
+    # If primitive is a known primitive OR no legacy --model flag, use primitive mode
+    if primitive in PRIMITIVES:
+        return cmd_benchmark_primitive(args, device)
+
+    # Legacy mode: use --model or primitive as model name
+    model_name = args.model or primitive or 'mlp'
+    if model_name not in MODELS:
+        # Maybe they meant a primitive?
+        if primitive:
+            print(f"Unknown primitive or model: {primitive}")
+            print(f"Primitives: {', '.join(PRIMITIVES)}")
+            print(f"Legacy models: {', '.join(MODELS.keys())}")
         else:
-            print("No primitives with benchmark interface registered.")
-        print("\nUse 'all' to run all benchmarks:")
-        print("  wide_compiler benchmark all")
+            print(f"Unknown model: {model_name}")
+            print(f"Available: {', '.join(MODELS.keys())}")
         return 1
 
-    # Parse overrides
-    overrides = {}
-    if args.n_values:
-        overrides['n_values'] = [int(x) for x in args.n_values.split(',')]
+    return cmd_benchmark_legacy(args, model_name, device)
 
-    result = benchmark(
-        primitive,
-        preset=args.preset,
+
+def cmd_benchmark_primitive(args, device: str):
+    """Benchmark a Wide primitive with the benchmark framework."""
+    try:
+        from .core.benchmark.benchmark_runner import run
+        from .core.benchmark.benchmark_schema import CompilationMode, compilation_available
+    except ImportError:
+        try:
+            from wide_compiler.core.benchmark.benchmark_runner import run
+            from wide_compiler.core.benchmark.benchmark_schema import CompilationMode, compilation_available
+        except ImportError:
+            print("Benchmark framework not found. Install with benchmark support.")
+            return 1
+
+    primitive = args.primitive
+    preset = args.preset
+
+    # Map compile string to enum
+    compile_map = {
+        'auto': CompilationMode.AUTO,
+        'eager': CompilationMode.EAGER,
+        'inductor': CompilationMode.INDUCTOR,
+        'reduce-overhead': CompilationMode.REDUCE_OVERHEAD,
+        'max-autotune': CompilationMode.MAX_AUTOTUNE,
+    }
+    compilation = compile_map.get(args.compile, CompilationMode.AUTO)
+
+    # Load primitive and create benchmark job
+    job = None
+    try:
+        if primitive == 'gru':
+            from .core.primitives import WideGRU
+            job = WideGRU.benchmark_job(preset)
+        elif primitive == 'lstm':
+            from .core.primitives import WideLSTM
+            job = WideLSTM.benchmark_job(preset)
+        elif primitive == 'linear':
+            from .core.primitives import WideLinear
+            job = WideLinear.benchmark_job(preset)
+        elif primitive == 'conv2d':
+            from .core.primitives import WideConv2d
+            job = WideConv2d.benchmark_job(preset)
+        elif primitive == 'conv1d':
+            from .core.primitives import WideConv1d
+            job = WideConv1d.benchmark_job(preset)
+        elif primitive == 'attention':
+            from .core.primitives import WideAttention
+            job = WideAttention.benchmark_job(preset)
+        elif primitive == 'embedding':
+            from .core.primitives import WideEmbedding
+            job = WideEmbedding.benchmark_job(preset)
+    except ImportError as e:
+        print(f"Could not import {primitive}: {e}")
+        return 1
+    except AttributeError:
+        print(f"Primitive {primitive} does not support benchmarking yet")
+        return 1
+
+    if job is None:
+        print(f"Could not create benchmark job for {primitive}")
+        return 1
+
+    # Print compilation info
+    compile_available = compilation_available()
+    if compilation == CompilationMode.AUTO:
+        actual_mode = "compiled (reduce-overhead)" if compile_available else "eager"
+    elif compilation == CompilationMode.EAGER:
+        actual_mode = "eager"
+    else:
+        actual_mode = f"compiled ({compilation.value})"
+        if not compile_available:
+            actual_mode = "eager (compile unavailable)"
+
+    print(f"Primitive: {primitive}")
+    print(f"Preset: {preset}")
+    print(f"Device: {device}")
+    print(f"Compilation: {actual_mode}")
+    print()
+
+    # Run benchmark
+    result = run(
+        job,
         device=device,
         verbose=not args.quiet,
-        **overrides,
+        warmup=args.warmup,
+        iterations=args.iters,
+        validate=not args.no_validate,
+        compilation=compilation,
     )
 
-    # Print summary + top results
+    # Print results
     print(result.summary())
     print(result.top_table(args.top))
 
     # Save if requested
     if args.output:
-        output_path = args.output
-    elif args.save:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = f"benchmark_{primitive}_{timestamp}.json"
-    else:
-        output_path = None
+        result.save(args.output)
+        print(f"\nSaved to {args.output}")
 
-    if output_path:
-        result.save(output_path)
-        print(f"\nSaved to {output_path}")
+    return 0
+
+
+def cmd_benchmark_legacy(args, model_name: str, device: str):
+    """Legacy benchmark mode for sample models (MLP, ResBlock, etc.)."""
+    model_cls, sample_fn = MODELS[model_name]
+    N = args.n or 100
+    B = args.batch
+
+    print(f"Benchmark: {model_name} (legacy mode)")
+    print(f"Device: {device}")
+    print(f"N models: {N}")
+    print(f"Batch size: {B}")
+    print("=" * 60)
+
+    # Create models
+    models = [model_cls().to(device).eval() for _ in range(N)]
+    sample = sample_fn().to(device)
+
+    # Build wide model
+    print("\nBuilding wide model...")
+    wide_model = TracedWideModel.from_models(models, sample).to(device).eval()
+    print(wide_model.summary())
+
+    # Prepare inputs
+    if model_name in ('resblock', 'convnet'):
+        inputs = [torch.randn(B, *sample.shape[1:], device=device) for _ in range(N)]
+    else:
+        inputs = [torch.randn(B, 64, device=device) for _ in range(N)]
+    packed = pack_inputs(inputs)
+
+    # Warmup
+    print("\nWarming up...")
+    with torch.no_grad():
+        for _ in range(5):
+            wide_model(packed)
+            models[0](inputs[0])
+
+    if device == 'cuda':
+        torch.cuda.synchronize()
+
+    iters = args.iters
+    compile_mode = args.compile
+
+    # Determine if we should run compiled based on --compile flag
+    run_compiled = compile_mode != 'eager' and device == 'cuda'
+
+    # Eager benchmark
+    print("\n--- Eager Mode ---")
+    with torch.no_grad():
+        start = time.perf_counter()
+        for _ in range(iters):
+            for i in range(N):
+                models[i](inputs[i])
+        if device == 'cuda':
+            torch.cuda.synchronize()
+        seq_time = time.perf_counter() - start
+
+        start = time.perf_counter()
+        for _ in range(iters):
+            wide_model(packed)
+        if device == 'cuda':
+            torch.cuda.synchronize()
+        wide_time = time.perf_counter() - start
+
+    print(f"Sequential ({N}x): {seq_time*1000:.2f}ms")
+    print(f"Wide:              {wide_time*1000:.2f}ms")
+    print(f"Speedup:           {seq_time/wide_time:.2f}x")
+
+    # Compiled benchmark
+    if run_compiled:
+        mode = 'reduce-overhead' if compile_mode == 'auto' else compile_mode
+        print(f"\n--- Compiled ({mode}) ---")
+        try:
+            compiled_wide = torch.compile(wide_model, mode=mode)
+            compiled_models = [torch.compile(m, mode=mode) for m in models]
+
+            # Warmup compiled
+            with torch.no_grad():
+                for _ in range(10):
+                    compiled_wide(packed)
+                    for i, m in enumerate(compiled_models):
+                        m(inputs[i])
+
+            if device == 'cuda':
+                torch.cuda.synchronize()
+
+            with torch.no_grad():
+                # Baseline compiled
+                start = time.perf_counter()
+                for _ in range(iters):
+                    for i, m in enumerate(compiled_models):
+                        m(inputs[i])
+                if device == 'cuda':
+                    torch.cuda.synchronize()
+                seq_compiled_time = time.perf_counter() - start
+
+                # Wide compiled
+                start = time.perf_counter()
+                for _ in range(iters):
+                    compiled_wide(packed)
+                if device == 'cuda':
+                    torch.cuda.synchronize()
+                wide_compiled_time = time.perf_counter() - start
+
+            print(f"Sequential compiled: {seq_compiled_time*1000:.2f}ms")
+            print(f"Wide compiled:       {wide_compiled_time*1000:.2f}ms")
+            print(f"Speedup (compiled):  {seq_compiled_time/wide_compiled_time:.2f}x")
+
+        except Exception as e:
+            print(f"Compile failed: {e}")
 
     return 0
 
@@ -344,40 +451,48 @@ def cmd_info(args):
     print("Fuse N identical models into a single Wide model.")
     print("Uses grouped ops for compile-friendly batched execution.")
     print()
-
-    print("Registered primitives (for compilation):")
+    print("Registered primitives:")
     for name in sorted(list_registered()):
         print(f"  - {name}")
     print()
-
-    # Show benchmark primitives
-    try:
-        from .core.benchmark import list_primitives
-    except ImportError:
-        try:
-            from wide_compiler.core.benchmark import list_primitives
-        except ImportError:
-            list_primitives = None
-
-    if list_primitives:
-        available = list_primitives()
-        if available:
-            print("Benchmarkable primitives:")
-            for name in sorted(available):
-                print(f"  - {name}")
-            print()
-
-    print("Usage:")
-    print("  wide_compiler benchmark            # List available primitives")
-    print("  wide_compiler benchmark conv1d     # Benchmark conv1d")
-    print("  wide_compiler benchmark all        # Benchmark ALL primitives")
-    print("  wide_compiler benchmark all -s     # Benchmark all + auto-save")
-    print("  wide_compiler benchmark conv1d -q  # Quiet mode (no progress)")
-    print("  wide_compiler test                 # Run correctness tests")
-    print("  wide_compiler trace -m mlp         # Show FX trace")
-    print("  wide_compiler info                 # This help")
+    print("Benchmarkable primitives:")
+    print("  - gru, lstm, linear, conv2d, conv1d, attention, embedding")
     print()
-    print("GitHub: https://github.com/AbstractEyes/pytorch-parallel-compiler")
+    print("Compilation modes (--compile):")
+    print("  - auto           Default, uses compiled if available")
+    print("  - eager          No compilation")
+    print("  - reduce-overhead Optimized for low latency")
+    print("  - inductor       Standard inductor backend")
+    print("  - max-autotune   Maximum optimization (slow compile)")
+    print()
+
+    # System info
+    print("System:")
+    print(f"  PyTorch: {torch.__version__}")
+    print(f"  CUDA: {torch.cuda.is_available()}", end="")
+    if torch.cuda.is_available():
+        print(f" ({torch.cuda.get_device_name(0)})")
+    else:
+        print()
+
+    # Check torch.compile
+    try:
+        major = int(torch.__version__.split('.')[0])
+        compile_available = major >= 2
+    except:
+        compile_available = False
+    print(f"  torch.compile: {'available' if compile_available else 'not available'}")
+    print()
+    print("Typical speedups:")
+    print("  - Eager: 1-2x")
+    print("  - Compiled (CUDA): 2-10x")
+    print()
+    print("Usage:")
+    print("  python -m wide_compiler benchmark gru -p quick")
+    print("  python -m wide_compiler benchmark gru -p quick --compile reduce-overhead")
+    print("  python -m wide_compiler benchmark mlp --n 100  # legacy mode")
+    print()
+    print("GitHub: https://github.com/AbstractEyes/wide-compiler")
     return 0
 
 
@@ -398,27 +513,26 @@ def main():
 
     # trace
     trace_parser = subparsers.add_parser('trace', help='Show FX trace for a model')
-    trace_parser.add_argument('--model', '-m', default='mlp',
-                             help='Model name (mlp, deep_mlp, resblock, convnet)')
-    trace_parser.add_argument('--tabular', '-t', action='store_true',
-                             help='Show tabular view')
+    trace_parser.add_argument('--model', '-m', default='mlp', help='Model name')
+    trace_parser.add_argument('--tabular', '-t', action='store_true', help='Show tabular view')
 
-    # benchmark - positional primitive argument
-    bench_parser = subparsers.add_parser('benchmark', help='Benchmark primitive strategies')
+    # benchmark <primitive> - NEW: benchmark Wide primitives with compilation
+    bench_parser = subparsers.add_parser('benchmark', help='Benchmark Wide primitives')
     bench_parser.add_argument('primitive', nargs='?', default=None,
-                             help='Primitive to benchmark (conv1d, conv2d, linear, or "all")')
-    bench_parser.add_argument('--preset', '-p', default='full',
-                             help='Sweep preset (quick, full, ci)')
-    bench_parser.add_argument('--n-values', '-n',
-                             help='Override N values (comma-separated, e.g., "4,8,16,32")')
-    bench_parser.add_argument('--output', '-o',
-                             help='Save results to specific JSON file')
-    bench_parser.add_argument('--save', '-s', action='store_true',
-                             help='Auto-save results with timestamp')
-    bench_parser.add_argument('--top', '-t', type=int, default=10,
-                             help='Number of top results to display (default: 10)')
-    bench_parser.add_argument('--quiet', '-q', action='store_true',
-                             help='Suppress progress output')
+                              help='Primitive to benchmark (gru, lstm, linear, conv2d, attention) or legacy model name')
+    bench_parser.add_argument('-p', '--preset', default='quick', help='Preset (quick, ci, full)')
+    bench_parser.add_argument('-c', '--compile', default='auto',
+                              choices=['auto', 'eager', 'inductor', 'reduce-overhead', 'max-autotune'],
+                              help='Compilation mode (default: auto)')
+    bench_parser.add_argument('--model', '-m', default=None, help='Legacy: model name (mlp, resblock, etc.)')
+    bench_parser.add_argument('--n', type=int, default=None, help='Number of models (legacy mode)')
+    bench_parser.add_argument('--batch', '-b', type=int, default=32, help='Batch size')
+    bench_parser.add_argument('--iters', '-i', type=int, default=100, help='Iterations')
+    bench_parser.add_argument('--warmup', '-w', type=int, default=3, help='Warmup iterations')
+    bench_parser.add_argument('--top', type=int, default=8, help='Show top N results')
+    bench_parser.add_argument('--no-validate', action='store_true', help='Skip validation')
+    bench_parser.add_argument('-q', '--quiet', action='store_true', help='Quiet mode')
+    bench_parser.add_argument('-o', '--output', help='Save results to JSON file')
     bench_parser.add_argument('--cpu', action='store_true', help='Force CPU')
 
     # info
@@ -430,14 +544,16 @@ def main():
         parser.print_help()
         return 0
 
-    commands = {
-        'test': cmd_test,
-        'trace': cmd_trace,
-        'benchmark': cmd_benchmark,
-        'info': cmd_info,
-    }
+    if args.command == 'test':
+        return cmd_test(args)
+    elif args.command == 'trace':
+        return cmd_trace(args)
+    elif args.command == 'benchmark':
+        return cmd_benchmark(args)
+    elif args.command == 'info':
+        return cmd_info(args)
 
-    return commands[args.command](args)
+    return 0
 
 
 if __name__ == '__main__':

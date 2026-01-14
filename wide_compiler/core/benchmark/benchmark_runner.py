@@ -2,17 +2,21 @@
 WideCompiler.core.benchmark.benchmark_runner
 
 Execute benchmark jobs and time functions.
+Supports torch.compile for fair Wide vs baseline comparison.
 
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
 
 import time
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 import torch
-from torch import Tensor
+from torch import nn, Tensor
 
-from .benchmark_schema import BenchmarkJob, BenchmarkResult, SingleResult
+from .benchmark_schema import (
+    BenchmarkJob, BenchmarkResult, SingleResult,
+    CompilationMode, compilation_available, get_compile_fn
+)
 
 
 def time_fn(
@@ -60,6 +64,7 @@ def run_single(
     warmup: int = 3,
     iterations: int = 10,
     validate: bool = True,
+    compilation: CompilationMode = CompilationMode.EAGER,
 ) -> SingleResult:
     """
     Run a single benchmark configuration.
@@ -73,26 +78,43 @@ def run_single(
         warmup: Warmup iterations
         iterations: Timing iterations
         validate: Run correctness validation (default True)
+        compilation: Compilation mode for both Wide and baseline
 
     Returns:
         SingleResult with timing and validation status
     """
+    # Get compile function if available
+    compile_fn = get_compile_fn(compilation)
+    compiled = compile_fn is not None
+    extra_warmup = job.compile_warmup_extra if compiled else 0
+
     # Create N models
     models = [job.model_factory(**params).to(device).eval() for _ in range(n)]
+
+    # Compile baseline models if compilation enabled
+    if compiled:
+        models_compiled = [compile_fn(m) for m in models]
+    else:
+        models_compiled = models
 
     # Create input
     sample = job.input_factory(n=n, device=device, **params)
     inputs = [sample.clone() for _ in range(n)]
 
-    # Baseline: sequential execution - get outputs for validation
+    # Baseline: sequential execution - get outputs for validation (use uncompiled for validation)
     with torch.no_grad():
         baseline_outputs = [m(inp) for m, inp in zip(models, inputs)]
 
     def baseline_fn():
-        for i, m in enumerate(models):
+        for i, m in enumerate(models_compiled):
             m(inputs[i])
 
-    baseline_ms = time_fn(baseline_fn, iterations=iterations, warmup=warmup, device=device)
+    baseline_ms = time_fn(
+        baseline_fn,
+        iterations=iterations,
+        warmup=warmup + extra_warmup,
+        device=device
+    )
 
     # Strategy-specific
     if strategy == 'baseline':
@@ -103,21 +125,29 @@ def run_single(
             time_ms=baseline_ms,
             baseline_ms=baseline_ms,
             speedup=1.0,
+            compiled=compiled,
             valid=True,
             validation_msg="OK",
         )
 
     # Build wide model with strategy
     wide_model = job.wide_factory(models, strategy).to(device).eval()
+
+    # Compile wide model if compilation enabled
+    if compiled:
+        wide_model = compile_fn(wide_model)
+
     packed = job.pack_fn(inputs)
 
-    # Run validation if requested and validate_fn exists
+    # Run validation if requested and validate_fn exists (use uncompiled wide for validation)
     is_valid = True
     validation_msg = "OK"
 
     if validate and hasattr(job, 'validate_fn') and job.validate_fn is not None:
+        # Create uncompiled wide for validation to avoid compile overhead
+        wide_for_val = job.wide_factory(models, strategy).to(device).eval()
         with torch.no_grad():
-            wide_output = wide_model(packed)
+            wide_output = wide_for_val(packed)
 
         is_valid, validation_msg = job.validate_fn(wide_output, baseline_outputs)
 
@@ -130,6 +160,7 @@ def run_single(
                 time_ms=float('inf'),
                 baseline_ms=baseline_ms,
                 speedup=0.0,
+                compiled=compiled,
                 valid=False,
                 validation_msg=validation_msg,
             )
@@ -137,7 +168,12 @@ def run_single(
     def wide_fn():
         wide_model(packed)
 
-    wide_ms = time_fn(wide_fn, iterations=iterations, warmup=warmup, device=device)
+    wide_ms = time_fn(
+        wide_fn,
+        iterations=iterations,
+        warmup=warmup + extra_warmup,
+        device=device
+    )
     speedup = baseline_ms / wide_ms if wide_ms > 0 else 0
 
     return SingleResult(
@@ -147,6 +183,7 @@ def run_single(
         time_ms=wide_ms,
         baseline_ms=baseline_ms,
         speedup=speedup,
+        compiled=compiled,
         valid=is_valid,
         validation_msg=validation_msg,
     )
@@ -159,6 +196,7 @@ def run(
     warmup: int = 3,
     iterations: int = 10,
     validate: bool = True,
+    compilation: Optional[CompilationMode] = None,
 ) -> BenchmarkResult:
     """
     Run complete benchmark sweep.
@@ -170,6 +208,7 @@ def run(
         warmup: Warmup iterations per config
         iterations: Timing iterations per config
         validate: Run correctness validation (default True)
+        compilation: Override job's compilation mode (None=use job default)
 
     Returns:
         BenchmarkResult with all measurements
@@ -178,6 +217,16 @@ def run(
         if verbose:
             print("CUDA not available, falling back to CPU")
         device = 'cpu'
+
+    # Determine compilation mode
+    comp_mode = compilation if compilation is not None else job.compilation
+    if comp_mode == CompilationMode.AUTO:
+        if compilation_available():
+            comp_mode = CompilationMode.REDUCE_OVERHEAD
+        else:
+            comp_mode = CompilationMode.EAGER
+
+    compiled = get_compile_fn(comp_mode) is not None
 
     results: List[SingleResult] = []
     sweep = job.sweep
@@ -190,7 +239,8 @@ def run(
     current = 0
 
     if verbose:
-        print(f"Running {job.name}: {total_configs} configs")
+        mode_str = "compiled" if compiled else "eager"
+        print(f"Running {job.name}: {total_configs} configs ({mode_str})")
 
     for n in sweep.n_values:
         if verbose:
@@ -209,6 +259,7 @@ def run(
                         warmup=warmup,
                         iterations=iterations,
                         validate=validate,
+                        compilation=comp_mode,
                     )
                     results.append(result)
                     n_results.append(result)
@@ -283,4 +334,4 @@ def _generate_param_combos(sweep) -> List[dict]:
     return combos
 
 
-__all__ = ['run', 'run_single', 'time_fn']
+__all__ = ['run', 'run_single', 'time_fn', 'CompilationMode']
