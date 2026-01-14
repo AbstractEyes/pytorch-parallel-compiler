@@ -1,6 +1,6 @@
 # pytorch-parallel-compiler
 
-### Version 0.4.0
+### Version 0.3.0
 
 Compile-friendly batched model execution. Fuse N identical models into a single Wide model for massive speedups.
 
