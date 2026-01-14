@@ -6,6 +6,10 @@ Main API entry point.
     import wide_compiler
     wide_model = wide_compiler.compile(models, sample_input)
 
+Benchmark API:
+    from wide_compiler.api import benchmark_primitive
+    result = benchmark_primitive('conv1d')
+
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
@@ -77,10 +81,10 @@ def compile(
     # Import here to avoid circular imports
     try:
         from .core.traced_wide import TracedWideModel
-        from .core.wide_model import pack_inputs, unpack_outputs
+        from .core.ensemble_util import pack_inputs, unpack_outputs
     except ImportError:
         from wide_compiler.core.traced_wide import TracedWideModel
-        from wide_compiler.core.wide_model import pack_inputs, unpack_outputs
+        from wide_compiler.core.ensemble_util import pack_inputs, unpack_outputs
 
     # Resolve config
     cfg = config or get_default_config()
@@ -262,9 +266,9 @@ def _validate_model(
 ) -> None:
     """Validate Wide model produces same outputs as individual models."""
     try:
-        from .core.wide_model import pack_inputs, unpack_outputs
+        from .core.ensemble_util import pack_inputs, unpack_outputs
     except ImportError:
-        from wide_compiler.core.wide_model import pack_inputs, unpack_outputs
+        from wide_compiler.core.ensemble_util import pack_inputs, unpack_outputs
 
     n = len(models)
     device = sample_input.device
@@ -306,24 +310,108 @@ def _validate_model(
 def pack(inputs: List[Tensor]) -> Tensor:
     """Pack N inputs into wide format. Alias for pack_inputs."""
     try:
-        from .core.wide_model import pack_inputs
+        from .core.ensemble_util import pack_inputs
     except ImportError:
-        from wide_compiler.core.wide_model import pack_inputs
+        from wide_compiler.core.ensemble_util import pack_inputs
     return pack_inputs(inputs)
 
 
 def unpack(output: Tensor, n: int) -> List[Tensor]:
     """Unpack wide output to N tensors. Alias for unpack_outputs."""
     try:
-        from .core.wide_model import unpack_outputs
+        from .core.ensemble_util import unpack_outputs
     except ImportError:
-        from wide_compiler.core.wide_model import unpack_outputs
+        from wide_compiler.core.ensemble_util import unpack_outputs
     return unpack_outputs(output, n)
 
 
+# =============================================================================
+# BENCHMARK API (convenience re-exports)
+# =============================================================================
+
+def benchmark_primitive(
+    name: str,
+    preset: str = 'full',
+    device: str = 'cuda',
+    verbose: bool = True,
+    **overrides,
+):
+    """
+    Benchmark a primitive's strategy selection.
+
+    Args:
+        name: Primitive name ('conv1d', 'conv2d', 'linear', etc.)
+        preset: Sweep preset ('quick', 'full', 'ci')
+        device: 'cuda' or 'cpu'
+        verbose: Print progress
+        **overrides: Override sweep params (e.g., n_values=[4,8])
+
+    Returns:
+        BenchmarkResult with all measurements
+
+    Example:
+        result = benchmark_primitive('conv1d')
+        result = benchmark_primitive('conv1d', preset='quick')
+        result = benchmark_primitive('conv1d', n_values=[8, 16, 32])
+    """
+    try:
+        from .core.benchmark import benchmark
+    except ImportError:
+        from wide_compiler.core.benchmark import benchmark
+    return benchmark(name, preset=preset, device=device, verbose=verbose, **overrides)
+
+
+def benchmark_custom(
+    model_class,
+    input_shape,
+    n_values,
+    name: str = 'custom',
+    device: str = 'cuda',
+    **model_kwargs,
+):
+    """
+    Benchmark an arbitrary model class.
+
+    Args:
+        model_class: nn.Module subclass
+        input_shape: Shape for single model input (without batch)
+        n_values: List of N values to test
+        name: Name for this benchmark
+        device: 'cuda' or 'cpu'
+        **model_kwargs: Arguments passed to model_class()
+
+    Returns:
+        BenchmarkResult
+
+    Example:
+        class Expert(nn.Module):
+            def __init__(self, d=256):
+                super().__init__()
+                self.fc1 = nn.Linear(d, d*4)
+                self.fc2 = nn.Linear(d*4, d)
+            def forward(self, x):
+                return self.fc2(F.gelu(self.fc1(x)))
+
+        result = benchmark_custom(Expert, (256,), [8, 16, 32, 64], d=256)
+    """
+    try:
+        from .core.benchmark import benchmark_custom as _benchmark_custom
+    except ImportError:
+        from wide_compiler.core.benchmark import benchmark_custom as _benchmark_custom
+    return _benchmark_custom(
+        model_class, input_shape, n_values,
+        name=name, device=device, **model_kwargs
+    )
+
+
 __all__ = [
+    # Main API
     'compile',
     'WideBuilder',
     'pack',
     'unpack',
+
+    # Benchmark API
+    'benchmark_primitive',
+    'benchmark_custom',
 ]

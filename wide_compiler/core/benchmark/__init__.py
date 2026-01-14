@@ -1,53 +1,78 @@
 """
 WideCompiler.core.benchmark
 
-Internal benchmarking suite for WideCompiler components.
+Unified benchmark system.
 
-Benchmarks:
-    - traced_wide: TracedWideModel forward pass variants
-    - conv1d: WideConv1d strategy selection
-    - conv2d: WideConv2d strategy selection
-    - linear: WideLinear strategy selection
+API Usage:
+    from wide_compiler.core.benchmark import benchmark, benchmark_custom
 
-Usage:
-    from wide_compiler.core.benchmark import run_benchmark, list_benchmarks
+    # Run registered benchmark
+    result = benchmark('conv1d')
+    result = benchmark('conv1d', preset='quick')
 
-    # List available
-    print(list_benchmarks())
+    # Run custom model
+    result = benchmark_custom(MyModel, (32, 256), [8, 16, 32])
 
-    # Run one
-    results = run_benchmark('conv1d')
-
-    # Run all primitives
-    results = run_benchmark_all(tag='primitive')
+Schema:
+    SweepParams     - Parameter ranges (lives in primitive files)
+    BenchmarkJob    - Sweep + factories (runtime)
+    SingleResult    - One measurement
+    BenchmarkResult - Full output (serializable)
 
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
 
-from .benchmark_registry import (
-    register_benchmark,
-    list_benchmarks,
-    get_benchmark_info,
-    run_benchmark,
-    run_all_benchmarks,
-    print_benchmark_summary,
-    BenchmarkInfo,
+# Schema
+from .benchmark_schema import (
+    SweepParams,
+    BenchmarkJob,
+    SingleResult,
+    BenchmarkResult,
 )
 
-# Import benchmark modules to trigger registration
-from . import wide_conv1d_benchmark
+# Runner
+from .benchmark_runner import run, run_single, time_fn
 
-# from . import traced_wide_benchmark  # Add when moved
-# from . import wide_conv2d_benchmark  # Add when created
-# from . import wide_linear_benchmark  # Add when created
+# API
+from .benchmark_api import (
+    benchmark,
+    benchmark_multi,
+    benchmark_all,
+    benchmark_custom,
+)
+
+# Registry
+from .benchmark_registry import (
+    register,
+    register_primitive,
+    get_primitive,
+    list_primitives,
+    has_primitive,
+)
 
 __all__ = [
-    'register_benchmark',
-    'list_benchmarks',
-    'get_benchmark_info',
-    'run_benchmark',
-    'run_all_benchmarks',
-    'print_benchmark_summary',
-    'BenchmarkInfo',
+    # Schema
+    'SweepParams',
+    'BenchmarkJob',
+    'SingleResult',
+    'BenchmarkResult',
+
+    # Runner
+    'run',
+    'run_single',
+    'time_fn',
+
+    # API
+    'benchmark',
+    'benchmark_multi',
+    'benchmark_all',
+    'benchmark_custom',
+
+    # Registry
+    'register',
+    'register_primitive',
+    'get_primitive',
+    'list_primitives',
+    'has_primitive',
 ]

@@ -7,131 +7,59 @@ Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
 
-try:
-    from .config import (
-        WideConfig,
-        get_default_config,
-        set_default_config,
-    )
-except ImportError:
-    from wide_compiler.core.config import (
-        WideConfig,
-        get_default_config,
-        set_default_config,
-    )
+# Traced model (main entry point)
+from .traced_wide import (
+    TracedWideModel,
+    FunctionalOp,
+    BinaryOp,
+    print_trace,
+)
 
-try:
-    from .registry import (
-        WideRegistry,
-        get_registry,
-        register,
-        unregister,
-        get_builder,
-        build_wide,
-        list_registered,
-    )
-except ImportError:
-    from wide_compiler.core.registry import (
-        WideRegistry,
-        get_registry,
-        register,
-        unregister,
-        get_builder,
-        build_wide,
-        list_registered,
-    )
+# Pack/unpack utilities
+from .ensemble_util import (
+    pack_inputs,
+    unpack_outputs,
+)
 
-try:
-    from .traced_wide import (
-        TracedWideModel,
-        TraceNode,
-        WideStage,
-        FunctionalOp,
-        BinaryOp,
-        analyze_trace,
-        print_trace,
-    )
-except ImportError:
-    from wide_compiler.core.traced_wide import (
-        TracedWideModel,
-        TraceNode,
-        WideStage,
-        FunctionalOp,
-        BinaryOp,
-        analyze_trace,
-        print_trace,
-    )
+# Registry
+from .registry import (
+    WideRegistry,
+    get_registry,
+    register,
+    unregister,
+    get_builder,
+    build_wide,
+    list_registered,
+)
 
-try:
-    from .wide_model import (
-        WideModel,
-        TreeNode,
-        traverse,
-        get_leaves,
-        make_wide,
-        align_modules,
-        pack_inputs,
-        unpack_outputs,
-    )
-except ImportError:
-    from wide_compiler.core.wide_model import (
-        WideModel,
-        TreeNode,
-        traverse,
-        get_leaves,
-        make_wide,
-        align_modules,
-        pack_inputs,
-        unpack_outputs,
-    )
+# Config
+from .config import (
+    WideConfig,
+    get_default_config,
+    set_default_config,
+)
 
-try:
-    from .primitives import (
-        WideLinear,
-        WideConv2d,
-        WideConv1d,
-        WideBatchNorm2d,
-        WideBatchNorm1d,
-        WideLayerNorm,
-        WideEmbedding,
-    )
-except ImportError:
-    from wide_compiler.core.primitives import (
-        WideLinear,
-        WideConv2d,
-        WideConv1d,
-        WideBatchNorm2d,
-        WideBatchNorm1d,
-        WideLayerNorm,
-        WideEmbedding,
-    )
-
-try:
-    from .traced_benchmark import (
-        benchmark_model,
-        benchmark_models,
-        profile_with_torch_profiler,
-        BenchmarkResult,
-        TimingResult,
-        StageProfile,
-        MemoryResult,
-    )
-except ImportError:
-    from wide_compiler.core.benchmark.traced_wide_benchmark import (
-        benchmark_model,
-        benchmark_models,
-        profile_with_torch_profiler,
-        BenchmarkResult,
-        TimingResult,
-        StageProfile,
-        MemoryResult,
-    )
+# Primitives
+from .primitives import (
+    WideLinear,
+    WideConv2d,
+    WideConv1d,
+    WideBatchNorm2d,
+    WideBatchNorm1d,
+    WideLayerNorm,
+    WideEmbedding,
+)
 
 __all__ = [
-    # Config
-    'WideConfig',
-    'get_default_config',
-    'set_default_config',
+    # Traced model
+    'TracedWideModel',
+    'FunctionalOp',
+    'BinaryOp',
+    'print_trace',
+
+    # Pack/unpack
+    'pack_inputs',
+    'unpack_outputs',
 
     # Registry
     'WideRegistry',
@@ -142,24 +70,10 @@ __all__ = [
     'build_wide',
     'list_registered',
 
-    # Traced Wide
-    'TracedWideModel',
-    'TraceNode',
-    'WideStage',
-    'FunctionalOp',
-    'BinaryOp',
-    'analyze_trace',
-    'print_trace',
-
-    # Wide Model
-    'WideModel',
-    'TreeNode',
-    'traverse',
-    'get_leaves',
-    'make_wide',
-    'align_modules',
-    'pack_inputs',
-    'unpack_outputs',
+    # Config
+    'WideConfig',
+    'get_default_config',
+    'set_default_config',
 
     # Primitives
     'WideLinear',
@@ -169,13 +83,4 @@ __all__ = [
     'WideBatchNorm1d',
     'WideLayerNorm',
     'WideEmbedding',
-
-    # Benchmark
-    'benchmark_model',
-    'benchmark_models',
-    'profile_with_torch_profiler',
-    'BenchmarkResult',
-    'TimingResult',
-    'StageProfile',
-    'MemoryResult',
 ]

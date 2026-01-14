@@ -2,6 +2,7 @@
 WideCompiler.core.primitives.wide_conv1d
 
 N parallel Conv1d layers fused into single operation.
+
 Strategy auto-selected based on N:
   - SEQUENTIAL (N < 10): Loop over individual convs
   - GROUPED (N >= 10): Single grouped convolution
@@ -13,8 +14,8 @@ Apache 2.0 License
 from __future__ import annotations
 
 from enum import Enum, auto
-from typing import List, Optional
-import warnings
+from typing import List, Optional, Dict, Any
+from dataclasses import replace
 
 import torch
 from torch import nn, Tensor
@@ -23,11 +24,11 @@ import torch.nn.functional as F
 
 class Conv1dStrategy(Enum):
     """Execution strategy for WideConv1d."""
-    GROUPED = auto()  # Single grouped conv - best for large N
+    GROUPED = auto()     # Single grouped conv - best for large N
     SEQUENTIAL = auto()  # Loop over N convs - best for small N
 
 
-# Threshold for strategy selection (same as Conv2d)
+# Threshold for strategy selection
 _GROUPED_THRESHOLD = 10
 
 
@@ -51,16 +52,16 @@ class WideConv1d(nn.Module):
     """
 
     def __init__(
-            self,
-            n: int,
-            in_channels: int,
-            out_channels: int,
-            kernel_size: int,
-            stride: int = 1,
-            padding: int = 0,
-            dilation: int = 1,
-            bias: bool = True,
-            strategy: Optional[Conv1dStrategy] = None,
+        self,
+        n: int,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        bias: bool = True,
+        strategy: Optional[Conv1dStrategy] = None,
     ):
         super().__init__()
         self.n = n
@@ -90,7 +91,6 @@ class WideConv1d(nn.Module):
             )
         else:
             # SEQUENTIAL: store N separate weight tensors
-            # Weight shape: [N, out_channels, in_channels, kernel_size]
             self.weight = nn.Parameter(
                 torch.empty(n, out_channels, in_channels, kernel_size)
             )
@@ -102,12 +102,14 @@ class WideConv1d(nn.Module):
             self._init_sequential_weights()
 
     def _init_sequential_weights(self):
-        """Initialize sequential weights with Kaiming uniform."""
+        """Initialize sequential weights to match PyTorch Conv1d defaults."""
+        import math
         for i in range(self.n):
-            nn.init.kaiming_uniform_(self.weight[i], a=5 ** 0.5)
+            # Match nn.Conv1d: kaiming_uniform with a=sqrt(5)
+            nn.init.kaiming_uniform_(self.weight[i], a=math.sqrt(5))
             if self.bias is not None:
                 fan_in = self.in_channels * self.kernel_size
-                bound = 1 / (fan_in ** 0.5)
+                bound = 1 / math.sqrt(fan_in)
                 nn.init.uniform_(self.bias[i], -bound, bound)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -127,7 +129,6 @@ class WideConv1d(nn.Module):
 
         outputs = []
         for i in range(self.n):
-            # x[:, i]: [B, C_in, L]
             out = F.conv1d(
                 x[:, i],
                 self.weight[i],
@@ -138,30 +139,20 @@ class WideConv1d(nn.Module):
             )
             outputs.append(out)
 
-        # Stack and reshape: [N, B, C_out, L_out] -> [B, N*C_out, L_out]
-        stacked = torch.stack(outputs, dim=1)  # [B, N, C_out, L_out]
+        # Stack and reshape: [B, N, C_out, L_out] -> [B, N*C_out, L_out]
+        stacked = torch.stack(outputs, dim=1)
         return stacked.view(B, self.n * C_out, -1)
 
     @classmethod
     def from_modules(
-            cls,
-            modules: List[nn.Conv1d],
-            strategy: Optional[Conv1dStrategy] = None,
+        cls,
+        modules: List[nn.Conv1d],
+        strategy: Optional[Conv1dStrategy] = None,
     ) -> 'WideConv1d':
-        """
-        Build WideConv1d from N existing Conv1d modules.
-
-        Args:
-            modules: List of N Conv1d modules with identical architecture
-            strategy: Force specific strategy, or None for auto-selection
-
-        Returns:
-            WideConv1d with weights copied from input modules
-        """
+        """Build WideConv1d from N existing Conv1d modules."""
         n = len(modules)
         t = modules[0]
 
-        # Extract scalar values from potentially tuple attributes
         k = t.kernel_size[0] if isinstance(t.kernel_size, tuple) else t.kernel_size
         s = t.stride[0] if isinstance(t.stride, tuple) else t.stride
         p = t.padding[0] if isinstance(t.padding, tuple) else t.padding
@@ -179,7 +170,6 @@ class WideConv1d(nn.Module):
             strategy=strategy,
         )
 
-        # Copy weights
         with torch.no_grad():
             if wide.strategy == Conv1dStrategy.GROUPED:
                 for i, m in enumerate(modules):
@@ -202,100 +192,120 @@ class WideConv1d(nn.Module):
             f"k={self.kernel_size}, strategy={self.strategy.name.lower()})"
         )
 
+    # =========================================================================
+    # BENCHMARK INTERFACE
+    # =========================================================================
+
+    # Import here to avoid circular imports
+    try:
+        from ..benchmark.benchmark_schema import SweepParams, BenchmarkJob
+    except ImportError:
+        SweepParams = None
+        BenchmarkJob = None
+
+    BENCHMARK_SWEEPS: Dict[str, Any] = {}
+    BENCHMARK_STRATEGIES = ['baseline', 'grouped', 'sequential']
+
+    @classmethod
+    def _init_benchmark_sweeps(cls):
+        """Initialize sweep configs (called once on first access)."""
+        if cls.BENCHMARK_SWEEPS:
+            return
+
+        try:
+            from ..benchmark.benchmark_schema import SweepParams
+        except ImportError:
+            return
+
+        cls.BENCHMARK_SWEEPS = {
+            'quick': SweepParams(
+                n_values=[4, 8, 16, 32],
+                batch_sizes=[8],
+                channels=[64],
+                kernel_sizes=[3],
+                seq_lengths=[256],
+            ),
+            'full': SweepParams(
+                n_values=[2, 4, 6, 8, 10, 12, 16, 20, 32, 64],
+                batch_sizes=[8],
+                channels=[32, 64, 128],
+                kernel_sizes=[1, 3, 5, 7],
+                seq_lengths=[64, 256, 1024],
+            ),
+            'ci': SweepParams(
+                n_values=[4, 16],
+                batch_sizes=[8],
+                channels=[64],
+                kernel_sizes=[3],
+                seq_lengths=[256],
+            ),
+        }
+
+    @classmethod
+    def benchmark_job(cls, preset: str = 'full', **overrides) -> 'BenchmarkJob':
+        """
+        Get benchmark job for WideConv1d.
+
+        Args:
+            preset: 'quick', 'full', or 'ci'
+            **overrides: Override sweep params
+
+        Returns:
+            BenchmarkJob ready to run
+        """
+        cls._init_benchmark_sweeps()
+
+        from ..benchmark.benchmark_schema import SweepParams, BenchmarkJob
+
+        sweep = cls.BENCHMARK_SWEEPS.get(preset)
+        if sweep is None:
+            raise ValueError(f"Unknown preset '{preset}'. Available: {list(cls.BENCHMARK_SWEEPS.keys())}")
+
+        if overrides:
+            sweep = sweep.with_overrides(**overrides)
+
+        return BenchmarkJob(
+            name=f'conv1d_{preset}',
+            primitive='conv1d',
+            strategies=cls.BENCHMARK_STRATEGIES,
+            sweep=sweep,
+            model_factory=cls._bench_model,
+            input_factory=cls._bench_input,
+            wide_factory=cls._bench_wide,
+            pack_fn=cls._bench_pack,
+            unpack_fn=cls._bench_unpack,
+        )
+
+    @staticmethod
+    def _bench_model(channels: int, kernel_sizes: int, **_) -> nn.Conv1d:
+        """Create single Conv1d for benchmarking."""
+        return nn.Conv1d(channels, channels, kernel_sizes, padding=kernel_sizes // 2)
+
+    @staticmethod
+    def _bench_input(n: int, batch_sizes: int, channels: int, seq_lengths: int, device: str = 'cpu', **_) -> Tensor:
+        """Create single input tensor (will be replicated for N models)."""
+        return torch.randn(batch_sizes, channels, seq_lengths, device=device)
+
+    @classmethod
+    def _bench_wide(cls, modules: List[nn.Conv1d], strategy: str) -> 'WideConv1d':
+        """Create WideConv1d with specific strategy."""
+        strat = Conv1dStrategy.GROUPED if strategy == 'grouped' else Conv1dStrategy.SEQUENTIAL
+        return cls.from_modules(modules, strategy=strat)
+
+    @staticmethod
+    def _bench_pack(inputs: List[Tensor]) -> Tensor:
+        """Pack N inputs into wide format."""
+        stacked = torch.stack(inputs, dim=1)  # [B, N, C, L]
+        B, N, C, L = stacked.shape
+        return stacked.view(B, N * C, L)
+
+    @staticmethod
+    def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
+        """Unpack wide output to N outputs."""
+        B, NC, L = output.shape
+        C = NC // n
+        reshaped = output.view(B, n, C, L)
+        return [reshaped[:, i] for i in range(n)]
+
 
 __all__ = ['WideConv1d', 'Conv1dStrategy']
-
-# =============================================================================
-# TESTS
-# =============================================================================
-
-if __name__ == '__main__':
-    torch.manual_seed(42)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"WideConv1d Tests | Device: {device}")
-    print("=" * 60)
-
-    # Test parameters
-    B, C_in, C_out, L, K = 8, 32, 64, 128, 3
-
-    for N in [4, 8, 16, 32]:
-        print(f"\n--- N={N} ---")
-
-        # Create N separate Conv1d
-        convs = [nn.Conv1d(C_in, C_out, K, padding=1).to(device) for _ in range(N)]
-
-        # Create wide versions with both strategies
-        wide_grouped = WideConv1d.from_modules(convs, strategy=Conv1dStrategy.GROUPED).to(device)
-        wide_seq = WideConv1d.from_modules(convs, strategy=Conv1dStrategy.SEQUENTIAL).to(device)
-        wide_auto = WideConv1d.from_modules(convs).to(device)
-
-        print(f"  Auto-selected: {wide_auto}")
-
-        # Test inputs
-        inputs = [torch.randn(B, C_in, L, device=device) for _ in range(N)]
-
-        # Pack inputs
-        packed = torch.cat([inp.unsqueeze(1) for inp in inputs], dim=1)
-        packed = packed.view(B, N * C_in, L)
-
-        # Reference: run separately
-        with torch.no_grad():
-            ref_outputs = [convs[i](inputs[i]) for i in range(N)]
-            ref_stacked = torch.stack(ref_outputs, dim=1)
-            ref_packed = ref_stacked.view(B, N * C_out, -1)
-
-        # Test grouped
-        with torch.no_grad():
-            out_grouped = wide_grouped(packed)
-        diff_grouped = (ref_packed - out_grouped).abs().max().item()
-
-        # Test sequential
-        with torch.no_grad():
-            out_seq = wide_seq(packed)
-        diff_seq = (ref_packed - out_seq).abs().max().item()
-
-        print(f"  GROUPED diff:    {diff_grouped:.2e} {'OK' if diff_grouped < 1e-5 else 'FAIL'}")
-        print(f"  SEQUENTIAL diff: {diff_seq:.2e} {'OK' if diff_seq < 1e-5 else 'FAIL'}")
-
-    # Benchmark
-    print("\n" + "=" * 60)
-    print("Benchmark (N=20, B=16, C=64, L=256, K=3)")
-    print("=" * 60)
-
-    import time
-
-    N, B, C_in, C_out, L, K = 20, 16, 64, 64, 256, 3
-    convs = [nn.Conv1d(C_in, C_out, K, padding=1).to(device) for _ in range(N)]
-
-    wide_grouped = WideConv1d.from_modules(convs, strategy=Conv1dStrategy.GROUPED).to(device)
-    wide_seq = WideConv1d.from_modules(convs, strategy=Conv1dStrategy.SEQUENTIAL).to(device)
-
-    inputs = [torch.randn(B, C_in, L, device=device) for _ in range(N)]
-    packed = torch.cat([inp.unsqueeze(1) for inp in inputs], dim=1).view(B, N * C_in, L)
-
-
-    def bench(fn, iters=100, warmup=20):
-        for _ in range(warmup):
-            fn()
-        if device == 'cuda':
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            fn()
-        if device == 'cuda':
-            torch.cuda.synchronize()
-        return (time.perf_counter() - t0) / iters * 1000
-
-
-    with torch.no_grad():
-        t_seq_baseline = bench(lambda: [convs[i](inputs[i]) for i in range(N)])
-        t_grouped = bench(lambda: wide_grouped(packed))
-        t_sequential = bench(lambda: wide_seq(packed))
-
-    print(f"  N x Conv1d:      {t_seq_baseline:.3f}ms (baseline)")
-    print(f"  GROUPED:         {t_grouped:.3f}ms ({t_seq_baseline / t_grouped:.2f}x)")
-    print(f"  SEQUENTIAL:      {t_sequential:.3f}ms ({t_seq_baseline / t_sequential:.2f}x)")
-
-    print("\n" + "=" * 60)
-    print("ALL TESTS COMPLETE")
-    print("=" * 60)

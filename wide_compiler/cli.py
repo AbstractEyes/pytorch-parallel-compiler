@@ -4,17 +4,18 @@ WideCompiler CLI
 Benchmark and debug utilities for Wide model compilation.
 
 Usage:
-    python -m wide_compiler.cli test
-    python -m wide_compiler.cli benchmark --n 100 --model mlp
-    python -m wide_compiler.cli trace --model resblock
-    python -m wide_compiler.cli info
+    python -m wide_compiler test
+    python -m wide_compiler benchmark conv1d
+    python -m wide_compiler benchmark conv1d --preset quick
+    python -m wide_compiler benchmark all
+    python -m wide_compiler trace --model resblock
+    python -m wide_compiler info
 
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
 
 import argparse
-import time
 import sys
 
 import torch
@@ -25,23 +26,21 @@ import torch.fx as fx
 try:
     from .core import (
         TracedWideModel,
-        pack_inputs,
-        unpack_outputs,
         print_trace,
     )
+    from .core.ensemble_util import pack_inputs, unpack_outputs
     from .core.registry import list_registered
 except ImportError:
     from wide_compiler.core import (
         TracedWideModel,
-        pack_inputs,
-        unpack_outputs,
         print_trace,
     )
+    from wide_compiler.core.ensemble_util import pack_inputs, unpack_outputs
     from wide_compiler.core.registry import list_registered
 
 
 # =============================================================================
-# SAMPLE MODELS
+# SAMPLE MODELS (for test/trace commands)
 # =============================================================================
 
 class MLP(nn.Module):
@@ -152,14 +151,14 @@ def cmd_test(args):
             max_diff = max((separate[i] - wide_outs[i]).abs().max().item() for i in range(N))
 
             if max_diff < 1e-3:
-                print(f"  ✓ {name}: max_diff={max_diff:.8f}")
+                print(f"  OK {name}: max_diff={max_diff:.8f}")
                 passed += 1
             else:
-                print(f"  ✗ {name}: max_diff={max_diff:.8f} (too high)")
+                print(f"  FAIL {name}: max_diff={max_diff:.8f} (too high)")
                 failed += 1
 
         except Exception as e:
-            print(f"  ✗ {name}: {e}")
+            print(f"  FAIL {name}: {e}")
             failed += 1
 
     print("\n" + "=" * 60)
@@ -198,111 +197,75 @@ def cmd_trace(args):
 
 
 def cmd_benchmark(args):
-    """Benchmark wide model speedup."""
-    device = 'cuda' if torch.cuda.is_available() and not args.cpu else 'cpu'
+    """Benchmark primitive strategies."""
+    try:
+        from .core.benchmark import benchmark, benchmark_all, list_primitives
+    except ImportError:
+        from wide_compiler.core.benchmark import benchmark, benchmark_all, list_primitives
 
-    if args.model not in MODELS:
-        print(f"Unknown model: {args.model}")
-        print(f"Available: {', '.join(MODELS.keys())}")
+    device = 'cpu' if args.cpu else 'cuda'
+    available = list_primitives()
+
+    # Handle 'all'
+    if args.primitive == 'all':
+        results = benchmark_all(
+            preset=args.preset,
+            device=device,
+            verbose=True,
+        )
+
+        # Summary
+        print("\n" + "=" * 60)
+        print("SUMMARY")
+        print("=" * 60)
+        for name, result in results.items():
+            print(f"\n{name}:")
+            print(f"  Crossover N: {result.crossover_n}")
+            print(f"  Best speedup: {result.best_speedup:.2f}x")
+            print(f"  Strategy wins: {result.strategy_wins}")
+
+        if args.output:
+            import json
+            combined = {name: r.to_dict() for name, r in results.items()}
+            with open(args.output, 'w') as f:
+                json.dump(combined, f, indent=2)
+            print(f"\nSaved to {args.output}")
+
+        return 0
+
+    # Single primitive
+    primitive = args.primitive
+
+    if primitive not in available:
+        print(f"Unknown primitive: '{primitive}'")
+        if available:
+            print(f"Available: {', '.join(sorted(available))}")
+        else:
+            print("No primitives with benchmark interface registered.")
+        print("\nUse 'all' to run all benchmarks:")
+        print("  wide_compiler benchmark all")
         return 1
 
-    model_cls, sample_fn = MODELS[args.model]
-    N = args.n
-    B = args.batch
+    # Parse overrides
+    overrides = {}
+    if args.n_values:
+        overrides['n_values'] = [int(x) for x in args.n_values.split(',')]
 
-    print(f"Benchmark: {args.model}")
-    print(f"Device: {device}")
-    print(f"N models: {N}")
-    print(f"Batch size: {B}")
-    print("=" * 60)
+    result = benchmark(
+        primitive,
+        preset=args.preset,
+        device=device,
+        verbose=True,
+        **overrides,
+    )
 
-    # Create models
-    models = [model_cls().to(device).eval() for _ in range(N)]
-    sample = sample_fn().to(device)
+    # Print table
+    print("\n" + result.table())
 
-    # Build wide model
-    print("\nBuilding wide model...")
-    wide_model = TracedWideModel.from_models(models, sample).to(device).eval()
-    print(wide_model.summary())
-
-    # Prepare inputs
-    if args.model in ('resblock', 'convnet'):
-        inputs = [torch.randn(B, *sample.shape[1:], device=device) for _ in range(N)]
-    else:
-        inputs = [torch.randn(B, 64, device=device) for _ in range(N)]
-    packed = pack_inputs(inputs)
-
-    # Warmup
-    print("\nWarming up...")
-    with torch.no_grad():
-        for _ in range(5):
-            wide_model(packed)
-            models[0](inputs[0])
-
-    if device == 'cuda':
-        torch.cuda.synchronize()
-
-    # Eager benchmark
-    print("\n--- Eager Mode ---")
-    iters = args.iters
-
-    with torch.no_grad():
-        start = time.perf_counter()
-        for _ in range(iters):
-            for i in range(N):
-                models[i](inputs[i])
-        if device == 'cuda':
-            torch.cuda.synchronize()
-        seq_time = time.perf_counter() - start
-
-        start = time.perf_counter()
-        for _ in range(iters):
-            wide_model(packed)
-        if device == 'cuda':
-            torch.cuda.synchronize()
-        wide_time = time.perf_counter() - start
-
-    print(f"Sequential ({N}x): {seq_time * 1000:.2f}ms")
-    print(f"Wide:              {wide_time * 1000:.2f}ms")
-    print(f"Speedup:           {seq_time / wide_time:.2f}x")
-
-    # Compiled benchmark
-    if args.compile and device == 'cuda':
-        print("\n--- Compiled (reduce-overhead) ---")
-        try:
-            compiled_wide = torch.compile(wide_model, mode='reduce-overhead')
-            compiled_single = torch.compile(models[0], mode='reduce-overhead')
-
-            # Warmup compiled
-            with torch.no_grad():
-                for _ in range(5):
-                    compiled_wide(packed)
-                    compiled_single(inputs[0])
-
-            if device == 'cuda':
-                torch.cuda.synchronize()
-
-            with torch.no_grad():
-                start = time.perf_counter()
-                for _ in range(iters):
-                    compiled_single(inputs[0])
-                if device == 'cuda':
-                    torch.cuda.synchronize()
-                single_time = time.perf_counter() - start
-
-                start = time.perf_counter()
-                for _ in range(iters):
-                    compiled_wide(packed)
-                if device == 'cuda':
-                    torch.cuda.synchronize()
-                wide_time = time.perf_counter() - start
-
-            print(f"Single compiled x{iters}: {single_time * 1000:.2f}ms")
-            print(f"Wide compiled x{iters}:   {wide_time * 1000:.2f}ms")
-            print(f"Effective speedup:     {(single_time * N) / wide_time:.2f}x (vs N sequential)")
-
-        except Exception as e:
-            print(f"Compile failed: {e}")
+    # Save if requested
+    if args.output:
+        result.save(args.output)
+        print(f"\nSaved to {args.output}")
 
     return 0
 
@@ -315,14 +278,36 @@ def cmd_info(args):
     print("Fuse N identical models into a single Wide model.")
     print("Uses grouped ops for compile-friendly batched execution.")
     print()
-    print("Registered primitives:")
+
+    print("Registered primitives (for compilation):")
     for name in sorted(list_registered()):
         print(f"  - {name}")
     print()
-    #print("Typical speedups:")
-    #print("  - Eager: 2-5x")
-    #print("  - Compiled (CUDA): 20-40x")
-    #print()
+
+    # Show benchmark primitives
+    try:
+        from .core.benchmark import list_primitives
+    except ImportError:
+        try:
+            from wide_compiler.core.benchmark import list_primitives
+        except ImportError:
+            list_primitives = None
+
+    if list_primitives:
+        available = list_primitives()
+        if available:
+            print("Benchmarkable primitives:")
+            for name in sorted(available):
+                print(f"  - {name}")
+            print()
+
+    print("Usage:")
+    print("  wide_compiler test              # Run correctness tests")
+    print("  wide_compiler benchmark conv1d  # Benchmark Conv1d strategies")
+    print("  wide_compiler benchmark all     # Benchmark all primitives")
+    print("  wide_compiler trace -m mlp      # Show FX trace")
+    print("  wide_compiler info              # This help")
+    print()
     print("GitHub: https://github.com/AbstractEyes/pytorch-parallel-compiler")
     return 0
 
@@ -344,16 +329,21 @@ def main():
 
     # trace
     trace_parser = subparsers.add_parser('trace', help='Show FX trace for a model')
-    trace_parser.add_argument('--model', '-m', default='mlp', help='Model name')
-    trace_parser.add_argument('--tabular', '-t', action='store_true', help='Show tabular view')
+    trace_parser.add_argument('--model', '-m', default='mlp',
+                             help='Model name (mlp, deep_mlp, resblock, convnet)')
+    trace_parser.add_argument('--tabular', '-t', action='store_true',
+                             help='Show tabular view')
 
-    # benchmark
-    bench_parser = subparsers.add_parser('benchmark', help='Benchmark speedup')
-    bench_parser.add_argument('--model', '-m', default='mlp', help='Model name')
-    bench_parser.add_argument('--n', type=int, default=100, help='Number of models')
-    bench_parser.add_argument('--batch', '-b', type=int, default=32, help='Batch size')
-    bench_parser.add_argument('--iters', '-i', type=int, default=100, help='Iterations')
-    bench_parser.add_argument('--compile', '-c', action='store_true', help='Also benchmark compiled')
+    # benchmark - positional primitive argument
+    bench_parser = subparsers.add_parser('benchmark', help='Benchmark primitive strategies')
+    bench_parser.add_argument('primitive', nargs='?', default='all',
+                             help='Primitive to benchmark (conv1d, conv2d, linear, all)')
+    bench_parser.add_argument('--preset', '-p', default='full',
+                             help='Sweep preset (quick, full, ci)')
+    bench_parser.add_argument('--n-values', '-n',
+                             help='Override N values (comma-separated, e.g., "4,8,16,32")')
+    bench_parser.add_argument('--output', '-o',
+                             help='Save results to JSON file')
     bench_parser.add_argument('--cpu', action='store_true', help='Force CPU')
 
     # info
@@ -365,16 +355,14 @@ def main():
         parser.print_help()
         return 0
 
-    if args.command == 'test':
-        return cmd_test(args)
-    elif args.command == 'trace':
-        return cmd_trace(args)
-    elif args.command == 'benchmark':
-        return cmd_benchmark(args)
-    elif args.command == 'info':
-        return cmd_info(args)
+    commands = {
+        'test': cmd_test,
+        'trace': cmd_trace,
+        'benchmark': cmd_benchmark,
+        'info': cmd_info,
+    }
 
-    return 0
+    return commands[args.command](args)
 
 
 if __name__ == '__main__':

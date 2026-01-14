@@ -26,6 +26,16 @@ Main API:
     packed = wide_compiler.pack(inputs)
     outputs = wide_compiler.unpack(wide_out, n=100)
 
+Benchmark API:
+    from wide_compiler import benchmark, benchmark_primitive
+
+    # Benchmark primitive strategies
+    result = benchmark_primitive('conv1d')
+    result = benchmark_primitive('conv1d', preset='quick')
+
+    # Benchmark custom model
+    result = benchmark_custom(MyModel, (32, 256), [8, 16, 32])
+
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
@@ -93,14 +103,12 @@ except ImportError:
     )
 
 try:
-    from .core.wide_model import (
-        WideModel,
+    from .core.ensemble_util import (
         pack_inputs,
         unpack_outputs,
     )
 except ImportError:
-    from wide_compiler.core.wide_model import (
-        WideModel,
+    from wide_compiler.core.ensemble_util import (
         pack_inputs,
         unpack_outputs,
     )
@@ -127,6 +135,39 @@ except ImportError:
         WideEmbedding,
     )
 
+# Benchmark API (optional - may not be installed)
+try:
+    try:
+        from .core.benchmark import (
+            benchmark as benchmark_primitive,
+            benchmark_multi,
+            benchmark_all,
+            benchmark_custom,
+            list_primitives as list_benchmark_primitives,
+            BenchmarkResult,
+            SweepParams,
+        )
+    except ImportError:
+        from wide_compiler.core.benchmark import (
+            benchmark as benchmark_primitive,
+            benchmark_multi,
+            benchmark_all,
+            benchmark_custom,
+            list_primitives as list_benchmark_primitives,
+            BenchmarkResult,
+            SweepParams,
+        )
+    _HAS_BENCHMARK = True
+except ImportError:
+    _HAS_BENCHMARK = False
+    benchmark_primitive = None
+    benchmark_multi = None
+    benchmark_all = None
+    benchmark_custom = None
+    list_benchmark_primitives = None
+    BenchmarkResult = None
+    SweepParams = None
+
 __all__ = [
     # Main API
     'compile',
@@ -147,7 +188,6 @@ __all__ = [
 
     # Core
     'TracedWideModel',
-    'WideModel',
     'FunctionalOp',
     'BinaryOp',
     'print_trace',
@@ -162,4 +202,13 @@ __all__ = [
     'WideBatchNorm1d',
     'WideLayerNorm',
     'WideEmbedding',
+
+    # Benchmark (if available)
+    'benchmark_primitive',
+    'benchmark_multi',
+    'benchmark_all',
+    'benchmark_custom',
+    'list_benchmark_primitives',
+    'BenchmarkResult',
+    'SweepParams',
 ]

@@ -234,16 +234,6 @@ def unpack_outputs(output: Tensor, n: int) -> List[Tensor]:
 # =============================================================================
 
 __all__ = [
-    # Tree
-    'TreeNode',
-    'traverse',
-    'get_leaves',
-
-    # Factory
-    'make_wide',
-    'align_modules',
-    'WideModel',
-    # Packing
     'pack_inputs',
     'unpack_outputs',
 ]

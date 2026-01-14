@@ -49,7 +49,10 @@ from .wide_linear import (
     LINEAR_THRESHOLDS,
 )
 
-from .wide_conv1d import WideConv1d
+from .wide_conv1d import (
+    WideConv1d,
+    Conv1dStrategy
+)
 from .wide_batchnorm_2d import WideBatchNorm2d
 from .wide_batchnorm_1d import WideBatchNorm1d
 from .wide_layernorm import WideLayerNorm

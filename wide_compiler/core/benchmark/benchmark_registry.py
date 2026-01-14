@@ -1,17 +1,12 @@
 """
 WideCompiler.core.benchmark.benchmark_registry
 
-Registry for internal benchmarking scripts.
-Each benchmark tests a specific component's performance characteristics.
+Maps benchmark names to primitive classes.
 
-Usage:
-    from wide_compiler.core.benchmark import run_benchmark, list_benchmarks
-
-    # Run specific benchmark
-    run_benchmark('conv1d')
-
-    # List available benchmarks
-    print(list_benchmarks())
+Each primitive class must implement:
+    - BENCHMARK_SWEEPS: Dict[str, SweepParams]
+    - BENCHMARK_STRATEGIES: List[str]
+    - benchmark_job(preset, **overrides) -> BenchmarkJob
 
 Copyright 2025 AbstractPhil
 Apache 2.0 License
@@ -19,160 +14,118 @@ Apache 2.0 License
 
 from __future__ import annotations
 
-from typing import Dict, Callable, List, Optional, Any
-from dataclasses import dataclass
+from typing import Dict, List, Type, Optional, Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch import nn
 
 
-@dataclass
-class BenchmarkInfo:
-    """Metadata for a registered benchmark."""
-    name: str
-    description: str
-    fn: Callable
-    tags: List[str]
+# Registry of primitive name -> class
+_REGISTRY: Dict[str, Type] = {}
 
 
-# Global registry
-_BENCHMARKS: Dict[str, BenchmarkInfo] = {}
-
-
-def register_benchmark(
-        name: str,
-        description: str = "",
-        tags: Optional[List[str]] = None,
-) -> Callable:
+def register(name: str):
     """
-    Decorator to register a benchmark function.
-
-    Args:
-        name: Unique identifier for the benchmark
-        description: Human-readable description
-        tags: Categories (e.g., ['primitive', 'conv', 'strategy'])
+    Decorator to register a primitive class.
 
     Example:
-        @register_benchmark('conv1d', 'WideConv1d strategy comparison', ['primitive', 'conv'])
-        def benchmark_conv1d(device='cuda', verbose=True):
+        @register('conv1d')
+        class WideConv1d(nn.Module):
             ...
     """
-
-    def decorator(fn: Callable) -> Callable:
-        _BENCHMARKS[name] = BenchmarkInfo(
-            name=name,
-            description=description or fn.__doc__ or "",
-            fn=fn,
-            tags=tags or [],
-        )
-        return fn
-
+    def decorator(cls):
+        _REGISTRY[name] = cls
+        return cls
     return decorator
 
 
-def list_benchmarks(tag: Optional[str] = None) -> List[str]:
+def register_primitive(name: str, cls: Type):
+    """Register a primitive class directly."""
+    _REGISTRY[name] = cls
+
+
+def get_primitive(name: str) -> Type:
     """
-    List registered benchmark names.
-
-    Args:
-        tag: Filter by tag (e.g., 'primitive', 'traced')
-
-    Returns:
-        List of benchmark names
-    """
-    if tag is None:
-        return list(_BENCHMARKS.keys())
-    return [name for name, info in _BENCHMARKS.items() if tag in info.tags]
-
-
-def get_benchmark_info(name: str) -> Optional[BenchmarkInfo]:
-    """Get metadata for a benchmark."""
-    return _BENCHMARKS.get(name)
-
-
-def run_benchmark(
-        name: str,
-        device: str = 'cuda',
-        verbose: bool = True,
-        **kwargs,
-) -> Any:
-    """
-    Run a registered benchmark.
-
-    Args:
-        name: Benchmark name
-        device: 'cuda' or 'cpu'
-        verbose: Print progress
-        **kwargs: Additional args passed to benchmark function
-
-    Returns:
-        Benchmark results (format depends on benchmark)
+    Get primitive class by name.
 
     Raises:
-        KeyError: If benchmark not found
+        KeyError: If name not found
     """
-    if name not in _BENCHMARKS:
-        available = ', '.join(_BENCHMARKS.keys())
-        raise KeyError(f"Benchmark '{name}' not found. Available: {available}")
-
-    info = _BENCHMARKS[name]
-    if verbose:
-        print(f"Running benchmark: {info.name}")
-        print(f"Description: {info.description}")
-        print("-" * 60)
-
-    return info.fn(device=device, verbose=verbose, **kwargs)
+    if name not in _REGISTRY:
+        available = ', '.join(sorted(_REGISTRY.keys()))
+        raise KeyError(f"Unknown primitive '{name}'. Available: {available}")
+    return _REGISTRY[name]
 
 
-def run_all_benchmarks(
-        device: str = 'cuda',
-        tag: Optional[str] = None,
-        verbose: bool = True,
-) -> Dict[str, Any]:
+def list_primitives() -> List[str]:
+    """List all registered primitive names."""
+    return sorted(_REGISTRY.keys())
+
+
+def has_primitive(name: str) -> bool:
+    """Check if primitive is registered."""
+    return name in _REGISTRY
+
+
+def get_all_primitives() -> Dict[str, Type]:
+    """Get copy of full registry."""
+    return dict(_REGISTRY)
+
+
+# =============================================================================
+# AUTO-REGISTRATION
+# =============================================================================
+
+def _auto_register():
     """
-    Run all benchmarks (or filtered by tag).
+    Auto-register primitives that have benchmark interface.
 
-    Args:
-        device: 'cuda' or 'cpu'
-        tag: Filter by tag
-        verbose: Print progress
-
-    Returns:
-        Dict of {name: results}
+    Called when primitives are imported.
     """
-    names = list_benchmarks(tag)
-    results = {}
+    try:
+        from ..primitives import (
+            WideLinear,
+            WideConv1d,
+            WideConv2d,
+            WideBatchNorm1d,
+            WideBatchNorm2d,
+            WideLayerNorm,
+            WideEmbedding,
+        )
 
-    for name in names:
-        try:
-            results[name] = run_benchmark(name, device=device, verbose=verbose)
-        except Exception as e:
-            if verbose:
-                print(f"FAILED: {name} - {e}")
-            results[name] = {'error': str(e)}
+        # Only register if they have benchmark interface
+        primitives = [
+            ('linear', WideLinear),
+            ('conv1d', WideConv1d),
+            ('conv2d', WideConv2d),
+            ('batchnorm1d', WideBatchNorm1d),
+            ('batchnorm2d', WideBatchNorm2d),
+            ('layernorm', WideLayerNorm),
+            ('embedding', WideEmbedding),
+        ]
 
-    return results
+        for name, cls in primitives:
+            if hasattr(cls, 'benchmark_job'):
+                _REGISTRY[name] = cls
+
+    except ImportError:
+        # Primitives not available yet
+        pass
 
 
-def print_benchmark_summary():
-    """Print summary of all registered benchmarks."""
-    print("=" * 70)
-    print("Registered Benchmarks")
-    print("=" * 70)
+# Try to auto-register on import
+_auto_register()
 
-    for name, info in sorted(_BENCHMARKS.items()):
-        tags_str = ', '.join(info.tags) if info.tags else 'none'
-        print(f"\n{name}")
-        print(f"  Description: {info.description[:60]}...")
-        print(f"  Tags: {tags_str}")
 
-    print("\n" + "=" * 70)
-    print(f"Total: {len(_BENCHMARKS)} benchmarks")
-
+# =============================================================================
+# EXPORTS
+# =============================================================================
 
 __all__ = [
-    'register_benchmark',
-    'list_benchmarks',
-    'get_benchmark_info',
-    'run_benchmark',
-    'run_all_benchmarks',
-    'print_benchmark_summary',
-    'BenchmarkInfo',
+    'register',
+    'register_primitive',
+    'get_primitive',
+    'list_primitives',
+    'has_primitive',
+    'get_all_primitives',
 ]
