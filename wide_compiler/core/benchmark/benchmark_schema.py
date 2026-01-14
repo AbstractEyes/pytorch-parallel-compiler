@@ -23,26 +23,32 @@ class SweepParams:
     n_values: List[int] = field(default_factory=lambda: [4, 8, 16, 32])
     batch_sizes: List[int] = field(default_factory=lambda: [8])
 
-    # Conv1d/Conv2d
+    # Conv1d/Conv2d/Conv3d
     channels: List[int] = field(default_factory=list)
     kernel_sizes: List[int] = field(default_factory=list)
 
-    # Conv1d specific
+    # Sequence length (Conv1d, RNN, Attention)
     seq_lengths: List[int] = field(default_factory=list)
 
-    # Conv2d specific
+    # Spatial dims (Conv2d, Conv3d)
     heights: List[int] = field(default_factory=list)
     widths: List[int] = field(default_factory=list)
 
-    # Linear/Embedding/Attention
+    # Linear/Embedding/Attention/RNN input
     d_model: List[int] = field(default_factory=list)
 
-    # Attention specific
+    # Attention heads
     n_heads: List[int] = field(default_factory=list)
+
+    # RNN hidden size
+    hidden_sizes: List[int] = field(default_factory=list)
 
     # Embedding specific
     vocab_sizes: List[int] = field(default_factory=list)
     embedding_dims: List[int] = field(default_factory=list)
+
+    # Normalization
+    num_groups: List[int] = field(default_factory=list)
 
     def with_overrides(self, **kwargs) -> 'SweepParams':
         """Create copy with overridden values."""
@@ -69,6 +75,9 @@ class BenchmarkJob:
     pack_fn: Callable[..., Any]        # (inputs) -> packed
     unpack_fn: Callable[..., Any]      # (output, n) -> outputs
 
+    # Optional validation function
+    validate_fn: Optional[Callable[..., Any]] = None  # (wide_out, baseline_outs) -> (bool, str)
+
 
 @dataclass
 class SingleResult:
@@ -79,6 +88,8 @@ class SingleResult:
     time_ms: float
     baseline_ms: float
     speedup: float
+    valid: bool = True
+    validation_msg: str = "OK"
 
     def to_dict(self) -> dict:
         return {
@@ -88,6 +99,8 @@ class SingleResult:
             'time_ms': self.time_ms,
             'baseline_ms': self.baseline_ms,
             'speedup': self.speedup,
+            'valid': self.valid,
+            'validation_msg': self.validation_msg,
         }
 
 
@@ -100,35 +113,45 @@ class BenchmarkResult:
     results: List[SingleResult]
 
     @property
+    def valid_results(self) -> List[SingleResult]:
+        """Get only valid results."""
+        return [r for r in self.results if r.valid]
+
+    @property
+    def invalid_results(self) -> List[SingleResult]:
+        """Get invalid results."""
+        return [r for r in self.results if not r.valid]
+
+    @property
     def crossover_n(self) -> Optional[int]:
         """Find N where wide becomes faster than baseline."""
-        for r in sorted(self.results, key=lambda x: x.n):
+        for r in sorted(self.valid_results, key=lambda x: x.n):
             if r.strategy != 'baseline' and r.speedup > 1.0:
                 return r.n
         return None
 
     @property
     def best_speedup(self) -> float:
-        """Maximum speedup achieved."""
-        speedups = [r.speedup for r in self.results if r.strategy != 'baseline']
+        """Maximum speedup achieved (valid results only)."""
+        speedups = [r.speedup for r in self.valid_results if r.strategy != 'baseline']
         return max(speedups) if speedups else 1.0
 
     @property
     def best_result(self) -> Optional[SingleResult]:
-        """Result with highest speedup."""
-        non_baseline = [r for r in self.results if r.strategy != 'baseline']
+        """Result with highest speedup (valid only)."""
+        non_baseline = [r for r in self.valid_results if r.strategy != 'baseline']
         if not non_baseline:
             return None
         return max(non_baseline, key=lambda r: r.speedup)
 
     @property
     def strategy_wins(self) -> Dict[str, int]:
-        """Count wins per strategy (excluding baseline)."""
+        """Count wins per strategy (excluding baseline, valid only)."""
         from collections import defaultdict
 
         # Group by (n, params)
         groups = defaultdict(list)
-        for r in self.results:
+        for r in self.valid_results:
             if r.strategy != 'baseline':
                 key = (r.n, tuple(sorted(r.params.items())))
                 groups[key].append(r)
@@ -143,18 +166,22 @@ class BenchmarkResult:
         return dict(wins)
 
     def top_results(self, n: int = 10) -> List[SingleResult]:
-        """Get top N results by speedup (excluding baseline)."""
-        non_baseline = [r for r in self.results if r.strategy != 'baseline']
+        """Get top N results by speedup (excluding baseline, valid only)."""
+        non_baseline = [r for r in self.valid_results if r.strategy != 'baseline']
         return sorted(non_baseline, key=lambda r: -r.speedup)[:n]
 
     def summary(self) -> str:
         """Concise human-readable summary."""
+        total = len(self.results)
+        valid = len(self.valid_results)
+        invalid = len(self.invalid_results)
+
         lines = [
             f"{'='*60}",
             f"  {self.name.upper()}",
             f"{'='*60}",
             f"  Device:       {self.device}",
-            f"  Configs run:  {len(self.results)}",
+            f"  Configs run:  {valid}" + (f" ({invalid} invalid)" if invalid else ""),
             f"  Crossover N:  {self.crossover_n or 'N/A'}",
             f"  Best speedup: {self.best_speedup:.2f}x",
         ]

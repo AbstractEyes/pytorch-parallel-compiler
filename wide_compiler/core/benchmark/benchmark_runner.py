@@ -59,6 +59,7 @@ def run_single(
     device: str = 'cuda',
     warmup: int = 3,
     iterations: int = 10,
+    validate: bool = True,
 ) -> SingleResult:
     """
     Run a single benchmark configuration.
@@ -71,9 +72,10 @@ def run_single(
         device: 'cuda' or 'cpu'
         warmup: Warmup iterations
         iterations: Timing iterations
+        validate: Run correctness validation (default True)
 
     Returns:
-        SingleResult with timing
+        SingleResult with timing and validation status
     """
     # Create N models
     models = [job.model_factory(**params).to(device).eval() for _ in range(n)]
@@ -82,7 +84,10 @@ def run_single(
     sample = job.input_factory(n=n, device=device, **params)
     inputs = [sample.clone() for _ in range(n)]
 
-    # Baseline: sequential execution
+    # Baseline: sequential execution - get outputs for validation
+    with torch.no_grad():
+        baseline_outputs = [m(inp) for m, inp in zip(models, inputs)]
+
     def baseline_fn():
         for i, m in enumerate(models):
             m(inputs[i])
@@ -98,11 +103,36 @@ def run_single(
             time_ms=baseline_ms,
             baseline_ms=baseline_ms,
             speedup=1.0,
+            valid=True,
+            validation_msg="OK",
         )
 
     # Build wide model with strategy
     wide_model = job.wide_factory(models, strategy).to(device).eval()
     packed = job.pack_fn(inputs)
+
+    # Run validation if requested and validate_fn exists
+    is_valid = True
+    validation_msg = "OK"
+
+    if validate and hasattr(job, 'validate_fn') and job.validate_fn is not None:
+        with torch.no_grad():
+            wide_output = wide_model(packed)
+
+        is_valid, validation_msg = job.validate_fn(wide_output, baseline_outputs)
+
+        if not is_valid:
+            # Return immediately with validation failure - no timing
+            return SingleResult(
+                n=n,
+                strategy=strategy,
+                params=params,
+                time_ms=float('inf'),
+                baseline_ms=baseline_ms,
+                speedup=0.0,
+                valid=False,
+                validation_msg=validation_msg,
+            )
 
     def wide_fn():
         wide_model(packed)
@@ -117,6 +147,8 @@ def run_single(
         time_ms=wide_ms,
         baseline_ms=baseline_ms,
         speedup=speedup,
+        valid=is_valid,
+        validation_msg=validation_msg,
     )
 
 
@@ -126,6 +158,7 @@ def run(
     verbose: bool = True,
     warmup: int = 3,
     iterations: int = 10,
+    validate: bool = True,
 ) -> BenchmarkResult:
     """
     Run complete benchmark sweep.
@@ -136,6 +169,7 @@ def run(
         verbose: Print progress (True=progress updates, False=silent)
         warmup: Warmup iterations per config
         iterations: Timing iterations per config
+        validate: Run correctness validation (default True)
 
     Returns:
         BenchmarkResult with all measurements
@@ -147,6 +181,7 @@ def run(
 
     results: List[SingleResult] = []
     sweep = job.sweep
+    validation_failures = []
 
     # Generate all param combinations
     param_combos = _generate_param_combos(sweep)
@@ -173,9 +208,14 @@ def run(
                         device=device,
                         warmup=warmup,
                         iterations=iterations,
+                        validate=validate,
                     )
                     results.append(result)
                     n_results.append(result)
+
+                    # Track validation failures
+                    if not result.valid:
+                        validation_failures.append((n, strategy, result.validation_msg))
 
                 except Exception as e:
                     if verbose:
@@ -184,14 +224,29 @@ def run(
                         traceback.print_exc()
                         print()
 
-        # Print best speedup for this N
+        # Print best speedup for this N (only valid results)
         if verbose:
-            non_baseline = [r for r in n_results if r.strategy != 'baseline']
+            non_baseline = [r for r in n_results if r.strategy != 'baseline' and r.valid]
+            invalid = [r for r in n_results if not r.valid]
+
             if non_baseline:
                 best = max(non_baseline, key=lambda r: r.speedup)
-                print(f"→ {best.speedup:.2f}x ({best.strategy})")
+                status = f"→ {best.speedup:.2f}x ({best.strategy})"
+                if invalid:
+                    status += f" [{len(invalid)} invalid]"
+                print(status)
+            elif invalid:
+                print(f"→ ALL INVALID ({len(invalid)} failures)")
             else:
                 print()
+
+    # Print validation summary
+    if verbose and validation_failures:
+        print(f"\n⚠ Validation failures ({len(validation_failures)}):")
+        for n, strategy, msg in validation_failures[:5]:  # Show first 5
+            print(f"  N={n}, {strategy}: {msg}")
+        if len(validation_failures) > 5:
+            print(f"  ... and {len(validation_failures) - 5} more")
 
     return BenchmarkResult(
         name=job.name,
@@ -211,7 +266,8 @@ def _generate_param_combos(sweep) -> List[dict]:
     param_values = []
 
     for attr in ['batch_sizes', 'channels', 'kernel_sizes', 'seq_lengths',
-                 'heights', 'widths', 'd_model', 'n_heads', 'vocab_sizes', 'embedding_dims']:
+                 'heights', 'widths', 'd_model', 'n_heads', 'hidden_sizes',
+                 'vocab_sizes', 'embedding_dims', 'num_groups']:
         vals = getattr(sweep, attr, None)
         if vals:
             param_names.append(attr)  # Keep original name

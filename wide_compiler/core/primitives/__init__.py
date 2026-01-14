@@ -19,21 +19,12 @@ To disable TF32 globally at script start:
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_tf32 = False
 
-WideConv2d Strategies (A100 benchmarks):
-- 'grouped': NCHW format (FASTEST: 2-4x speedup, ~1e-6 error)
-- 'channels_last': NHWC format (most accurate: 0.0 error, but slower)
-- 'sequential': N separate ops (exact, slowest)
-- 'auto': Selects grouped for N >= 8 (ResNet18: 2.49x speedup at N=10)
-
-WideLinear Strategies (A100 benchmarks):
-- 'einsum': Batched matmul (3-13x speedup, ~1e-6 error in fp32)
-- 'sequential': N separate ops (exact, slower)
-- 'auto': Selects einsum for N>=8 or low B
-
 Copyright 2025 AbstractPhil
-MIT License
+Apache 2.0 License
 """
 
+# Conv layers
+from .wide_conv1d import WideConv1d, Conv1dStrategy
 from .wide_conv2d import (
     WideConv2d,
     ConvStrategy,
@@ -41,7 +32,9 @@ from .wide_conv2d import (
     create_wide_conv2d,
     STRATEGY_THRESHOLDS as CONV_THRESHOLDS,
 )
+from .wide_conv3d import WideConv3d, Conv3dStrategy
 
+# Linear
 from .wide_linear import (
     WideLinear,
     LinearStrategy,
@@ -49,46 +42,67 @@ from .wide_linear import (
     LINEAR_THRESHOLDS,
 )
 
-from .wide_conv1d import (
-    WideConv1d,
-    Conv1dStrategy
-)
-from .wide_batchnorm_2d import WideBatchNorm2d
+# Normalization layers
 from .wide_batchnorm_1d import WideBatchNorm1d
+from .wide_batchnorm_2d import WideBatchNorm2d
 from .wide_layernorm import WideLayerNorm
-from .wide_embedding import (
-    WideEmbedding,
-    EmbeddingStrategy,
+from .wide_groupnorm import WideGroupNorm, GroupNormStrategy
+from .wide_instancenorm import (
+    WideInstanceNorm1d,
+    WideInstanceNorm2d,
+    InstanceNormStrategy,
 )
-from .wide_attention import (
-    WideAttention,
-    AttentionStrategy,
-)
+
+# Embedding
+from .wide_embedding import WideEmbedding, EmbeddingStrategy
+
+# Attention
+from .wide_attention import WideAttention, AttentionStrategy
+
+# RNN layers
+from .wide_gru import WideGRU, GRUStrategy
+from .wide_lstm import WideLSTM, LSTMStrategy
 
 
 __all__ = [
-    # Conv2d with strategies
+    # Conv layers
+    'WideConv1d',
+    'Conv1dStrategy',
     'WideConv2d',
     'ConvStrategy',
     'select_conv_strategy',
     'create_wide_conv2d',
     'CONV_THRESHOLDS',
+    'WideConv3d',
+    'Conv3dStrategy',
 
-    # Linear with strategies
+    # Linear
     'WideLinear',
     'LinearStrategy',
     'select_linear_strategy',
     'LINEAR_THRESHOLDS',
 
-    # Other primitives
-    'WideConv1d',
-    'WideBatchNorm2d',
+    # Normalization
     'WideBatchNorm1d',
+    'WideBatchNorm2d',
     'WideLayerNorm',
+    'WideGroupNorm',
+    'GroupNormStrategy',
+    'WideInstanceNorm1d',
+    'WideInstanceNorm2d',
+    'InstanceNormStrategy',
+
+    # Embedding
     'WideEmbedding',
     'EmbeddingStrategy',
 
     # Attention
     'WideAttention',
     'AttentionStrategy',
+
+    # RNN
+    'WideGRU',
+    'GRUStrategy',
+    'WideLSTM',
+    'LSTMStrategy',
 ]
