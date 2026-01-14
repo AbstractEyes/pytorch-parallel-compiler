@@ -1,5 +1,5 @@
 """
-WideCompiler.core.traced_benchmark
+WideCompiler.core.benchmark.traced_wide_benchmark
 
 Benchmarking and profiling utilities for TracedWideModel.
 Test any model with the Wide traced compilation system.

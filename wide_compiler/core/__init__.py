@@ -117,7 +117,7 @@ try:
         MemoryResult,
     )
 except ImportError:
-    from wide_compiler.core.traced_benchmark import (
+    from wide_compiler.core.benchmark.traced_wide_benchmark import (
         benchmark_model,
         benchmark_models,
         profile_with_torch_profiler,
