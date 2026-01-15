@@ -4,14 +4,15 @@ WideCompiler CLI
 Benchmark and debug utilities for Wide model compilation.
 
 Usage:
-    # Benchmark primitives (with compilation support)
-    python -m wide_compiler benchmark gru -p quick
-    python -m wide_compiler benchmark gru -p quick --compile reduce-overhead
-    python -m wide_compiler benchmark linear -p full --compile auto
+    # Benchmark primitives
+    python -m wide_compiler benchmark gru -p quick        # eager (no compile)
+    python -m wide_compiler benchmark gru -p quick -c    # compiled (default)
+    python -m wide_compiler benchmark gru -c reduce-overhead
+    python -m wide_compiler benchmark linear -p full -c
 
     # Legacy model benchmark
     python -m wide_compiler benchmark mlp --n 100
-    python -m wide_compiler benchmark resblock --n 50 --compile auto
+    python -m wide_compiler benchmark resblock --n 50 -c
 
     # Other commands
     python -m wide_compiler test
@@ -248,13 +249,12 @@ def cmd_benchmark_primitive(args, device: str):
 
     # Map compile string to enum
     compile_map = {
-        'auto': CompilationMode.AUTO,
+        'default': CompilationMode.DEFAULT,
         'eager': CompilationMode.EAGER,
-        'inductor': CompilationMode.INDUCTOR,
         'reduce-overhead': CompilationMode.REDUCE_OVERHEAD,
         'max-autotune': CompilationMode.MAX_AUTOTUNE,
     }
-    compilation = compile_map.get(args.compile, CompilationMode.AUTO)
+    compilation = compile_map.get(args.compile, CompilationMode.EAGER)
 
     # Load primitive and create benchmark job
     job = None
@@ -293,14 +293,12 @@ def cmd_benchmark_primitive(args, device: str):
 
     # Print compilation info
     compile_available = compilation_available()
-    if compilation == CompilationMode.AUTO:
-        actual_mode = "compiled (reduce-overhead)" if compile_available else "eager"
-    elif compilation == CompilationMode.EAGER:
+    if compilation == CompilationMode.EAGER:
         actual_mode = "eager"
-    else:
+    elif compile_available:
         actual_mode = f"compiled ({compilation.value})"
-        if not compile_available:
-            actual_mode = "eager (compile unavailable)"
+    else:
+        actual_mode = "eager (compile unavailable)"
 
     print(f"Primitive: {primitive}")
     print(f"Preset: {preset}")
@@ -399,11 +397,16 @@ def cmd_benchmark_legacy(args, model_name: str, device: str):
 
     # Compiled benchmark
     if run_compiled:
-        mode = 'reduce-overhead' if compile_mode == 'auto' else compile_mode
-        print(f"\n--- Compiled ({mode}) ---")
         try:
-            compiled_wide = torch.compile(wide_model, mode=mode)
-            compiled_models = [torch.compile(m, mode=mode) for m in models]
+            # 'default' means no mode arg (use torch.compile defaults)
+            if compile_mode == 'default':
+                print(f"\n--- Compiled (default) ---")
+                compiled_wide = torch.compile(wide_model)
+                compiled_models = [torch.compile(m) for m in models]
+            else:
+                print(f"\n--- Compiled ({compile_mode}) ---")
+                compiled_wide = torch.compile(wide_model, mode=compile_mode)
+                compiled_models = [torch.compile(m, mode=compile_mode) for m in models]
 
             # Warmup compiled
             with torch.no_grad():
@@ -458,12 +461,12 @@ def cmd_info(args):
     print("Benchmarkable primitives:")
     print("  - gru, lstm, linear, conv2d, conv1d, attention, embedding")
     print()
-    print("Compilation modes (--compile):")
-    print("  - auto           Default, uses compiled if available")
-    print("  - eager          No compilation")
-    print("  - reduce-overhead Optimized for low latency")
-    print("  - inductor       Standard inductor backend")
-    print("  - max-autotune   Maximum optimization (slow compile)")
+    print("Compilation modes (-c / --compile):")
+    print("  -c               Use default compilation (torch.compile())")
+    print("  -c default       Same as above")
+    print("  -c eager         No compilation (default if -c not specified)")
+    print("  -c reduce-overhead  Optimized for low latency")
+    print("  -c max-autotune  Maximum optimization (slow compile)")
     print()
 
     # System info
@@ -488,9 +491,10 @@ def cmd_info(args):
     print("  - Compiled (CUDA): 2-10x")
     print()
     print("Usage:")
-    print("  python -m wide_compiler benchmark gru -p quick")
-    print("  python -m wide_compiler benchmark gru -p quick --compile reduce-overhead")
-    print("  python -m wide_compiler benchmark mlp --n 100  # legacy mode")
+    print("  python -m wide_compiler benchmark gru -p quick        # eager")
+    print("  python -m wide_compiler benchmark gru -p quick -c     # compiled (default)")
+    print("  python -m wide_compiler benchmark gru -c reduce-overhead")
+    print("  python -m wide_compiler benchmark mlp --n 100 -c      # legacy mode")
     print()
     print("GitHub: https://github.com/AbstractEyes/wide-compiler")
     return 0
@@ -521,9 +525,9 @@ def main():
     bench_parser.add_argument('primitive', nargs='?', default=None,
                               help='Primitive to benchmark (gru, lstm, linear, conv2d, attention) or legacy model name')
     bench_parser.add_argument('-p', '--preset', default='quick', help='Preset (quick, ci, full)')
-    bench_parser.add_argument('-c', '--compile', default='auto',
-                              choices=['auto', 'eager', 'inductor', 'reduce-overhead', 'max-autotune'],
-                              help='Compilation mode (default: auto)')
+    bench_parser.add_argument('-c', '--compile', nargs='?', const='default', default='eager',
+                              choices=['default', 'eager', 'reduce-overhead', 'max-autotune'],
+                              help='Compilation mode. -c alone uses default, or specify mode.')
     bench_parser.add_argument('--model', '-m', default=None, help='Legacy: model name (mlp, resblock, etc.)')
     bench_parser.add_argument('--n', type=int, default=None, help='Number of models (legacy mode)')
     bench_parser.add_argument('--batch', '-b', type=int, default=32, help='Batch size')

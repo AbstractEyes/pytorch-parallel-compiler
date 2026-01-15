@@ -18,10 +18,9 @@ import torch
 class CompilationMode(Enum):
     """Compilation modes for benchmarking."""
     EAGER = 'eager'                       # No compilation
-    INDUCTOR = 'inductor'                 # torch.compile with inductor backend
+    DEFAULT = 'default'                   # torch.compile with default settings
     REDUCE_OVERHEAD = 'reduce-overhead'   # Optimized for low latency
     MAX_AUTOTUNE = 'max-autotune'         # Maximum optimization (slower compile)
-    AUTO = 'auto'                         # Try compiled, fallback to eager
 
 
 def compilation_available() -> bool:
@@ -47,14 +46,12 @@ def get_compile_fn(mode: CompilationMode) -> Optional[Callable]:
     if not compilation_available():
         return None
 
-    if mode == CompilationMode.INDUCTOR:
-        return lambda m: torch.compile(m, backend='inductor')
+    if mode == CompilationMode.DEFAULT:
+        return lambda m: torch.compile(m)
     elif mode == CompilationMode.REDUCE_OVERHEAD:
         return lambda m: torch.compile(m, mode='reduce-overhead')
     elif mode == CompilationMode.MAX_AUTOTUNE:
         return lambda m: torch.compile(m, mode='max-autotune')
-    elif mode == CompilationMode.AUTO:
-        return lambda m: torch.compile(m, mode='reduce-overhead')
     return None
 
 
@@ -130,7 +127,7 @@ class BenchmarkJob:
     validate_fn: Optional[Callable[..., Any]] = None  # (wide_out, baseline_outs) -> (bool, str)
 
     # Compilation settings
-    compilation: CompilationMode = CompilationMode.AUTO
+    compilation: CompilationMode = CompilationMode.EAGER
     compile_warmup_extra: int = 5  # Extra warmup iterations for compiled models
 
     # Validation settings

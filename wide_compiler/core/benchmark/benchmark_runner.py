@@ -220,12 +220,6 @@ def run(
 
     # Determine compilation mode
     comp_mode = compilation if compilation is not None else job.compilation
-    if comp_mode == CompilationMode.AUTO:
-        if compilation_available():
-            comp_mode = CompilationMode.REDUCE_OVERHEAD
-        else:
-            comp_mode = CompilationMode.EAGER
-
     compiled = get_compile_fn(comp_mode) is not None
 
     results: List[SingleResult] = []
