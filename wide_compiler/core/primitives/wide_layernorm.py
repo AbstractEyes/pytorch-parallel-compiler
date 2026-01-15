@@ -48,10 +48,7 @@ class WideLayerNorm(nn.Module):
         D = self.normalized_shape
         N = self.n
 
-        # Normalize over last dimension (D) for each model
-        x = F.layer_norm(x, (D,), eps=self.eps)
-
-        # Apply per-model affine: weight/bias are [N*D], reshape to [N, D]
+        # Get per-model weight/bias: [N, D]
         weight = self.weight.view(N, D)
         bias = self.bias.view(N, D)
 
@@ -61,6 +58,10 @@ class WideLayerNorm(nn.Module):
             weight = weight.unsqueeze(1)
             bias = bias.unsqueeze(1)
 
+        # Manual layer norm: normalize over last dim, per-model affine
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, unbiased=False, keepdim=True)
+        x = (x - mean) / torch.sqrt(var + self.eps)
         x = x * weight + bias
 
         return x
