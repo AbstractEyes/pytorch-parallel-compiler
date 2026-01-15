@@ -9,15 +9,20 @@ For N LSTMs with input [B, T, N*I]:
 - Hidden projection: [B, N*H] @ [N*H, N*4H] -> [B, N*4H]
 - Gates: elementwise ops on [B, N*4H] - trivially parallel
 
-Performance characteristics:
-- Best speedup at small N (2-3x at N=4-8) where kernel launch overhead dominates
-- Diminishing returns at large N (N>16) where block-diagonal sparsity wastes bandwidth
-- Crossover point depends on hidden size and batch size
+Performance characteristics (A100, compiled):
+- N=4:  **3.3x speedup** - sweet spot, kernel launch savings dominate
+- N=8:  0.5x (2x SLOWER) - block-diagonal overhead exceeds benefits
+- N=16: 1.0x breakeven
+- N=32: 0.8x slower
+- N=64: 0.6x slower
+
+Recommendation: Use WideLSTM ONLY for N <= 4. For larger N, use:
+- WideGRU (better scaling via einsum, 5-8x at N=8-32)
+- Multiple WideLSTM(N=4) groups
+- Sequential baseline
 
 Limitations:
-- Block-diagonal weights contain O(N²) zeros, inefficient at large N
-- Future work: auto-tune crossover point, use sparse ops, or segment into
-  smaller fused groups (e.g., fuse N=64 as 8 groups of N=8)
+- Block-diagonal weights contain O(N²) zeros, inefficient at N > 4
 - Currently supports: num_layers=1, bidirectional=False, batch_first=True
 
 Copyright 2025 AbstractPhil

@@ -24,7 +24,7 @@ output = wide(packed_input)  # 1 kernel launch
 ## What's New in 0.5.0
 
 - **WideGRU** - N parallel GRUs via einsum fusion (**8x speedup** at N=32)
-- **WideLSTM** - N parallel LSTMs via block-diagonal weights (**3x speedup** at N=4-8)
+- **WideLSTM** - N parallel LSTMs via block-diagonal weights (**3.3x speedup** at N=4)
 - **Primitive Benchmarks with Compilation** - `benchmark gru -p quick -c` for torch.compile testing
 - **Validation Checkmarks** - Benchmark output shows ✓ when correctness verified
 
@@ -220,12 +220,15 @@ wide_compiler info
 | Layer | Wide Version | Strategies | Best Speedup |
 |-------|--------------|------------|--------------|
 | `nn.GRU` | `WideGRU` | fused (einsum) | **7.8x** |
-| `nn.LSTM` | `WideLSTM` | fused (block-diag) | **3.3x** |
+| `nn.LSTM` | `WideLSTM` | fused (block-diag) | **3.3x** (N=4 only) |
 | `nn.MultiheadAttention` | `WideAttention` | fused, sequential | **11.4x** |
 | `nn.Linear` | `WideLinear` | einsum, sequential | **12.8x** |
 | `nn.Embedding` | `WideEmbedding` | indexed, gather, sequential | **6.4x** |
 | `nn.Conv1d` | `WideConv1d` | grouped, sequential | **3.2x** |
 | `nn.Conv2d` | `WideConv2d` | grouped, channels_last, sequential | **2.5x** |
+| `nn.Conv3d` | `WideConv3d` | grouped, sequential | **~2x** |
+| `nn.GroupNorm` | `WideGroupNorm` | fused, sequential | **~2x** |
+| `nn.InstanceNorm1d/2d` | `WideInstanceNorm1d/2d` | fused, sequential | **~2x** |
 | `nn.LayerNorm` | `WideLayerNorm` | wide | **1.8x** |
 | `nn.BatchNorm1d` | `WideBatchNorm1d` | wide | **1.5x** |
 | `nn.BatchNorm2d` | `WideBatchNorm2d` | wide | **1.5x** |
@@ -244,14 +247,14 @@ wide_compiler info
 
 ### LSTM (NEW in 0.5.0)
 
-| N | Fused | Baseline | Notes |
-|---|-------|----------|-------|
-| 4 | **3.3x** | 1.0x | Sweet spot |
-| 8 | **2.1x** | 1.0x | |
-| 16 | 1.0x | 1.0x | Crossover point |
-| 32 | 0.8x | 1.0x | Block-diagonal overhead |
+| N | Fused | Baseline |
+|---|-------|----------|
+| 4 | **3.3x** | 1.0x |
+| 8 | 0.5x | 1.0x |
+| 16 | 1.0x | 1.0x |
+| 32 | 0.8x | 1.0x |
 
-> **Note:** WideLSTM uses block-diagonal weight matrices which become inefficient at large N due to sparsity overhead. For N > 16, consider using multiple smaller WideLSTMs or WideGRU instead.
+> Use WideGRU for N > 4.
 
 ### Attention (NEW in 0.4.0)
 
@@ -301,12 +304,22 @@ wide_compiler info
 
 1. **FX Tracing** - `torch.fx.symbolic_trace` captures the computation graph
 2. **Wide Primitives** - Each layer replaced with fused equivalent:
+   - `GRU` → Einsum fusion for input projections
+   - `LSTM` → Block-diagonal weight matrices (N≤4)
    - `Linear` → Batched einsum
    - `Conv2d` → Grouped convolution  
    - `Attention` → Reshape N→batch, single Flash Attention call
    - `BatchNorm` → Single BN over N*C channels
+   - `GroupNorm` → Single GN with N*num_groups
+   - `InstanceNorm` → Single IN over N*C channels
 3. **Strategy Selection** - Each primitive auto-selects optimal strategy based on N
 4. **Compile-Friendly** - 0 graph breaks, all native PyTorch ops
+
+**Why WideGRU is fast:**
+```python
+# Einsum fuses N input projections: [B,T,I] @ [N,I,3H] → [B,T,N,3H]
+# One kernel for all N models' input gates
+```
 
 **Why WideAttention is so fast:**
 ```python
@@ -334,14 +347,17 @@ wide_compiler/
     │   ├── benchmark_schema.py
     │   └── benchmark_registry.py
     └── primitives/
-        ├── wide_gru.py         # NEW: 8x speedup (einsum fusion)
-        ├── wide_lstm.py        # NEW: 3x speedup (block-diagonal)
+        ├── wide_gru.py         # 8x speedup (einsum fusion)
+        ├── wide_lstm.py        # 3x speedup (block-diagonal)
         ├── wide_attention.py   # 11x speedup
         ├── wide_linear.py
         ├── wide_conv1d.py
         ├── wide_conv2d.py
+        ├── wide_conv3d.py
         ├── wide_batchnorm_1d.py
         ├── wide_batchnorm_2d.py
+        ├── wide_groupnorm.py
+        ├── wide_instancenorm.py
         ├── wide_layernorm.py
         └── wide_embedding.py
 ```
@@ -359,12 +375,8 @@ wide_compiler/
 - **batch_first only** - `batch_first=True` required
 
 ### WideLSTM Performance
-Block-diagonal matrices become inefficient at large N:
-- **Best:** N ≤ 8 (2-3x speedup)
-- **Crossover:** N ≈ 16 (no benefit)
-- **Overhead:** N > 16 (slower than baseline)
-
-**Workaround:** Group large N into smaller chunks (e.g., N=64 as 8 × WideLSTM(N=8))
+- **N=4:** 3.3x speedup
+- **N>4:** Use WideGRU instead
 
 ## Use Cases
 
