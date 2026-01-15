@@ -140,15 +140,15 @@ class WideLSTM(nn.Module):
         hx: Optional[Tuple[Tensor, Tensor]] = None,
     ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
         """
-        Forward pass.
+        Forward pass with N-first format.
 
         Args:
-            x: [B, T, N*input_size]
-            hx: Optional (h_0, c_0) each [1, B, N*hidden_size]
+            x: [N, B, T, input_size] N-first format
+            hx: Optional (h_0, c_0) each [N, B, hidden_size]
 
         Returns:
-            output: [B, T, N*hidden_size]
-            (h_n, c_n): each [1, B, N*hidden_size]
+            output: [N, B, T, hidden_size]
+            (h_n, c_n): each [N, B, hidden_size]
         """
         if self._strategy == LSTMStrategy.SEQUENTIAL:
             return self._forward_sequential(x, hx)
@@ -160,41 +160,59 @@ class WideLSTM(nn.Module):
         x: Tensor,
         hx: Optional[Tuple[Tensor, Tensor]],
     ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
-        """Fused forward: block-diagonal matmuls + sequential timesteps."""
-        B, T, _ = x.shape
-        N, H = self.n, self.hidden_size
+        """
+        Fused forward with N-first format.
 
-        # Initialize hidden states
+        Input:  [N, B, T, I] N-first format
+        Output: [N, B, T, H]
+        """
+        N, B, T, I = x.shape
+        H = self.hidden_size
+
+        # Initialize hidden states: [N, B, H]
         if hx is not None:
-            h_t = hx[0].squeeze(0)  # [B, N*H]
-            c_t = hx[1].squeeze(0)  # [B, N*H]
+            h_t = hx[0]  # [N, B, H]
+            c_t = hx[1]  # [N, B, H]
         else:
-            h_t = x.new_zeros(B, N * H)
-            c_t = x.new_zeros(B, N * H)
+            h_t = x.new_zeros(N, B, H)
+            c_t = x.new_zeros(N, B, H)
 
-        # Precompute input projections for all timesteps: [B, T, N*4H]
-        # This is the key optimization - one big matmul instead of T*N small ones
-        gates_x = F.linear(x, self.weight_ih, self.bias_ih)  # [B, T, N*4H]
+        # Precompute input projections for all timesteps
+        # x: [N, B, T, I], weight_ih is [N*4H, N*I] block diagonal
+        # We need to extract the diagonal blocks for einsum
+        # Reshape to get [N, 4H, I] diagonal blocks
+        weight_ih_blocks = torch.stack([
+            self.weight_ih[i*4*H:(i+1)*4*H, i*I:(i+1)*I]
+            for i in range(N)
+        ], dim=0)  # [N, 4H, I]
+
+        # Input projection: [N, B, T, I] @ [N, I, 4H] -> [N, B, T, 4H]
+        gates_x = torch.einsum('nbti,ngi->nbtg', x, weight_ih_blocks)
+        if self.bias:
+            bias_ih_blocks = self.bias_ih.view(N, 4*H)
+            gates_x = gates_x + bias_ih_blocks.view(N, 1, 1, 4*H)
+
+        # Extract weight_hh diagonal blocks
+        weight_hh_blocks = torch.stack([
+            self.weight_hh[i*4*H:(i+1)*4*H, i*H:(i+1)*H]
+            for i in range(N)
+        ], dim=0)  # [N, 4H, H]
+
+        bias_hh_blocks = self.bias_hh.view(N, 4*H) if self.bias else None
 
         outputs = []
 
         for t in range(T):
-            # Hidden projection: [B, N*H] @ [N*H, N*4H].T -> [B, N*4H]
-            gates_h = F.linear(h_t, self.weight_hh, self.bias_hh)
+            # Hidden projection: [N, B, H] @ [N, H, 4H] -> [N, B, 4H]
+            gates_h = torch.einsum('nbh,ngh->nbg', h_t, weight_hh_blocks)
+            if bias_hh_blocks is not None:
+                gates_h = gates_h + bias_hh_blocks.view(N, 1, 4*H)
 
-            # Combined gates: [B, N*4H]
-            gates = gates_x[:, t, :] + gates_h
+            # Combined gates: [N, B, 4H]
+            gates = gates_x[:, :, t, :] + gates_h
 
-            # Reshape to [B, N, 4H] then split into 4 gates of [B, N, H]
-            # Layout after matmul: [i₀,f₀,g₀,o₀, i₁,f₁,g₁,o₁, ...]
-            gates = gates.view(B, N, 4 * H)
-            i_gate, f_gate, g_gate, o_gate = gates.chunk(4, dim=-1)  # each [B, N, H]
-
-            # Flatten back to [B, N*H]
-            i_gate = i_gate.reshape(B, N * H)
-            f_gate = f_gate.reshape(B, N * H)
-            g_gate = g_gate.reshape(B, N * H)
-            o_gate = o_gate.reshape(B, N * H)
+            # Split into 4 gates of [N, B, H]
+            i_gate, f_gate, g_gate, o_gate = gates.chunk(4, dim=-1)
 
             # Apply activations
             i_t = torch.sigmoid(i_gate)
@@ -210,38 +228,34 @@ class WideLSTM(nn.Module):
 
             outputs.append(h_t)
 
-        # Stack outputs: [B, T, N*H]
-        output = torch.stack(outputs, dim=1)
+        # Stack outputs: [N, B, T, H]
+        output = torch.stack(outputs, dim=2)
 
-        # Return with layer dimension: [1, B, N*H]
-        return output, (h_t.unsqueeze(0), c_t.unsqueeze(0))
+        return output, (h_t, c_t)
 
     def _forward_sequential(
         self,
         x: Tensor,
         hx: Optional[Tuple[Tensor, Tensor]],
     ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
-        """Sequential forward: process each of N LSTMs separately (for validation)."""
-        B, T, _ = x.shape
-        N, I, H = self.n, self.input_size, self.hidden_size
+        """
+        Sequential forward with N-first format.
 
-        # Split input: [B, T, N*I] -> list of [B, T, I]
-        x_chunks = x.view(B, T, N, I).unbind(dim=2)
+        Input:  [N, B, T, I] N-first format
+        Output: [N, B, T, H]
+        """
+        N, B, T, I = x.shape
+        H = self.hidden_size
 
         # Split hidden states if provided
         if hx is not None:
-            h_0, c_0 = hx
-            h_0 = h_0.squeeze(0)  # [B, N*H]
-            c_0 = c_0.squeeze(0)
-            h_chunks = h_0.view(B, N, H).unbind(dim=1)
-            c_chunks = c_0.view(B, N, H).unbind(dim=1)
+            h_t = hx[0]  # [N, B, H]
+            c_t = hx[1]  # [N, B, H]
         else:
-            h_chunks = [None] * N
-            c_chunks = [None] * N
+            h_t = x.new_zeros(N, B, H)
+            c_t = x.new_zeros(N, B, H)
 
         outputs = []
-        h_ns = []
-        c_ns = []
 
         for i in range(N):
             # Extract block weights for this LSTM
@@ -250,38 +264,31 @@ class WideLSTM(nn.Module):
             b_ih = self.bias_ih[i*4*H:(i+1)*4*H] if self.bias else None
             b_hh = self.bias_hh[i*4*H:(i+1)*4*H] if self.bias else None
 
-            xi = x_chunks[i]  # [B, T, I]
-
-            if h_chunks[i] is not None:
-                h_t = h_chunks[i]  # [B, H]
-                c_t = c_chunks[i]  # [B, H]
-            else:
-                h_t = xi.new_zeros(B, H)
-                c_t = xi.new_zeros(B, H)
+            xi = x[i]  # [B, T, I]
+            hi = h_t[i]  # [B, H]
+            ci = c_t[i]  # [B, H]
 
             out_seq = []
             for t in range(T):
-                gates = F.linear(xi[:, t], w_ih, b_ih) + F.linear(h_t, w_hh, b_hh)
+                gates = F.linear(xi[:, t], w_ih, b_ih) + F.linear(hi, w_hh, b_hh)
                 i_gate, f_gate, g_gate, o_gate = gates.chunk(4, dim=-1)
 
-                i_t = torch.sigmoid(i_gate)
-                f_t = torch.sigmoid(f_gate)
-                g_t = torch.tanh(g_gate)
-                o_t = torch.sigmoid(o_gate)
+                i_g = torch.sigmoid(i_gate)
+                f_g = torch.sigmoid(f_gate)
+                g_g = torch.tanh(g_gate)
+                o_g = torch.sigmoid(o_gate)
 
-                c_t = f_t * c_t + i_t * g_t
-                h_t = o_t * torch.tanh(c_t)
-                out_seq.append(h_t)
+                ci = f_g * ci + i_g * g_g
+                hi = o_g * torch.tanh(ci)
+                out_seq.append(hi)
 
             outputs.append(torch.stack(out_seq, dim=1))  # [B, T, H]
-            h_ns.append(h_t)
-            c_ns.append(c_t)
+            h_t[i] = hi
+            c_t[i] = ci
 
-        output = torch.cat(outputs, dim=-1)  # [B, T, N*H]
-        h_n = torch.cat(h_ns, dim=-1).unsqueeze(0)  # [1, B, N*H]
-        c_n = torch.cat(c_ns, dim=-1).unsqueeze(0)
+        output = torch.stack(outputs, dim=0)  # [N, B, T, H]
 
-        return output, (h_n, c_n)
+        return output, (h_t, c_t)
 
     @classmethod
     def from_modules(

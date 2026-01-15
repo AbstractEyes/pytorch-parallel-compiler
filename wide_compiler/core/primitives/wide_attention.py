@@ -145,33 +145,12 @@ class WideAttention(nn.Module):
         need_weights: bool = False,
     ) -> Union[Tensor, Tuple[Tensor, None]]:
         """
-        Forward pass supporting both self-attention and cross-attention.
+        Forward pass with N-first format.
 
-        Calling conventions:
+        Input:  [N, B, T, D] N-first format for query/key/value
+        Output: [N, B, T, D] or Tuple[[N, B, T, D], None]
 
-        1. Self-attention (channel-packed): forward(x)
-           - x: [B, T, N*D]
-           - Returns: [B, T, N*D]
-
-        2. Self-attention (MHA-style): forward(query, query, query)
-           - query: [B, N*T, D] (sequence-packed from TracedWideModel)
-           - Auto-repacks internally
-           - Returns: Tuple[Tensor [B, N*T, D], None]
-
-        3. Cross-attention (MHA-style): forward(query, key, value)
-           - query: [B, N*Tq, D], key/value: [B, N*Tkv, D]
-           - Returns: Tuple[Tensor [B, N*Tq, D], None]
-
-        Args:
-            query: Query tensor
-            key: Key tensor (None = use query for self-attention)
-            value: Value tensor (None = use query for self-attention)
-            attn_mask: Optional attention mask
-            is_causal: If True, apply causal mask
-            need_weights: Ignored (for MHA compatibility)
-
-        Returns:
-            Tensor or Tuple[Tensor, None] depending on calling convention
+        For self-attention, key and value default to query.
         """
         N, D = self.n, self.d_model
 
@@ -184,40 +163,11 @@ class WideAttention(nn.Module):
         if value is None:
             value = key
 
-        # Detect packing format from query shape
-        B = query.size(0)
-        last_dim = query.size(-1)
-
-        # Channel-packed: [B, T, N*D] - last dim is N*D
-        # Sequence-packed: [B, N*T, D] - last dim is D
-        needs_repack = (last_dim == D) and (query.size(1) % N == 0)
-
-        if needs_repack:
-            # Repack all inputs: [B, N*T, D] -> [B, T, N*D]
-            def repack_to_channel(x):
-                b, nt, d = x.shape
-                t = nt // N
-                x = x.view(b, N, t, d)
-                x = x.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-                return x.view(b, t, N * d)
-
-            query = repack_to_channel(query)
-            key = repack_to_channel(key)
-            value = repack_to_channel(value)
-
-        # Run attention
+        # Run attention (inputs already N-first)
         if self._use_fused:
             out = self._forward_fused(query, key, value, attn_mask, is_causal)
         else:
             out = self._forward_sequential(query, key, value, attn_mask, is_causal)
-
-        # Repack output if needed
-        if needs_repack:
-            # [B, T, N*D] -> [B, N*T, D]
-            b, t, nd = out.shape
-            out = out.view(b, t, N, D)
-            out = out.permute(0, 2, 1, 3).contiguous()  # [B, N, T, D]
-            out = out.view(b, N * t, D)
 
         # Return appropriate type
         if mha_mode:
@@ -236,22 +186,14 @@ class WideAttention(nn.Module):
         """
         Fused attention using batched SDPA.
 
-        Reshape N parallel models into batch dimension to leverage
-        Flash Attention / memory-efficient attention.
-
-        Args:
-            query: [B, Tq, N*D] query tensor
-            key: [B, Tkv, N*D] key tensor
-            value: [B, Tkv, N*D] value tensor
+        Input:  [N, B, Tq, D] query, [N, B, Tkv, D] key/value (N-first)
+        Output: [N, B, Tq, D]
         """
         N, D, H, Dh = self.n, self.d_model, self.n_heads, self.d_head
-        B, Tq, _ = query.shape
-        Tkv = key.size(1)
+        _, B, Tq, _ = query.shape
+        Tkv = key.size(2)
 
-        # Reshape inputs: [B, T, N*D] -> [N, B, T, D]
-        query = query.view(B, Tq, N, D).permute(2, 0, 1, 3)   # [N, B, Tq, D]
-        key = key.view(B, Tkv, N, D).permute(2, 0, 1, 3)      # [N, B, Tkv, D]
-        value = value.view(B, Tkv, N, D).permute(2, 0, 1, 3)  # [N, B, Tkv, D]
+        # Inputs already N-first: [N, B, T, D]
 
         # Q projection: [N, B, Tq, D] @ [N, D, D] -> [N, B, Tq, D]
         q = torch.einsum('nbtd,nod->nbto', query, self.q_weight)
@@ -293,9 +235,6 @@ class WideAttention(nn.Module):
         if self.out_bias is not None:
             out = out + self.out_bias.view(N, 1, 1, D)
 
-        # Reshape output: [N, B, Tq, D] -> [B, Tq, N*D]
-        out = out.permute(1, 2, 0, 3).reshape(B, Tq, N * D)
-
         return out
 
     def _forward_sequential(
@@ -306,15 +245,15 @@ class WideAttention(nn.Module):
         attn_mask: Optional[Tensor],
         is_causal: bool,
     ) -> Tensor:
-        """N separate attention computations - baseline."""
-        N, D, H, Dh = self.n, self.d_model, self.n_heads, self.d_head
-        B, Tq, _ = query.shape
-        Tkv = key.size(1)
+        """
+        N separate attention computations - baseline.
 
-        # Reshape inputs: [B, T, N*D] -> [B, T, N, D]
-        query = query.view(B, Tq, N, D)
-        key = key.view(B, Tkv, N, D)
-        value = value.view(B, Tkv, N, D)
+        Input:  [N, B, Tq, D] query, [N, B, Tkv, D] key/value (N-first)
+        Output: [N, B, Tq, D]
+        """
+        N, D, H, Dh = self.n, self.d_model, self.n_heads, self.d_head
+        _, B, Tq, _ = query.shape
+        Tkv = key.size(2)
 
         # Split KV weight into K and V parts
         k_weight = self.kv_weight[:, :D, :]  # [N, D, D]
@@ -324,9 +263,9 @@ class WideAttention(nn.Module):
         dropout_p = self.dropout if self.training else 0.0
 
         for i in range(N):
-            qi = query[:, :, i, :]  # [B, Tq, D]
-            ki = key[:, :, i, :]    # [B, Tkv, D]
-            vi = value[:, :, i, :]  # [B, Tkv, D]
+            qi = query[i]  # [B, Tq, D]
+            ki = key[i]    # [B, Tkv, D]
+            vi = value[i]  # [B, Tkv, D]
 
             # Q projection
             q = F.linear(qi, self.q_weight[i],
@@ -361,8 +300,8 @@ class WideAttention(nn.Module):
                           self.out_bias[i] if self.out_bias is not None else None)
             outputs.append(out)
 
-        # Concatenate: [B, Tq, N*D]
-        return torch.cat(outputs, dim=-1)
+        # Stack: [N, B, Tq, D]
+        return torch.stack(outputs, dim=0)
 
     @classmethod
     def from_modules(

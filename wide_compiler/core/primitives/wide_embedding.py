@@ -94,19 +94,19 @@ class WideEmbedding(nn.Module):
         """
         Batched advanced indexing - fastest approach.
 
-        weight[:, x] does batched lookup across all N tables simultaneously.
+        Input:  [B, T] indices
+        Output: [N, B, T, D] N-first format
         """
         # x: [B, T], weight: [N, V, D]
         # weight[:, x] -> [N, B, T, D]
-        B, T = x.shape
-
-        out = self.weight[:, x]  # [N, B, T, D]
-        out = out.permute(1, 2, 0, 3)  # [B, T, N, D]
-        return out.reshape(B, T, -1)  # [B, T, N*D]
+        return self.weight[:, x]  # [N, B, T, D]
 
     def _forward_gather(self, x: Tensor) -> Tensor:
         """
         torch.gather based batched lookup.
+
+        Input:  [B, T] indices
+        Output: [N, B, T, D] N-first format
         """
         B, T = x.shape
         N, V, D = self.weight.shape
@@ -118,14 +118,17 @@ class WideEmbedding(nn.Module):
 
         # Gather along vocab dimension
         out = torch.gather(self.weight, 1, x_exp)  # [N, B*T, D]
-        out = out.view(N, B, T, D)
-        out = out.permute(1, 2, 0, 3)  # [B, T, N, D]
-        return out.reshape(B, T, -1)  # [B, T, N*D]
+        return out.view(N, B, T, D)  # [N, B, T, D]
 
     def _forward_sequential(self, x: Tensor) -> Tensor:
-        """N separate embedding lookups - baseline."""
+        """
+        N separate embedding lookups - baseline.
+
+        Input:  [B, T] indices
+        Output: [N, B, T, D] N-first format
+        """
         outs = [F.embedding(x, self.weight[i]) for i in range(self.n)]
-        return torch.cat(outs, dim=-1)
+        return torch.stack(outs, dim=0)  # [N, B, T, D]
 
     @classmethod
     def from_modules(

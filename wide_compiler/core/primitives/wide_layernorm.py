@@ -39,29 +39,29 @@ class WideLayerNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(n * normalized_shape))
 
     def forward(self, x: Tensor) -> Tensor:
-        # x: [B, N*D] or [B, T, N*D]
+        """
+        Layer normalization with N-first format.
+
+        Input:  [N, B, ..., D] N-first format
+        Output: [N, B, ..., D]
+        """
         D = self.normalized_shape
+        N = self.n
 
-        if x.dim() == 2:
-            B, ND = x.shape
-            N = ND // D
+        # Normalize over last dimension (D) for each model
+        x = F.layer_norm(x, (D,), eps=self.eps)
 
-            # Reshape to [B, N, D], normalize over D, reshape back
-            x = x.view(B, N, D)
-            x = F.layer_norm(x, (D,), eps=self.eps)
-            x = x.view(B, ND)
+        # Apply per-model affine: weight/bias are [N*D], reshape to [N, D]
+        weight = self.weight.view(N, D)
+        bias = self.bias.view(N, D)
 
-            # Apply per-group affine
-            x = x * self.weight + self.bias
+        # Expand weight/bias to match x dimensions
+        # x: [N, B, ..., D], need weight: [N, 1, ..., 1, D]
+        for _ in range(x.dim() - 2):
+            weight = weight.unsqueeze(1)
+            bias = bias.unsqueeze(1)
 
-        elif x.dim() == 3:
-            B, T, ND = x.shape
-            N = ND // D
-
-            x = x.view(B, T, N, D)
-            x = F.layer_norm(x, (D,), eps=self.eps)
-            x = x.view(B, T, ND)
-            x = x * self.weight + self.bias
+        x = x * weight + bias
 
         return x
 

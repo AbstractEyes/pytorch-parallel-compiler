@@ -448,7 +448,19 @@ class TracedWideModel(nn.Module):
         return wide_model
 
     def forward(self, x: Tensor) -> Tensor:
-        """Execute graph respecting dataflow."""
+        """
+        Execute graph with N-first internal format.
+
+        Input:  [B, ..., N*D] channel-packed
+        Internal: [N, B, ..., D] N-first format
+        Output: [B, ..., N*D] channel-packed
+        """
+        # Unpack: [B, ..., N*D] -> [N, B, ..., D]
+        *batch_dims, nd = x.shape
+        d = nd // self.n
+        x = x.view(*batch_dims, self.n, d)  # [B, ..., N, D]
+        x = x.movedim(-2, 0)                 # [N, B, ..., D]
+
         values: Dict[str, Tensor] = {self._input_name: x}
 
         # Pre-populate get_attr values
@@ -494,7 +506,17 @@ class TracedWideModel(nn.Module):
             else:
                 values[node_name] = op(*args)
 
-        return values[self._output_name]
+        out = values[self._output_name]
+
+        # Pack: [N, B, ..., D] -> [B, ..., N*D]
+        # Handle tuple outputs (e.g., from attention)
+        if isinstance(out, tuple):
+            out = out[0]
+
+        out = out.movedim(0, -2)             # [B, ..., N, D]
+        out = out.flatten(-2)                # [B, ..., N*D]
+
+        return out
 
     def summary(self) -> str:
         """Print model summary."""

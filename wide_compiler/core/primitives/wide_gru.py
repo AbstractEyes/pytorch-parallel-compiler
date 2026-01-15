@@ -124,15 +124,15 @@ class WideGRU(nn.Module):
         h_0: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
-        Forward pass.
+        Forward pass with N-first format.
 
         Args:
-            x: [B, T, N*input_size] if batch_first else [T, B, N*input_size]
-            h_0: Optional [1, B, N*hidden_size] initial hidden state
+            x: [N, B, T, input_size] N-first format
+            h_0: Optional [N, B, hidden_size] initial hidden state
 
         Returns:
-            output: [B, T, N*hidden_size] or [T, B, N*hidden_size]
-            h_n: [1, B, N*hidden_size] final hidden state
+            output: [N, B, T, hidden_size]
+            h_n: [N, B, hidden_size] final hidden state
         """
         if self._use_fused:
             return self._forward_fused(x, h_0)
@@ -147,50 +147,42 @@ class WideGRU(nn.Module):
         """
         Fused forward: pre-compute ALL input projections, then run recurrence.
 
-        This fuses ~50% of the compute (input projections) while the
-        hidden-to-hidden must remain sequential due to recurrence.
+        Input:  [N, B, T, I] N-first format
+        Output: [N, B, T, H]
         """
         N = self.n
         H = self.hidden_size
         I = self.input_size
 
-        # Handle batch_first
-        if self.batch_first:
-            B, T, _ = x.shape
-        else:
-            T, B, _ = x.shape
-            x = x.transpose(0, 1)  # [T, B, N*I] -> [B, T, N*I]
-
-        # Reshape input: [B, T, N*I] -> [B, T, N, I]
-        x = x.reshape(B, T, N, I)
+        _, B, T, _ = x.shape
 
         # === FUSED INPUT PROJECTION ===
         # Compute W_ih @ x for ALL timesteps, ALL models in ONE einsum
-        # x: [B, T, N, I], weight_ih: [N, 3H, I] -> [B, T, N, 3H]
-        gates_x = torch.einsum('btni,ngi->btng', x, self.weight_ih)
+        # x: [N, B, T, I], weight_ih: [N, 3H, I] -> [N, B, T, 3H]
+        gates_x = torch.einsum('nbti,ngi->nbtg', x, self.weight_ih)
         if self.bias_ih is not None:
-            gates_x = gates_x + self.bias_ih.view(1, 1, N, 3 * H)
+            gates_x = gates_x + self.bias_ih.view(N, 1, 1, 3 * H)
 
         # Initialize hidden state
         if h_0 is not None:
-            # [1, B, N*H] -> [B, N, H]
-            h = h_0.squeeze(0).reshape(B, N, H).contiguous()
+            # [N, B, H]
+            h = h_0.contiguous()
         else:
-            h = torch.zeros(B, N, H, device=x.device, dtype=x.dtype)
+            h = torch.zeros(N, B, H, device=x.device, dtype=x.dtype)
 
         # === RECURRENCE (sequential over time, parallel over N) ===
         outputs = []
         for t in range(T):
-            # Hidden projection: [B, N, H] @ [N, 3H, H]^T -> [B, N, 3H]
-            gates_h = torch.einsum('bnh,ngh->bng', h, self.weight_hh)
+            # Hidden projection: [N, B, H] @ [N, 3H, H]^T -> [N, B, 3H]
+            gates_h = torch.einsum('nbh,ngh->nbg', h, self.weight_hh)
             if self.bias_hh is not None:
-                gates_h = gates_h + self.bias_hh.view(1, N, 3 * H)
+                gates_h = gates_h + self.bias_hh.view(N, 1, 3 * H)
 
             # Get input gates for this timestep
-            gx = gates_x[:, t]  # [B, N, 3H]
+            gx = gates_x[:, :, t]  # [N, B, 3H]
 
             # Split gates
-            gx_r, gx_z, gx_n = gx.chunk(3, dim=-1)    # Each [B, N, H]
+            gx_r, gx_z, gx_n = gx.chunk(3, dim=-1)    # Each [N, B, H]
             gh_r, gh_z, gh_n = gates_h.chunk(3, dim=-1)
 
             # Reset and update gates: r, z use sum of input and hidden
@@ -206,14 +198,11 @@ class WideGRU(nn.Module):
 
             outputs.append(h)
 
-        # Stack outputs: List of [B, N, H] -> [B, T, N, H] -> [B, T, N*H]
-        output = torch.stack(outputs, dim=1).reshape(B, T, N * H)
+        # Stack outputs: List of [N, B, H] -> [N, B, T, H]
+        output = torch.stack(outputs, dim=2)
 
-        # Final hidden: [B, N, H] -> [1, B, N*H]
-        h_n = h.reshape(1, B, N * H)
-
-        if not self.batch_first:
-            output = output.transpose(0, 1)  # [B, T, N*H] -> [T, B, N*H]
+        # Final hidden: [N, B, H]
+        h_n = h
 
         return output, h_n
 
@@ -222,31 +211,29 @@ class WideGRU(nn.Module):
         x: Tensor,
         h_0: Optional[Tensor],
     ) -> Tuple[Tensor, Tensor]:
-        """Sequential: use individual GRU cells per model."""
+        """
+        Sequential: use individual GRU cells per model.
+
+        Input:  [N, B, T, I] N-first format
+        Output: [N, B, T, H]
+        """
         N = self.n
         H = self.hidden_size
         I = self.input_size
 
-        if self.batch_first:
-            B, T, _ = x.shape
-        else:
-            T, B, _ = x.shape
-            x = x.transpose(0, 1)
-
-        # [B, T, N*I] -> [B, T, N, I]
-        x = x.reshape(B, T, N, I)
+        _, B, T, _ = x.shape
 
         if h_0 is not None:
-            h = h_0.squeeze(0).reshape(B, N, H).contiguous()
+            h = h_0.contiguous()
         else:
-            h = torch.zeros(B, N, H, device=x.device, dtype=x.dtype)
+            h = torch.zeros(N, B, H, device=x.device, dtype=x.dtype)
 
         outputs = []
         for t in range(T):
             h_new = []
             for i in range(N):
-                xi = x[:, t, i, :]  # [B, I]
-                hi = h[:, i, :]     # [B, H]
+                xi = x[i, :, t, :]  # [B, I]
+                hi = h[i]          # [B, H]
 
                 # GRU cell computation
                 gi = F.linear(xi, self.weight_ih[i], self.bias_ih[i] if self.bias_ih is not None else None)
@@ -261,14 +248,11 @@ class WideGRU(nn.Module):
 
                 h_new.append((1 - z) * n + z * hi)
 
-            h = torch.stack(h_new, dim=1)  # [B, N, H]
+            h = torch.stack(h_new, dim=0)  # [N, B, H]
             outputs.append(h)
 
-        output = torch.stack(outputs, dim=1).reshape(B, T, N * H)
-        h_n = h.reshape(1, B, N * H)
-
-        if not self.batch_first:
-            output = output.transpose(0, 1)
+        output = torch.stack(outputs, dim=2)  # [N, B, T, H]
+        h_n = h  # [N, B, H]
 
         return output, h_n
 
