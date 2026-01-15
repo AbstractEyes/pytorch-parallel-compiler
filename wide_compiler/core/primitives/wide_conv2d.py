@@ -163,16 +163,34 @@ class WideConv2d(nn.Module):
         return self._strategy
 
     def forward(self, x: Tensor) -> Tensor:
-        """Forward pass - strategy resolved at construction, no runtime selection."""
-        if self._use_channels_last:
-            return self._forward_channels_last(x)
-        elif self._use_grouped:
-            return self.grouped_conv(x)
-        else:
-            return self._forward_sequential(x)
+        """
+        Forward pass with N-first format.
 
-    def _forward_channels_last(self, x: Tensor) -> Tensor:
-        """Execute grouped conv in NHWC format (channels_last)."""
+        Input:  [N, B, C_in, H, W]
+        Output: [N, B, C_out, H', W']
+        """
+        N, B, C, H, W = x.shape
+
+        # Convert N-first to channel-packed: [N, B, C, H, W] -> [B, N*C, H, W]
+        x_packed = x.permute(1, 0, 2, 3, 4).reshape(B, N * C, H, W)
+
+        # Run conv in channel-packed format
+        if self._use_channels_last:
+            out = self._forward_channels_last_internal(x_packed)
+        elif self._use_grouped:
+            out = self.grouped_conv(x_packed)
+        else:
+            out = self._forward_sequential_internal(x_packed)
+
+        # Convert back to N-first: [B, N*C_out, H', W'] -> [N, B, C_out, H', W']
+        B, NC_out, H_out, W_out = out.shape
+        C_out = NC_out // N
+        out = out.view(B, N, C_out, H_out, W_out).permute(1, 0, 2, 3, 4)
+
+        return out.contiguous()
+
+    def _forward_channels_last_internal(self, x: Tensor) -> Tensor:
+        """Execute grouped conv in NHWC format on channel-packed input."""
         x_nhwc = x.to(memory_format=torch.channels_last)
         w_nhwc = self.grouped_conv.weight.to(memory_format=torch.channels_last)
 
@@ -188,8 +206,8 @@ class WideConv2d(nn.Module):
 
         return out.contiguous()
 
-    def _forward_sequential(self, x: Tensor) -> Tensor:
-        """N separate convolutions, concatenated."""
+    def _forward_sequential_internal(self, x: Tensor) -> Tensor:
+        """N separate convolutions on channel-packed input."""
         B = x.shape[0]
         H, W = x.shape[2], x.shape[3]
 
