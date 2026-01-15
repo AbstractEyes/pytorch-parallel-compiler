@@ -45,7 +45,6 @@ wide_compiler/
     ├── config.py        → WideConfig dataclass
     ├── registry.py      → Maps 'Linear' → WideLinear.from_modules
     ├── traced_wide.py   → FX tracing, graph execution (THE CORE)
-    ├── wide_model.py    → pack_inputs(), unpack_outputs(), tree utils
     ├── benchmark/       → Primitive benchmarking system (NEW)
     │   ├── __init__.py
     │   ├── benchmark_api.py      → run_benchmark(), list_primitives()

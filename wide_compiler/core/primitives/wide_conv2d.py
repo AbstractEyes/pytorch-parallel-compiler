@@ -13,6 +13,10 @@ Strategies:
 - 'sequential': N separate F.conv2d (exact, slowest)
 - 'auto': Heuristic selection (prefers grouped NCHW)
 
+Input/Output Format (v0.6.0):
+- Input:  [N, B, C_in, H, W]   (N-first)
+- Output: [N, B, C_out, H', W'] (N-first)
+
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
@@ -397,7 +401,7 @@ class WideConv2d(nn.Module):
 
     @staticmethod
     def _bench_input(n: int, batch_sizes: int, channels: int, heights: int, widths: int, device: str = 'cpu', **_) -> Tensor:
-        """Create single input tensor."""
+        """Create single input tensor for one model."""
         return torch.randn(batch_sizes, channels, heights, widths, device=device)
 
     @classmethod
@@ -413,18 +417,13 @@ class WideConv2d(nn.Module):
 
     @staticmethod
     def _bench_pack(inputs: List[Tensor]) -> Tensor:
-        """Pack N inputs into wide format."""
-        stacked = torch.stack(inputs, dim=1)  # [B, N, C, H, W]
-        B, N, C, H, W = stacked.shape
-        return stacked.view(B, N * C, H, W)
+        """Pack N inputs into N-first format: [N, B, C, H, W]."""
+        return torch.stack(inputs, dim=0)
 
     @staticmethod
     def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
-        """Unpack wide output to N outputs."""
-        B, NC, H, W = output.shape
-        C = NC // n
-        reshaped = output.view(B, n, C, H, W)
-        return [reshaped[:, i] for i in range(n)]
+        """Unpack N-first output to list of [B, C, H, W]."""
+        return [output[i] for i in range(n)]
 
 
 # Convenience function
