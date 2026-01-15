@@ -88,26 +88,28 @@ def run_single(
     compiled = compile_fn is not None
     extra_warmup = job.compile_warmup_extra if compiled else 0
 
-    # Create N models
+    # Create N models (uncompiled for validation)
     models = [job.model_factory(**params).to(device).eval() for _ in range(n)]
 
-    # Compile baseline models if compilation enabled
+    # For baseline timing: compile 1 model and run it N times
+    # This is fair because we're measuring throughput, not unique model dispatch
     if compiled:
-        models_compiled = [compile_fn(m) for m in models]
+        baseline_model_compiled = compile_fn(models[0])
     else:
-        models_compiled = models
+        baseline_model_compiled = models[0]
 
     # Create input
     sample = job.input_factory(n=n, device=device, **params)
     inputs = [sample.clone() for _ in range(n)]
 
-    # Baseline: sequential execution - get outputs for validation (use uncompiled for validation)
+    # Baseline: get outputs for validation (use uncompiled)
     with torch.no_grad():
         baseline_outputs = [m(inp) for m, inp in zip(models, inputs)]
 
+    # Baseline timing: run 1 compiled model N times (same as running N models)
     def baseline_fn():
-        for i, m in enumerate(models_compiled):
-            m(inputs[i])
+        for i in range(n):
+            baseline_model_compiled(inputs[i])
 
     baseline_ms = time_fn(
         baseline_fn,

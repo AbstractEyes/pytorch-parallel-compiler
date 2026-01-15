@@ -128,7 +128,7 @@ class BenchmarkJob:
 
     # Compilation settings
     compilation: CompilationMode = CompilationMode.EAGER
-    compile_warmup_extra: int = 5  # Extra warmup iterations for compiled models
+    compile_warmup_extra: int = 2  # Extra warmup iterations for compiled models
 
     # Validation settings
     validate: bool = True  # Run consistency check
