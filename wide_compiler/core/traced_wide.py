@@ -46,19 +46,21 @@ import operator
 
 try:
     from .primitives import (
-        WideLinear, WideConv2d, WideConv1d,
-        WideBatchNorm2d, WideBatchNorm1d, WideLayerNorm,
-        WideEmbedding
+        WideLinear, WideConv1d, WideConv2d, WideConv3d,
+        WideBatchNorm1d, WideBatchNorm2d, WideLayerNorm,
+        WideGroupNorm, WideInstanceNorm1d, WideInstanceNorm2d,
+        WideEmbedding, WideAttention, WideGRU, WideLSTM
     )
 
-    from .wide_model import pack_inputs, unpack_outputs
+    from .ensemble_util import pack_inputs, unpack_outputs
 except ImportError:
     from wide_compiler.core.primitives import (
-        WideLinear, WideConv2d, WideConv1d,
-        WideBatchNorm2d, WideBatchNorm1d, WideLayerNorm,
-        WideEmbedding
+        WideLinear, WideConv1d, WideConv2d, WideConv3d,
+        WideBatchNorm1d, WideBatchNorm2d, WideLayerNorm,
+        WideGroupNorm, WideInstanceNorm1d, WideInstanceNorm2d,
+        WideEmbedding, WideAttention, WideGRU, WideLSTM
     )
-    from wide_compiler.core.wide_model import pack_inputs, unpack_outputs
+    from wide_compiler.core.ensemble_util import pack_inputs, unpack_outputs
 
 
 # =============================================================================
@@ -66,13 +68,26 @@ except ImportError:
 # =============================================================================
 
 WIDE_BUILDERS = {
+    # Linear
     'Linear': WideLinear.from_modules,
-    'Conv2d': WideConv2d.from_modules,
+    # Convolutions
     'Conv1d': WideConv1d.from_modules,
-    'BatchNorm2d': WideBatchNorm2d.from_modules,
+    'Conv2d': WideConv2d.from_modules,
+    'Conv3d': WideConv3d.from_modules,
+    # Normalization
     'BatchNorm1d': WideBatchNorm1d.from_modules,
+    'BatchNorm2d': WideBatchNorm2d.from_modules,
     'LayerNorm': WideLayerNorm.from_modules,
+    'GroupNorm': WideGroupNorm.from_modules,
+    'InstanceNorm1d': WideInstanceNorm1d.from_modules,
+    'InstanceNorm2d': WideInstanceNorm2d.from_modules,
+    # Embedding
     'Embedding': WideEmbedding.from_modules,
+    # Attention
+    'MultiheadAttention': WideAttention.from_modules,
+    # RNNs
+    'GRU': WideGRU.from_modules,
+    'LSTM': WideLSTM.from_modules,
 }
 
 

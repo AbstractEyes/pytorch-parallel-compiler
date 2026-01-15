@@ -1,92 +1,31 @@
 """
 WideCompiler.core.benchmark.benchmark_registry
 
-Auto-discovers and registers primitives that support benchmarking.
+Registry for benchmarkable primitives.
+
+Auto-discovers primitives with BENCHMARK_SWEEPS and benchmark_job().
 
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
 
-from typing import Dict, Type, Optional, List
-import torch.nn as nn
+from typing import Dict, Any, Optional, List
 
-# Registry of benchmark-capable primitives
-_PRIMITIVE_REGISTRY: Dict[str, Type[nn.Module]] = {}
-
-# Store import errors for debugging
+# Registry storage
+_PRIMITIVE_REGISTRY: Dict[str, Any] = {}
+_INITIALIZED = False
 _IMPORT_ERRORS: List[str] = []
 
 
-def register(name: str):
-    """Decorator to register a primitive for benchmarking."""
-    def decorator(cls: Type[nn.Module]) -> Type[nn.Module]:
-        register_primitive(name, cls)
-        return cls
-    return decorator
-
-
-def register_primitive(name: str, cls: Type[nn.Module]) -> None:
-    """Register a primitive class for benchmarking."""
-    if not hasattr(cls, 'benchmark_job'):
-        raise ValueError(f"{cls.__name__} must have a benchmark_job classmethod")
-    _PRIMITIVE_REGISTRY[name] = cls
-
-
-def get_primitive(name: str) -> Optional[Type[nn.Module]]:
-    """Get a primitive class by name."""
-    _ensure_registered()
-    return _PRIMITIVE_REGISTRY.get(name)
-
-
-def has_primitive(name: str) -> bool:
-    """Check if a primitive is registered."""
-    _ensure_registered()
-    return name in _PRIMITIVE_REGISTRY
-
-
-def list_primitives() -> List[str]:
-    """List all registered primitive names."""
-    _ensure_registered()
-    return sorted(_PRIMITIVE_REGISTRY.keys())
-
-
-def get_all_primitives() -> Dict[str, Type[nn.Module]]:
-    """Get all registered primitives."""
-    _ensure_registered()
-    return dict(_PRIMITIVE_REGISTRY)
-
-
-def get_import_errors() -> List[str]:
-    """Get any import errors that occurred during registration."""
-    return list(_IMPORT_ERRORS)
-
-
-def debug_registration() -> None:
-    """Print debug info about registered primitives."""
-    _ensure_registered()
-    print(f"Registered primitives: {list(_PRIMITIVE_REGISTRY.keys())}")
-    if _IMPORT_ERRORS:
-        print(f"Import errors:")
-        for err in _IMPORT_ERRORS:
-            print(f"  - {err}")
-
-
-_REGISTERED = False
-
-
-def _ensure_registered():
-    """Lazy registration on first access."""
-    global _REGISTERED
-    if not _REGISTERED:
-        _auto_register()
-        _REGISTERED = True
-
-
 def _auto_register():
-    """Auto-discover and register primitives with benchmark support."""
-    global _PRIMITIVE_REGISTRY, _IMPORT_ERRORS
+    """Auto-register primitives that have benchmark interface."""
+    global _INITIALIZED
+    if _INITIALIZED:
+        return
+    _INITIALIZED = True
 
-    primitives_module = False
+    # Try multiple import paths
+    primitives_module = None
 
     # Path 1: Relative import (when installed as package)
     try:
@@ -170,18 +109,82 @@ def _auto_register():
             if sweeps:  # Non-empty dict
                 _PRIMITIVE_REGISTRY[name] = cls
             else:
-                _IMPORT_ERRORS.append(f"{name}: BENCHMARK_SWEEPS empty after init")
-        else:
-            _IMPORT_ERRORS.append(f"{name}: no benchmark_job method")
+                _IMPORT_ERRORS.append(f"{name}: BENCHMARK_SWEEPS is empty")
+
+
+def register(name: str, primitive_class: Any) -> None:
+    """
+    Manually register a primitive for benchmarking.
+
+    Args:
+        name: Short name ('conv1d', 'linear', etc.)
+        primitive_class: Class with benchmark_job() and BENCHMARK_SWEEPS
+    """
+    _auto_register()
+    if not hasattr(primitive_class, 'benchmark_job'):
+        raise ValueError(f"{primitive_class} must have benchmark_job() method")
+    _PRIMITIVE_REGISTRY[name] = primitive_class
+
+
+def register_primitive(name: str, primitive_class: Any) -> None:
+    """Alias for register()."""
+    register(name, primitive_class)
+
+
+def get_primitive(name: str) -> Any:
+    """
+    Get primitive class by name.
+
+    Args:
+        name: Primitive name ('conv1d', 'conv2d', etc.)
+
+    Returns:
+        Primitive class with benchmark interface
+
+    Raises:
+        KeyError if not found
+    """
+    _auto_register()
+    if name not in _PRIMITIVE_REGISTRY:
+        available = list(_PRIMITIVE_REGISTRY.keys())
+        raise KeyError(f"Unknown primitive '{name}'. Available: {available}")
+    return _PRIMITIVE_REGISTRY[name]
+
+
+def list_primitives() -> List[str]:
+    """List all registered primitive names."""
+    _auto_register()
+    return list(_PRIMITIVE_REGISTRY.keys())
+
+
+def has_primitive(name: str) -> bool:
+    """Check if primitive is registered."""
+    _auto_register()
+    return name in _PRIMITIVE_REGISTRY
+
+
+def get_import_errors() -> List[str]:
+    """Get any import errors encountered during registration."""
+    _auto_register()
+    return _IMPORT_ERRORS.copy()
+
+
+def debug_registration() -> None:
+    """Print debug info about registration."""
+    _auto_register()
+    print(f"Registered primitives: {list(_PRIMITIVE_REGISTRY.keys())}")
+    if _IMPORT_ERRORS:
+        print("Import errors:")
+        for err in _IMPORT_ERRORS:
+            print(f"  - {err}")
 
 
 __all__ = [
     'register',
     'register_primitive',
     'get_primitive',
-    'has_primitive',
     'list_primitives',
-    'get_all_primitives',
+    'has_primitive',
     'get_import_errors',
     'debug_registration',
 ]
