@@ -32,14 +32,26 @@ class WideAttention(nn.Module):
     """
     N parallel Multi-Head Attention modules fused into single operations.
 
-    Input shape:  [B, T, N*D]
-    Output shape: [B, T, N*D]
+    Supports two calling conventions:
+
+    1. Direct (channel-packed):
+       - Input:  [B, T, N*D]
+       - Output: [B, T, N*D]
+       - Usage:  out = wide_attn(x)
+
+    2. MHA-compatible (sequence-packed):
+       - Input:  [B, N*T, D]  (from TracedWideModel)
+       - Output: Tuple[Tensor [B, N*T, D], None]
+       - Usage:  out, _ = wide_attn(query, key, value)
+       - Auto-repacks internally to channel format
 
     Internally:
-    1. Project Q, K, V using fused linear (or per-model weights)
-    2. Reshape to [N*B, H, T, D_head] for batched attention
-    3. Run F.scaled_dot_product_attention (Flash Attention)
-    4. Reshape back and project output
+    1. Auto-detect packing format from input shape
+    2. Project Q, K, V using fused linear (or per-model weights)
+    3. Reshape to [N*B, H, T, D_head] for batched attention
+    4. Run F.scaled_dot_product_attention (Flash Attention)
+    5. Reshape back and project output
+    6. Repack to original format if needed
 
     Strategies:
         'fused': Reshape N models into batch dim, single SDPA call
@@ -114,25 +126,84 @@ class WideAttention(nn.Module):
 
     def forward(
         self,
-        x: Tensor,
+        query: Tensor,
+        key: Optional[Tensor] = None,
+        value: Optional[Tensor] = None,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
-    ) -> Tensor:
+        need_weights: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, None]]:
         """
-        Forward pass.
+        Forward pass with auto-detection of input format.
+
+        Supports two calling conventions:
+
+        1. Direct (channel-packed): forward(x) where x is [B, T, N*D]
+           - Used when calling WideAttention directly
+           - Returns: Tensor [B, T, N*D]
+
+        2. MHA-compatible (sequence-packed): forward(query, key, value)
+           where inputs are [B, N*T, D]
+           - Used by TracedWideModel when replacing nn.MultiheadAttention
+           - Auto-repacks to channel format internally
+           - Returns: Tuple[Tensor, None] to match MHA signature
 
         Args:
-            x: [B, T, N*D] input hidden states
+            query: Input tensor. Shape depends on calling convention:
+                   - Direct: [B, T, N*D] (channel-packed)
+                   - MHA: [B, N*T, D] (sequence-packed)
+            key: For MHA signature, usually same as query for self-attention
+            value: For MHA signature, usually same as query for self-attention
             attn_mask: Optional attention mask [T, T] or [B, T, T]
             is_causal: If True, apply causal mask (for decoder)
+            need_weights: Ignored (for MHA compatibility)
 
         Returns:
-            [B, T, N*D] output hidden states
+            Direct call: Tensor [B, T, N*D]
+            MHA call: Tuple[Tensor [B, N*T, D], None]
         """
-        if self._use_fused:
-            return self._forward_fused(x, attn_mask, is_causal)
+        # Detect calling convention
+        mha_mode = key is not None or value is not None
+        x = query
+
+        # Auto-detect packing format from shape
+        B = x.size(0)
+        last_dim = x.size(-1)
+        N, D = self.n, self.d_model
+
+        # Determine if we need to repack
+        # Channel-packed: [B, T, N*D] - last dim is N*D
+        # Sequence-packed: [B, N*T, D] - last dim is D (from MHA trace)
+        needs_repack = (last_dim == D) and (x.size(1) % N == 0)
+
+        if needs_repack:
+            # Sequence-packed [B, N*T, D] -> Channel-packed [B, T, N*D]
+            NT = x.size(1)
+            T = NT // N
+            x = x.view(B, N, T, D)
+            x = x.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+            x = x.view(B, T, N * D)  # [B, T, N*D]
         else:
-            return self._forward_sequential(x, attn_mask, is_causal)
+            T = x.size(1)
+
+        # Run attention
+        if self._use_fused:
+            out = self._forward_fused(x, attn_mask, is_causal)
+        else:
+            out = self._forward_sequential(x, attn_mask, is_causal)
+
+        # Repack output if needed
+        if needs_repack:
+            # Channel-packed [B, T, N*D] -> Sequence-packed [B, N*T, D]
+            out = out.view(B, T, N, D)
+            out = out.permute(0, 2, 1, 3).contiguous()  # [B, N, T, D]
+            out = out.view(B, N * T, D)  # [B, N*T, D]
+
+        # Return appropriate type
+        if mha_mode:
+            return out, None  # Match nn.MultiheadAttention signature
+        else:
+            return out
 
     def _forward_fused(
         self,
