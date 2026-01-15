@@ -36,14 +36,14 @@ class WideInstanceNorm1d(nn.Module):
     """
 
     def __init__(
-            self,
-            n: int,
-            num_features: int,
-            eps: float = 1e-5,
-            momentum: float = 0.1,
-            affine: bool = False,
-            track_running_stats: bool = False,
-            strategy: Union[str, InstanceNormStrategy] = 'auto',
+        self,
+        n: int,
+        num_features: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = False,
+        track_running_stats: bool = False,
+        strategy: Union[str, InstanceNormStrategy] = 'auto',
     ):
         super().__init__()
 
@@ -87,24 +87,41 @@ class WideInstanceNorm1d(nn.Module):
         return self._strategy
 
     def forward(self, x: Tensor) -> Tensor:
-        if self._use_fused:
-            return self.norm(x)
-        return self._forward_sequential(x)
+        """
+        Forward pass with N-first format.
 
-    def _forward_sequential(self, x: Tensor) -> Tensor:
+        Input:  [N, B, C, L]
+        Output: [N, B, C, L]
+        """
+        N, B, C, L = x.shape
+
+        # Convert N-first to channel-packed: [N, B, C, L] -> [B, N*C, L]
+        x = x.permute(1, 0, 2, 3).reshape(B, N * C, L)
+
+        if self._use_fused:
+            out = self.norm(x)
+        else:
+            out = self._forward_sequential_internal(x)
+
+        # Convert back: [B, N*C, L] -> [N, B, C, L]
+        out = out.view(B, N, C, L).permute(1, 0, 2, 3)
+        return out.contiguous()
+
+    def _forward_sequential_internal(self, x: Tensor) -> Tensor:
+        """Sequential on channel-packed input."""
         C = self.num_features
         outputs = []
         for i in range(self.n):
-            xi = x[:, i * C:(i + 1) * C]
+            xi = x[:, i*C:(i+1)*C]
             out_i = self.norms[i](xi)
             outputs.append(out_i)
         return torch.cat(outputs, dim=1)
 
     @classmethod
     def from_modules(
-            cls,
-            modules: List[nn.InstanceNorm1d],
-            strategy: Union[str, InstanceNormStrategy] = 'auto',
+        cls,
+        modules: List[nn.InstanceNorm1d],
+        strategy: Union[str, InstanceNormStrategy] = 'auto',
     ) -> 'WideInstanceNorm1d':
         n = len(modules)
         t = modules[0]
@@ -152,14 +169,14 @@ class WideInstanceNorm2d(nn.Module):
     """
 
     def __init__(
-            self,
-            n: int,
-            num_features: int,
-            eps: float = 1e-5,
-            momentum: float = 0.1,
-            affine: bool = False,
-            track_running_stats: bool = False,
-            strategy: Union[str, InstanceNormStrategy] = 'auto',
+        self,
+        n: int,
+        num_features: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = False,
+        track_running_stats: bool = False,
+        strategy: Union[str, InstanceNormStrategy] = 'auto',
     ):
         super().__init__()
 
@@ -203,24 +220,41 @@ class WideInstanceNorm2d(nn.Module):
         return self._strategy
 
     def forward(self, x: Tensor) -> Tensor:
-        if self._use_fused:
-            return self.norm(x)
-        return self._forward_sequential(x)
+        """
+        Forward pass with N-first format.
 
-    def _forward_sequential(self, x: Tensor) -> Tensor:
+        Input:  [N, B, C, H, W]
+        Output: [N, B, C, H, W]
+        """
+        N, B, C, H, W = x.shape
+
+        # Convert N-first to channel-packed: [N, B, C, H, W] -> [B, N*C, H, W]
+        x = x.permute(1, 0, 2, 3, 4).reshape(B, N * C, H, W)
+
+        if self._use_fused:
+            out = self.norm(x)
+        else:
+            out = self._forward_sequential_internal(x)
+
+        # Convert back: [B, N*C, H, W] -> [N, B, C, H, W]
+        out = out.view(B, N, C, H, W).permute(1, 0, 2, 3, 4)
+        return out.contiguous()
+
+    def _forward_sequential_internal(self, x: Tensor) -> Tensor:
+        """Sequential on channel-packed input."""
         C = self.num_features
         outputs = []
         for i in range(self.n):
-            xi = x[:, i * C:(i + 1) * C]
+            xi = x[:, i*C:(i+1)*C]
             out_i = self.norms[i](xi)
             outputs.append(out_i)
         return torch.cat(outputs, dim=1)
 
     @classmethod
     def from_modules(
-            cls,
-            modules: List[nn.InstanceNorm2d],
-            strategy: Union[str, InstanceNormStrategy] = 'auto',
+        cls,
+        modules: List[nn.InstanceNorm2d],
+        strategy: Union[str, InstanceNormStrategy] = 'auto',
     ) -> 'WideInstanceNorm2d':
         n = len(modules)
         t = modules[0]
@@ -379,7 +413,7 @@ class WideInstanceNorm2d(nn.Module):
     def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
         B, NC = output.shape[:2]
         C = NC // n
-        return [output[:, i * C:(i + 1) * C] for i in range(n)]
+        return [output[:, i*C:(i+1)*C] for i in range(n)]
 
 
 __all__ = ['WideInstanceNorm1d', 'WideInstanceNorm2d', 'InstanceNormStrategy']

@@ -38,16 +38,16 @@ class WideConv3d(nn.Module):
     """
 
     def __init__(
-            self,
-            n: int,
-            in_channels: int,
-            out_channels: int,
-            kernel_size: Union[int, Tuple[int, int, int]],
-            stride: Union[int, Tuple[int, int, int]] = 1,
-            padding: Union[int, Tuple[int, int, int]] = 0,
-            dilation: Union[int, Tuple[int, int, int]] = 1,
-            bias: bool = True,
-            strategy: Union[str, Conv3dStrategy] = 'auto',
+        self,
+        n: int,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: Union[int, Tuple[int, int, int]],
+        stride: Union[int, Tuple[int, int, int]] = 1,
+        padding: Union[int, Tuple[int, int, int]] = 0,
+        dilation: Union[int, Tuple[int, int, int]] = 1,
+        bias: bool = True,
+        strategy: Union[str, Conv3dStrategy] = 'auto',
     ):
         super().__init__()
 
@@ -101,26 +101,37 @@ class WideConv3d(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         """
-        Forward pass.
+        Forward pass with N-first format.
 
-        Args:
-            x: [B, N*C_in, D, H, W]
-
-        Returns:
-            [B, N*C_out, D', H', W']
+        Input:  [N, B, C_in, D, H, W]
+        Output: [N, B, C_out, D', H', W']
         """
-        if self._use_grouped:
-            return self.conv(x)
-        return self._forward_sequential(x)
+        N, B, C, D, H, W = x.shape
 
-    def _forward_sequential(self, x: Tensor) -> Tensor:
-        """N separate Conv3d calls."""
+        # Convert N-first to channel-packed: [N, B, C, D, H, W] -> [B, N*C, D, H, W]
+        x = x.permute(1, 0, 2, 3, 4, 5).reshape(B, N * C, D, H, W)
+
+        # Run conv in channel-packed format
+        if self._use_grouped:
+            out = self.conv(x)
+        else:
+            out = self._forward_sequential_internal(x)
+
+        # Convert back to N-first: [B, N*C_out, D', H', W'] -> [N, B, C_out, D', H', W']
+        B, NC_out, D_out, H_out, W_out = out.shape
+        C_out = NC_out // N
+        out = out.view(B, N, C_out, D_out, H_out, W_out).permute(1, 0, 2, 3, 4, 5)
+
+        return out.contiguous()
+
+    def _forward_sequential_internal(self, x: Tensor) -> Tensor:
+        """N separate Conv3d calls on channel-packed input."""
         B, NC, D, H, W = x.shape
         C_in = self.in_channels
 
         outputs = []
         for i in range(self.n):
-            xi = x[:, i * C_in:(i + 1) * C_in]  # [B, C_in, D, H, W]
+            xi = x[:, i*C_in:(i+1)*C_in]  # [B, C_in, D, H, W]
             out_i = self.convs[i](xi)
             outputs.append(out_i)
 
@@ -128,9 +139,9 @@ class WideConv3d(nn.Module):
 
     @classmethod
     def from_modules(
-            cls,
-            modules: List[nn.Conv3d],
-            strategy: Union[str, Conv3dStrategy] = 'auto',
+        cls,
+        modules: List[nn.Conv3d],
+        strategy: Union[str, Conv3dStrategy] = 'auto',
     ) -> 'WideConv3d':
         """Create from N existing Conv3d modules."""
         n = len(modules)
@@ -301,7 +312,7 @@ class WideConv3d(nn.Module):
     def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
         B, NC, D, H, W = output.shape
         C = NC // n
-        return [output[:, i * C:(i + 1) * C] for i in range(n)]
+        return [output[:, i*C:(i+1)*C] for i in range(n)]
 
 
 __all__ = ['WideConv3d', 'Conv3dStrategy']

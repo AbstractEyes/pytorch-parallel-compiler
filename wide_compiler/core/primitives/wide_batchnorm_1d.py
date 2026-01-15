@@ -30,13 +30,13 @@ class WideBatchNorm1d(nn.Module):
     """
 
     def __init__(
-            self,
-            n: int,
-            num_features: int,
-            eps: float = 1e-5,
-            momentum: float = 0.1,
-            affine: bool = True,
-            track_running_stats: bool = True,
+        self,
+        n: int,
+        num_features: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        track_running_stats: bool = True,
     ):
         super().__init__()
         self.n = n
@@ -51,7 +51,26 @@ class WideBatchNorm1d(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.op(x)
+        """
+        Forward pass with N-first format.
+
+        Input:  [N, B, C] or [N, B, C, L]
+        Output: [N, B, C] or [N, B, C, L]
+        """
+        if x.dim() == 3:
+            # [N, B, C] case
+            N, B, C = x.shape
+            x = x.permute(1, 0, 2).reshape(B, N * C)
+            out = self.op(x)
+            out = out.view(B, N, C).permute(1, 0, 2)
+        else:
+            # [N, B, C, L] case
+            N, B, C, L = x.shape
+            x = x.permute(1, 0, 2, 3).reshape(B, N * C, L)
+            out = self.op(x)
+            out = out.view(B, N, C, L).permute(1, 0, 2, 3)
+
+        return out.contiguous()
 
     @classmethod
     def from_modules(cls, modules: List[nn.BatchNorm1d]) -> 'WideBatchNorm1d':

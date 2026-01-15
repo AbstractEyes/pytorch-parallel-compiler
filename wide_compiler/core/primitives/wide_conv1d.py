@@ -112,13 +112,32 @@ class WideConv1d(nn.Module):
                 nn.init.uniform_(self.bias[i], -bound, bound)
 
     def forward(self, x: Tensor) -> Tensor:
-        if self.strategy == Conv1dStrategy.GROUPED:
-            return self.op(x)
-        else:
-            return self._forward_sequential(x)
+        """
+        Forward pass with N-first format.
 
-    def _forward_sequential(self, x: Tensor) -> Tensor:
-        """Sequential forward: loop over N convolutions."""
+        Input:  [N, B, C_in, L]
+        Output: [N, B, C_out, L_out]
+        """
+        N, B, C, L = x.shape
+
+        # Convert N-first to channel-packed: [N, B, C, L] -> [B, N*C, L]
+        x = x.permute(1, 0, 2, 3).reshape(B, N * C, L)
+
+        # Run conv in channel-packed format
+        if self.strategy == Conv1dStrategy.GROUPED:
+            out = self.op(x)
+        else:
+            out = self._forward_sequential_internal(x)
+
+        # Convert back to N-first: [B, N*C_out, L_out] -> [N, B, C_out, L_out]
+        B, NC_out, L_out = out.shape
+        C_out = NC_out // N
+        out = out.view(B, N, C_out, L_out).permute(1, 0, 2, 3)
+
+        return out.contiguous()
+
+    def _forward_sequential_internal(self, x: Tensor) -> Tensor:
+        """Sequential forward on channel-packed input."""
         B, NC, L = x.shape
         C_in = self.in_channels
         C_out = self.out_channels

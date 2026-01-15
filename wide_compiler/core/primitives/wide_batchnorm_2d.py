@@ -30,13 +30,13 @@ class WideBatchNorm2d(nn.Module):
     """
 
     def __init__(
-            self,
-            n: int,
-            num_features: int,
-            eps: float = 1e-5,
-            momentum: float = 0.1,
-            affine: bool = True,
-            track_running_stats: bool = True,
+        self,
+        n: int,
+        num_features: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        track_running_stats: bool = True,
     ):
         super().__init__()
         self.n = n
@@ -51,7 +51,24 @@ class WideBatchNorm2d(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.op(x)
+        """
+        Forward pass with N-first format.
+
+        Input:  [N, B, C, H, W]
+        Output: [N, B, C, H, W]
+        """
+        N, B, C, H, W = x.shape
+
+        # Convert N-first to channel-packed: [N, B, C, H, W] -> [B, N*C, H, W]
+        x = x.permute(1, 0, 2, 3, 4).reshape(B, N * C, H, W)
+
+        # Run batchnorm
+        out = self.op(x)
+
+        # Convert back to N-first: [B, N*C, H, W] -> [N, B, C, H, W]
+        out = out.view(B, N, C, H, W).permute(1, 0, 2, 3, 4)
+
+        return out.contiguous()
 
     @classmethod
     def from_modules(cls, modules: List[nn.BatchNorm2d]) -> 'WideBatchNorm2d':
@@ -200,8 +217,7 @@ class WideBatchNorm2d(nn.Module):
         return nn.BatchNorm2d(channels)
 
     @staticmethod
-    def _bench_input(n: int, batch_sizes: int, channels: int, heights: int, widths: int, device: str = 'cpu',
-                     **_) -> Tensor:
+    def _bench_input(n: int, batch_sizes: int, channels: int, heights: int, widths: int, device: str = 'cpu', **_) -> Tensor:
         """Create single input tensor."""
         return torch.randn(batch_sizes, channels, heights, widths, device=device)
 

@@ -39,13 +39,13 @@ class WideGroupNorm(nn.Module):
     """
 
     def __init__(
-            self,
-            n: int,
-            num_groups: int,
-            num_channels: int,
-            eps: float = 1e-5,
-            affine: bool = True,
-            strategy: Union[str, GroupNormStrategy] = 'auto',
+        self,
+        n: int,
+        num_groups: int,
+        num_channels: int,
+        eps: float = 1e-5,
+        affine: bool = True,
+        strategy: Union[str, GroupNormStrategy] = 'auto',
     ):
         super().__init__()
 
@@ -89,20 +89,35 @@ class WideGroupNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         """
-        Forward pass.
+        Forward pass with N-first format.
 
-        Args:
-            x: [B, N*C, ...] any number of spatial dimensions
-
-        Returns:
-            [B, N*C, ...] normalized output
+        Input:  [N, B, C, ...] any number of spatial dimensions
+        Output: [N, B, C, ...]
         """
-        if self._use_fused:
-            return self.norm(x)
-        return self._forward_sequential(x)
+        N = x.shape[0]
+        B = x.shape[1]
+        C = x.shape[2]
+        spatial = x.shape[3:]
 
-    def _forward_sequential(self, x: Tensor) -> Tensor:
-        """N separate GroupNorm calls."""
+        # Convert N-first to channel-packed
+        # [N, B, C, ...] -> [B, N, C, ...] -> [B, N*C, ...]
+        x = x.permute(1, 0, 2, *range(3, x.dim()))
+        x = x.reshape(B, N * C, *spatial)
+
+        # Run groupnorm
+        if self._use_fused:
+            out = self.norm(x)
+        else:
+            out = self._forward_sequential_internal(x)
+
+        # Convert back: [B, N*C, ...] -> [N, B, C, ...]
+        out = out.view(B, N, C, *spatial)
+        out = out.permute(1, 0, 2, *range(3, out.dim()))
+
+        return out.contiguous()
+
+    def _forward_sequential_internal(self, x: Tensor) -> Tensor:
+        """N separate GroupNorm calls on channel-packed input."""
         C = self.num_channels
         shape = x.shape
         B = shape[0]
@@ -110,7 +125,7 @@ class WideGroupNorm(nn.Module):
 
         outputs = []
         for i in range(self.n):
-            xi = x[:, i * C:(i + 1) * C]  # [B, C, ...]
+            xi = x[:, i*C:(i+1)*C]  # [B, C, ...]
             out_i = self.norms[i](xi)
             outputs.append(out_i)
 
@@ -118,9 +133,9 @@ class WideGroupNorm(nn.Module):
 
     @classmethod
     def from_modules(
-            cls,
-            modules: List[nn.GroupNorm],
-            strategy: Union[str, GroupNormStrategy] = 'auto',
+        cls,
+        modules: List[nn.GroupNorm],
+        strategy: Union[str, GroupNormStrategy] = 'auto',
     ) -> 'WideGroupNorm':
         """Create from N existing GroupNorm modules."""
         n = len(modules)
@@ -288,7 +303,7 @@ class WideGroupNorm(nn.Module):
     def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
         B, NC = output.shape[:2]
         C = NC // n
-        return [output[:, i * C:(i + 1) * C] for i in range(n)]
+        return [output[:, i*C:(i+1)*C] for i in range(n)]
 
 
 __all__ = ['WideGroupNorm', 'GroupNormStrategy']
