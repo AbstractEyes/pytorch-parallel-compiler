@@ -420,7 +420,7 @@ class WideGRU(nn.Module):
                 hidden_sizes=[128],
             ),
             'quick': SweepParams(
-                n_values=[8, 16, 32],
+                n_values=[2, 3, 4, 5, 6, 7, 8],
                 batch_sizes=[8],
                 seq_lengths=[32],
                 d_model=[64],
