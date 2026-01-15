@@ -10,7 +10,7 @@ Usage:
     python -m wide_compiler benchmark gru -c reduce-overhead
     python -m wide_compiler benchmark linear -p full -c
 
-    # Legacy model benchmark
+    # Benchmark TracedWideModel with sample models
     python -m wide_compiler benchmark mlp --n 100
     python -m wide_compiler benchmark resblock --n 50 -c
 
@@ -204,31 +204,31 @@ def cmd_trace(args):
 
 
 def cmd_benchmark(args):
-    """Benchmark Wide primitives or legacy models."""
+    """Benchmark Wide primitives or TracedWideModel."""
     device = 'cuda' if torch.cuda.is_available() and not args.cpu else 'cpu'
 
-    # Check if this is a primitive benchmark or legacy model benchmark
+    # Check if this is a primitive benchmark or TracedWideModel benchmark
     primitive = args.primitive
     PRIMITIVES = ['gru', 'lstm', 'linear', 'conv2d', 'attention', 'conv1d', 'embedding']
 
-    # If primitive is a known primitive OR no legacy --model flag, use primitive mode
+    # If primitive is a known primitive, use primitive benchmark mode
     if primitive in PRIMITIVES:
         return cmd_benchmark_primitive(args, device)
 
-    # Legacy mode: use --model or primitive as model name
+    # TracedWideModel mode: use --model or primitive as model name
     model_name = args.model or primitive or 'mlp'
     if model_name not in MODELS:
         # Maybe they meant a primitive?
         if primitive:
             print(f"Unknown primitive or model: {primitive}")
             print(f"Primitives: {', '.join(PRIMITIVES)}")
-            print(f"Legacy models: {', '.join(MODELS.keys())}")
+            print(f"Sample models: {', '.join(MODELS.keys())}")
         else:
             print(f"Unknown model: {model_name}")
             print(f"Available: {', '.join(MODELS.keys())}")
         return 1
 
-    return cmd_benchmark_legacy(args, model_name, device)
+    return cmd_benchmark_traced(args, model_name, device)
 
 
 def cmd_benchmark_primitive(args, device: str):
@@ -329,13 +329,13 @@ def cmd_benchmark_primitive(args, device: str):
     return 0
 
 
-def cmd_benchmark_legacy(args, model_name: str, device: str):
-    """Legacy benchmark mode for sample models (MLP, ResBlock, etc.)."""
+def cmd_benchmark_traced(args, model_name: str, device: str):
+    """Benchmark TracedWideModel with sample models (MLP, ResBlock, etc.)."""
     model_cls, sample_fn = MODELS[model_name]
     N = args.n or 100
     B = args.batch
 
-    print(f"Benchmark: {model_name} (legacy mode)")
+    print(f"Benchmark: {model_name} (TracedWideModel)")
     print(f"Device: {device}")
     print(f"N models: {N}")
     print(f"Batch size: {B}")
@@ -494,7 +494,7 @@ def cmd_info(args):
     print("  python -m wide_compiler benchmark gru -p quick        # eager")
     print("  python -m wide_compiler benchmark gru -p quick -c     # compiled (default)")
     print("  python -m wide_compiler benchmark gru -c reduce-overhead")
-    print("  python -m wide_compiler benchmark mlp --n 100 -c      # legacy mode")
+    print("  python -m wide_compiler benchmark mlp --n 100 -c      # TracedWideModel")
     print()
     print("GitHub: https://github.com/AbstractEyes/wide-compiler")
     return 0
@@ -523,13 +523,13 @@ def main():
     # benchmark <primitive> - NEW: benchmark Wide primitives with compilation
     bench_parser = subparsers.add_parser('benchmark', help='Benchmark Wide primitives')
     bench_parser.add_argument('primitive', nargs='?', default=None,
-                              help='Primitive to benchmark (gru, lstm, linear, conv2d, attention) or legacy model name')
+                              help='Primitive (gru, lstm, linear, conv2d, attention) or sample model (mlp, resblock, convnet)')
     bench_parser.add_argument('-p', '--preset', default='quick', help='Preset (quick, ci, full)')
     bench_parser.add_argument('-c', '--compile', nargs='?', const='default', default='eager',
                               choices=['default', 'eager', 'reduce-overhead', 'max-autotune'],
                               help='Compilation mode. -c alone uses default, or specify mode.')
-    bench_parser.add_argument('--model', '-m', default=None, help='Legacy: model name (mlp, resblock, etc.)')
-    bench_parser.add_argument('--n', type=int, default=None, help='Number of models (legacy mode)')
+    bench_parser.add_argument('--model', '-m', default=None, help='Sample model name (mlp, resblock, convnet, deep_mlp)')
+    bench_parser.add_argument('--n', type=int, default=None, help='Number of models for TracedWideModel')
     bench_parser.add_argument('--batch', '-b', type=int, default=32, help='Batch size')
     bench_parser.add_argument('--iters', '-i', type=int, default=100, help='Iterations')
     bench_parser.add_argument('--warmup', '-w', type=int, default=3, help='Warmup iterations')
