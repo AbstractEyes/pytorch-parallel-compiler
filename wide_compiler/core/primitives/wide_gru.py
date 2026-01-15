@@ -8,9 +8,9 @@ The hidden-to-hidden projection must still be sequential (h_t depends on h_{t-1}
 but input projection (~50% of compute) can be fully parallelized.
 
 Fusion strategy (einsum):
-- Input projection: einsum('bti,nio->btno', x, W_ih) fuses N matmuls
+- Input projection: einsum('nbti,ngi->nbtg', x, W_ih) fuses N matmuls
 - Hidden projection: per-timestep loop (unavoidable due to recurrence)
-- Gates: elementwise ops on [B, T, N, 3H]
+- Gates: elementwise ops on [N, B, T, 3H]
 
 Performance characteristics:
 - Scales well with N (3-8x speedup observed at N=8-32)
@@ -20,6 +20,11 @@ Performance characteristics:
 Strategies:
 - 'fused': Pre-compute input projections via einsum (FASTEST)
 - 'sequential': N separate GRU calls (baseline)
+
+Input/Output Format (v0.6.0):
+- Input:  [N, B, T, input_size]  (N-first)
+- Output: [N, B, T, hidden_size] (N-first)
+- h_n:    [N, B, hidden_size]    (N-first)
 
 Copyright 2025 AbstractPhil
 Apache 2.0 License
@@ -43,8 +48,9 @@ class WideGRU(nn.Module):
     """
     N parallel GRU modules with fused input projections.
 
-    Input shape:  [B, T, N*input_size] if batch_first else [T, B, N*input_size]
-    Output shape: [B, T, N*hidden_size] if batch_first else [T, B, N*hidden_size]
+    Input shape:  [N, B, T, input_size]
+    Output shape: [N, B, T, hidden_size]
+    Hidden shape: [N, B, hidden_size]
 
     Strategies:
         'fused': Pre-compute all input projections, fused recurrence
@@ -318,11 +324,11 @@ class WideGRU(nn.Module):
         atol: float = 1e-5,
     ) -> Tuple[bool, str]:
         """
-        Validate wide outputs match concatenated baseline outputs.
+        Validate wide outputs match stacked baseline outputs.
 
         Args:
-            wide_out: (output, h_n) from WideGRU
-            baseline_outs: List of (output, h_n) from N individual GRUs
+            wide_out: (output, h_n) from WideGRU - [N, B, T, H] format
+            baseline_outs: List of (output, h_n) from N individual GRUs - [B, T, H] each
             rtol: Relative tolerance
             atol: Absolute tolerance
 
@@ -331,9 +337,9 @@ class WideGRU(nn.Module):
         """
         wide_output, wide_hn = wide_out
 
-        # Concatenate baseline outputs
-        baseline_output = torch.cat([o[0] for o in baseline_outs], dim=-1)
-        baseline_hn = torch.cat([o[1] for o in baseline_outs], dim=-1)
+        # Stack baseline outputs: N x [B, T, H] -> [N, B, T, H]
+        baseline_output = torch.stack([o[0] for o in baseline_outs], dim=0)
+        baseline_hn = torch.stack([o[1].squeeze(0) for o in baseline_outs], dim=0)
 
         # Check shapes
         if wide_output.shape != baseline_output.shape:
@@ -478,10 +484,12 @@ class WideGRU(nn.Module):
 
     @staticmethod
     def _bench_input(n: int, batch_sizes: int, seq_lengths: int, d_model: int, device: str = 'cpu', **_) -> Tensor:
+        """Create single input tensor for one model: [B, T, D]."""
         return torch.randn(batch_sizes, seq_lengths, d_model, device=device)
 
     @classmethod
     def _bench_wide(cls, modules: List[nn.Module], strategy: str) -> 'WideGRU':
+        """Create WideGRU from list of GRUWrapper modules."""
         strat_map = {
             'fused': GRUStrategy.FUSED,
             'sequential': GRUStrategy.SEQUENTIAL,
@@ -492,14 +500,15 @@ class WideGRU(nn.Module):
 
     @staticmethod
     def _bench_pack(inputs: List[Tensor]) -> Tensor:
-        return torch.cat(inputs, dim=-1)
+        """Pack N inputs into N-first format: [N, B, T, D]."""
+        return torch.stack(inputs, dim=0)
 
     @staticmethod
     def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
+        """Unpack N-first output to list of [B, T, H]."""
         if isinstance(output, tuple):
             output = output[0]
-        chunks = output.shape[-1] // n
-        return [output[..., i*chunks:(i+1)*chunks] for i in range(n)]
+        return [output[i] for i in range(n)]
 
     @staticmethod
     def _bench_validate(
@@ -508,21 +517,27 @@ class WideGRU(nn.Module):
         rtol: float = 1e-3,
         atol: float = 1e-3,
     ) -> Tuple[bool, str]:
-        """Validate wide output matches concatenated baseline.
+        """
+        Validate wide output matches stacked baseline outputs.
 
         Note: RNNs accumulate numerical differences over timesteps,
         so we use relaxed tolerances (1e-3 vs 1e-5 for feedforward).
+
+        Args:
+            wide_output: [N, B, T, H] from WideGRU
+            baseline_outputs: List of N x [B, T, H] from individual GRUs
         """
         if isinstance(wide_output, tuple):
             wide_output = wide_output[0]
 
-        baseline_concat = torch.cat(baseline_outputs, dim=-1)
+        # Stack baseline: N x [B, T, H] -> [N, B, T, H]
+        baseline_stacked = torch.stack(baseline_outputs, dim=0)
 
-        if wide_output.shape != baseline_concat.shape:
-            return False, f"Shape mismatch: {wide_output.shape} vs {baseline_concat.shape}"
+        if wide_output.shape != baseline_stacked.shape:
+            return False, f"Shape mismatch: {wide_output.shape} vs {baseline_stacked.shape}"
 
-        if not torch.allclose(wide_output, baseline_concat, rtol=rtol, atol=atol):
-            diff = (wide_output - baseline_concat).abs()
+        if not torch.allclose(wide_output, baseline_stacked, rtol=rtol, atol=atol):
+            diff = (wide_output - baseline_stacked).abs()
             max_diff = diff.max().item()
             mean_diff = diff.mean().item()
             return False, f"Value mismatch: max={max_diff:.6f}, mean={mean_diff:.6f}"
