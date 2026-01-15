@@ -8,6 +8,30 @@ Forward uses dict-based value lookup which compiles cleanly (0 graph breaks).
 All string ops, isinstance checks, and per-stage allocations are traced through
 by torch.compile without issue.
 
+PACKING CONVENTION:
+    TracedWideModel uses channel-packing: input [B, D] becomes [B, N*D].
+    All Wide primitives (WideLinear, WideConv2d, etc.) expect this convention.
+
+LIMITATIONS:
+    Models with data-dependent reshapes (e.g., `x.view(B, H, W, C)`) will fail
+    because the packed tensor has N*D elements, not D. Supported patterns:
+
+    ✓ MLPs (Linear → activation → Linear)
+    ✓ CNNs (Conv2d → BatchNorm → ReLU → Pool)
+    ✓ Transformers WITHOUT explicit reshapes in forward()
+
+    ✗ ViT with `x.view(B, num_patches, patch_dim)` - patch dim changes with N
+    ✗ Any model using `.view()` or `.reshape()` with hardcoded dimensions
+
+    For models with reshapes, use manual Wide construction with einsum (see demos).
+
+ATTENTION HANDLING:
+    WideAttention auto-detects input format and handles both conventions:
+    - Direct call: [B, T, N*D] channel-packed → returns Tensor
+    - MHA trace: [B, N*T, D] sequence-packed → auto-repacks, returns Tuple
+
+    No wrapper needed - WideAttention handles repacking internally.
+
 FUTURE OPTIMIZATION:
     Yield-tree execution (pre-compiled index-based plan with generator traversal)
     showed ~7% eager speedup in prototyping. The pattern:
