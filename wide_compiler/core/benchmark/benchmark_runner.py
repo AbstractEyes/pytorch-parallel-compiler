@@ -132,24 +132,17 @@ def run_single(
             validation_msg="OK",
         )
 
-    # Build wide model with strategy
+    # Build wide model with strategy (uncompiled first for validation)
     wide_model = job.wide_factory(models, strategy).to(device).eval()
-
-    # Compile wide model if compilation enabled
-    if compiled:
-        wide_model = compile_fn(wide_model)
-
     packed = job.pack_fn(inputs)
 
-    # Run validation if requested and validate_fn exists (use uncompiled wide for validation)
+    # Run validation BEFORE compilation
     is_valid = True
     validation_msg = "OK"
 
     if validate and hasattr(job, 'validate_fn') and job.validate_fn is not None:
-        # Create uncompiled wide for validation to avoid compile overhead
-        wide_for_val = job.wide_factory(models, strategy).to(device).eval()
         with torch.no_grad():
-            wide_output = wide_for_val(packed)
+            wide_output = wide_model(packed)
 
         is_valid, validation_msg = job.validate_fn(wide_output, baseline_outputs)
 
@@ -166,6 +159,10 @@ def run_single(
                 valid=False,
                 validation_msg=validation_msg,
             )
+
+    # Compile wide model AFTER validation passes
+    if compiled:
+        wide_model = compile_fn(wide_model)
 
     def wide_fn():
         wide_model(packed)
@@ -236,7 +233,8 @@ def run(
 
     if verbose:
         mode_str = "compiled" if compiled else "eager"
-        print(f"Running {job.name}: {total_configs} configs ({mode_str})")
+        val_str = "" if validate else " (validation disabled)"
+        print(f"Running {job.name}: {total_configs} configs ({mode_str}){val_str}")
 
     for n in sweep.n_values:
         if verbose:
@@ -279,7 +277,9 @@ def run(
             if non_baseline:
                 best = max(non_baseline, key=lambda r: r.speedup)
                 status = f"→ {best.speedup:.2f}x ({best.strategy})"
-                if invalid:
+                if validate and not invalid:
+                    status += " ✓"  # Validation passed
+                elif invalid:
                     status += f" [{len(invalid)} invalid]"
                 print(status)
             elif invalid:
