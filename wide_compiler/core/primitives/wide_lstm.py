@@ -1,14 +1,15 @@
 """
 WideLSTM - N parallel LSTM layers fused into a single module.
 
-Key insight: Batch N sequences together, process with N separate LSTMs
-in parallel, concatenate outputs.
+Fusion strategy: Block-diagonal weight matrices allow N separate LSTMs
+to be computed with a single large matmul instead of N small ones.
 
-Strategies:
-- 'fused': Process all N via ModuleList (cleaner, same perf)
-- 'sequential': N separate LSTM calls (baseline)
+For N LSTMs with input [B, T, N*I]:
+- Input projection:  [B, T, N*I] @ [N*I, N*4H] -> [B, T, N*4H]
+- Hidden projection: [B, N*H] @ [N*H, N*4H] -> [B, N*4H]
+- Gates: elementwise ops on [B, N*4H] - trivially parallel
 
-Expected speedup: 2-6x depending on N and sequence length.
+Expected speedup: 2-6x depending on N and hardware.
 
 Copyright 2025 AbstractPhil
 Apache 2.0 License
@@ -19,6 +20,7 @@ from enum import Enum
 
 import torch
 from torch import nn, Tensor
+import torch.nn.functional as F
 
 
 class LSTMStrategy(Enum):
@@ -29,14 +31,15 @@ class LSTMStrategy(Enum):
 
 class WideLSTM(nn.Module):
     """
-    N parallel LSTM modules fused into single operations.
+    N parallel LSTM modules fused via block-diagonal weight matrices.
 
-    Input shape:  [B, T, N*input_size] or [T, B, N*input_size]
-    Output shape: [B, T, N*hidden_size] or [T, B, N*hidden_size], (h_n, c_n)
+    Input shape:  [B, T, N*input_size] (batch_first=True)
+    Output shape: [B, T, N*hidden_size], (h_n, c_n)
 
-    Strategies:
-        'fused': Process all N via optimized batching
-        'sequential': N separate LSTM computations
+    Weight layout:
+        weight_ih: [N*4*H, N*I] block-diagonal
+        weight_hh: [N*4*H, N*H] block-diagonal
+        bias: [N*4*H]
     """
 
     def __init__(
@@ -53,6 +56,13 @@ class WideLSTM(nn.Module):
     ):
         super().__init__()
 
+        if num_layers != 1:
+            raise NotImplementedError("WideLSTM currently only supports num_layers=1")
+        if bidirectional:
+            raise NotImplementedError("WideLSTM currently only supports bidirectional=False")
+        if not batch_first:
+            raise NotImplementedError("WideLSTM currently only supports batch_first=True")
+
         self.n = n
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -61,7 +71,6 @@ class WideLSTM(nn.Module):
         self.batch_first = batch_first
         self.dropout = dropout
         self.bidirectional = bidirectional
-        self.num_directions = 2 if bidirectional else 1
 
         if isinstance(strategy, str):
             strategy = LSTMStrategy(strategy)
@@ -69,21 +78,43 @@ class WideLSTM(nn.Module):
             strategy = LSTMStrategy.FUSED
 
         self._strategy = strategy
-        self._use_fused = (strategy == LSTMStrategy.FUSED)
 
-        # Create N separate LSTMs
-        self.lstms = nn.ModuleList([
-            nn.LSTM(
-                input_size=input_size,
-                hidden_size=hidden_size,
-                num_layers=num_layers,
-                bias=bias,
-                batch_first=batch_first,
-                dropout=dropout,
-                bidirectional=bidirectional,
-            )
-            for _ in range(n)
-        ])
+        # Fused weights: block-diagonal structure
+        # weight_ih: [N*4H, N*I] with N blocks of [4H, I] on diagonal
+        # weight_hh: [N*4H, N*H] with N blocks of [4H, H] on diagonal
+        I, H, N = input_size, hidden_size, n
+
+        self.weight_ih = nn.Parameter(torch.empty(N * 4 * H, N * I))
+        self.weight_hh = nn.Parameter(torch.empty(N * 4 * H, N * H))
+
+        if bias:
+            self.bias_ih = nn.Parameter(torch.empty(N * 4 * H))
+            self.bias_hh = nn.Parameter(torch.empty(N * 4 * H))
+        else:
+            self.register_parameter('bias_ih', None)
+            self.register_parameter('bias_hh', None)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize with block-diagonal structure (zeros off-diagonal)."""
+        I, H, N = self.input_size, self.hidden_size, self.n
+
+        # Initialize to zeros (ensures block-diagonal structure)
+        nn.init.zeros_(self.weight_ih)
+        nn.init.zeros_(self.weight_hh)
+
+        # Initialize each block with standard LSTM init
+        stdv = 1.0 / (H ** 0.5)
+        for i in range(N):
+            # weight_ih block [i]: rows [i*4H : (i+1)*4H], cols [i*I : (i+1)*I]
+            self.weight_ih.data[i*4*H:(i+1)*4*H, i*I:(i+1)*I].uniform_(-stdv, stdv)
+            # weight_hh block [i]: rows [i*4H : (i+1)*4H], cols [i*H : (i+1)*H]
+            self.weight_hh.data[i*4*H:(i+1)*4*H, i*H:(i+1)*H].uniform_(-stdv, stdv)
+
+        if self.bias:
+            nn.init.zeros_(self.bias_ih)
+            nn.init.zeros_(self.bias_hh)
 
     @property
     def strategy(self) -> LSTMStrategy:
@@ -98,94 +129,91 @@ class WideLSTM(nn.Module):
         Forward pass.
 
         Args:
-            x: [B, T, N*input_size] if batch_first else [T, B, N*input_size]
-            hx: Optional (h_0, c_0) each [num_layers*num_dir, B, N*hidden_size]
+            x: [B, T, N*input_size]
+            hx: Optional (h_0, c_0) each [1, B, N*hidden_size]
 
         Returns:
-            output: [B, T, N*hidden_size*num_dir] or [T, B, ...]
-            (h_n, c_n): each [num_layers*num_dir, B, N*hidden_size]
+            output: [B, T, N*hidden_size]
+            (h_n, c_n): each [1, B, N*hidden_size]
         """
-        if self._use_fused:
-            return self._forward_fused(x, hx)
-        else:
+        if self._strategy == LSTMStrategy.SEQUENTIAL:
             return self._forward_sequential(x, hx)
+        else:
+            return self._forward_fused(x, hx)
 
     def _forward_fused(
         self,
         x: Tensor,
         hx: Optional[Tuple[Tensor, Tensor]],
     ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
-        """Fused: process all N in parallel."""
-        N = self.n
-        H = self.hidden_size
-        D = self.num_directions
-        L = self.num_layers
+        """Fused forward: block-diagonal matmuls + sequential timesteps."""
+        B, T, _ = x.shape
+        N, H = self.n, self.hidden_size
 
-        if self.batch_first:
-            B, T, NI = x.shape
-            x_split = x.view(B, T, N, -1).permute(2, 0, 1, 3)
-        else:
-            T, B, NI = x.shape
-            x_split = x.view(T, B, N, -1).permute(2, 0, 1, 3)
-
-        # Split hidden states if provided
+        # Initialize hidden states
         if hx is not None:
-            h_0, c_0 = hx
-            h_split = h_0.view(L * D, B, N, H).permute(2, 0, 1, 3)
-            c_split = c_0.view(L * D, B, N, H).permute(2, 0, 1, 3)
+            h_t = hx[0].squeeze(0)  # [B, N*H]
+            c_t = hx[1].squeeze(0)  # [B, N*H]
         else:
-            h_split = [None] * N
-            c_split = [None] * N
+            h_t = x.new_zeros(B, N * H)
+            c_t = x.new_zeros(B, N * H)
+
+        # Precompute input projections for all timesteps: [B, T, N*4H]
+        # This is the key optimization - one big matmul instead of T*N small ones
+        gates_x = F.linear(x, self.weight_ih, self.bias_ih)  # [B, T, N*4H]
 
         outputs = []
-        h_ns = []
-        c_ns = []
 
-        for i in range(N):
-            xi = x_split[i]
-            if hx is not None:
-                hi = (h_split[i].contiguous(), c_split[i].contiguous())
-            else:
-                hi = None
-            out_i, (h_n_i, c_n_i) = self.lstms[i](xi, hi)
-            outputs.append(out_i)
-            h_ns.append(h_n_i)
-            c_ns.append(c_n_i)
+        for t in range(T):
+            # Hidden projection: [B, N*H] @ [N*H, N*4H].T -> [B, N*4H]
+            gates_h = F.linear(h_t, self.weight_hh, self.bias_hh)
 
-        # Concatenate outputs
-        if self.batch_first:
-            output = torch.cat(outputs, dim=-1)
-        else:
-            output = torch.cat(outputs, dim=-1)
+            # Combined gates: [B, N*4H]
+            gates = gates_x[:, t, :] + gates_h
 
-        h_n = torch.cat(h_ns, dim=-1)
-        c_n = torch.cat(c_ns, dim=-1)
+            # Split into 4 gates: each [B, N*H]
+            # PyTorch LSTM order: i, f, g, o
+            i_gate, f_gate, g_gate, o_gate = gates.chunk(4, dim=-1)
 
-        return output, (h_n, c_n)
+            # Apply activations
+            i_t = torch.sigmoid(i_gate)
+            f_t = torch.sigmoid(f_gate)
+            g_t = torch.tanh(g_gate)
+            o_t = torch.sigmoid(o_gate)
+
+            # Cell state update
+            c_t = f_t * c_t + i_t * g_t
+
+            # Hidden state
+            h_t = o_t * torch.tanh(c_t)
+
+            outputs.append(h_t)
+
+        # Stack outputs: [B, T, N*H]
+        output = torch.stack(outputs, dim=1)
+
+        # Return with layer dimension: [1, B, N*H]
+        return output, (h_t.unsqueeze(0), c_t.unsqueeze(0))
 
     def _forward_sequential(
         self,
         x: Tensor,
         hx: Optional[Tuple[Tensor, Tensor]],
     ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
-        """Sequential: N separate LSTM calls."""
-        N = self.n
-        H = self.hidden_size
-        I = self.input_size
-        D = self.num_directions
-        L = self.num_layers
+        """Sequential forward: process each of N LSTMs separately (for validation)."""
+        B, T, _ = x.shape
+        N, I, H = self.n, self.input_size, self.hidden_size
 
-        if self.batch_first:
-            B, T, _ = x.shape
-            x_chunks = x.view(B, T, N, I).unbind(dim=2)
-        else:
-            T, B, _ = x.shape
-            x_chunks = x.view(T, B, N, I).unbind(dim=2)
+        # Split input: [B, T, N*I] -> list of [B, T, I]
+        x_chunks = x.view(B, T, N, I).unbind(dim=2)
 
+        # Split hidden states if provided
         if hx is not None:
             h_0, c_0 = hx
-            h_chunks = h_0.view(L * D, B, N, H).unbind(dim=2)
-            c_chunks = c_0.view(L * D, B, N, H).unbind(dim=2)
+            h_0 = h_0.squeeze(0)  # [B, N*H]
+            c_0 = c_0.squeeze(0)
+            h_chunks = h_0.view(B, N, H).unbind(dim=1)
+            c_chunks = c_0.view(B, N, H).unbind(dim=1)
         else:
             h_chunks = [None] * N
             c_chunks = [None] * N
@@ -194,19 +222,43 @@ class WideLSTM(nn.Module):
         h_ns = []
         c_ns = []
 
-        for i, xi in enumerate(x_chunks):
-            if hx is not None:
-                hi = (h_chunks[i].contiguous(), c_chunks[i].contiguous())
-            else:
-                hi = None
-            out_i, (h_n_i, c_n_i) = self.lstms[i](xi, hi)
-            outputs.append(out_i)
-            h_ns.append(h_n_i)
-            c_ns.append(c_n_i)
+        for i in range(N):
+            # Extract block weights for this LSTM
+            w_ih = self.weight_ih[i*4*H:(i+1)*4*H, i*I:(i+1)*I]  # [4H, I]
+            w_hh = self.weight_hh[i*4*H:(i+1)*4*H, i*H:(i+1)*H]  # [4H, H]
+            b_ih = self.bias_ih[i*4*H:(i+1)*4*H] if self.bias else None
+            b_hh = self.bias_hh[i*4*H:(i+1)*4*H] if self.bias else None
 
-        output = torch.cat(outputs, dim=-1)
-        h_n = torch.cat(h_ns, dim=-1)
-        c_n = torch.cat(c_ns, dim=-1)
+            xi = x_chunks[i]  # [B, T, I]
+
+            if h_chunks[i] is not None:
+                h_t = h_chunks[i]  # [B, H]
+                c_t = c_chunks[i]  # [B, H]
+            else:
+                h_t = xi.new_zeros(B, H)
+                c_t = xi.new_zeros(B, H)
+
+            out_seq = []
+            for t in range(T):
+                gates = F.linear(xi[:, t], w_ih, b_ih) + F.linear(h_t, w_hh, b_hh)
+                i_gate, f_gate, g_gate, o_gate = gates.chunk(4, dim=-1)
+
+                i_t = torch.sigmoid(i_gate)
+                f_t = torch.sigmoid(f_gate)
+                g_t = torch.tanh(g_gate)
+                o_t = torch.sigmoid(o_gate)
+
+                c_t = f_t * c_t + i_t * g_t
+                h_t = o_t * torch.tanh(c_t)
+                out_seq.append(h_t)
+
+            outputs.append(torch.stack(out_seq, dim=1))  # [B, T, H]
+            h_ns.append(h_t)
+            c_ns.append(c_t)
+
+        output = torch.cat(outputs, dim=-1)  # [B, T, N*H]
+        h_n = torch.cat(h_ns, dim=-1).unsqueeze(0)  # [1, B, N*H]
+        c_n = torch.cat(c_ns, dim=-1).unsqueeze(0)
 
         return output, (h_n, c_n)
 
@@ -216,19 +268,27 @@ class WideLSTM(nn.Module):
         modules: List[nn.LSTM],
         strategy: Union[str, LSTMStrategy] = 'auto',
     ) -> 'WideLSTM':
-        """Create from N existing LSTM modules."""
+        """Create WideLSTM from N existing nn.LSTM modules."""
         n = len(modules)
         ref = modules[0]
+
+        # Validate compatibility
+        for m in modules:
+            assert m.input_size == ref.input_size
+            assert m.hidden_size == ref.hidden_size
+            assert m.num_layers == 1, "Only single-layer LSTM supported"
+            assert not m.bidirectional, "Bidirectional not supported"
+            assert m.batch_first == ref.batch_first
 
         wide = cls(
             n=n,
             input_size=ref.input_size,
             hidden_size=ref.hidden_size,
-            num_layers=ref.num_layers,
+            num_layers=1,
             bias=ref.bias,
-            batch_first=ref.batch_first,
+            batch_first=True,
             dropout=ref.dropout,
-            bidirectional=ref.bidirectional,
+            bidirectional=False,
             strategy=strategy,
         )
 
@@ -236,25 +296,41 @@ class WideLSTM(nn.Module):
         dtype = next(ref.parameters()).dtype
         wide = wide.to(device=device, dtype=dtype)
 
+        # Copy weights into block-diagonal structure
+        I, H = ref.input_size, ref.hidden_size
+
         with torch.no_grad():
+            # Reset to zeros
+            wide.weight_ih.zero_()
+            wide.weight_hh.zero_()
+            if wide.bias:
+                wide.bias_ih.zero_()
+                wide.bias_hh.zero_()
+
             for i, m in enumerate(modules):
-                wide.lstms[i].load_state_dict(m.state_dict())
+                # weight_ih: [4H, I] -> block at [i*4H:(i+1)*4H, i*I:(i+1)*I]
+                wide.weight_ih[i*4*H:(i+1)*4*H, i*I:(i+1)*I] = m.weight_ih_l0
+                # weight_hh: [4H, H] -> block at [i*4H:(i+1)*4*H, i*H:(i+1)*H]
+                wide.weight_hh[i*4*H:(i+1)*4*H, i*H:(i+1)*H] = m.weight_hh_l0
+
+                if wide.bias:
+                    wide.bias_ih[i*4*H:(i+1)*4*H] = m.bias_ih_l0
+                    wide.bias_hh[i*4*H:(i+1)*4*H] = m.bias_hh_l0
 
         return wide
 
     def __repr__(self):
         return (
-            f"WideLSTM({self.n}x[in={self.input_size}, h={self.hidden_size}, "
-            f"layers={self.num_layers}], strategy={self._strategy.value})"
+            f"WideLSTM(n={self.n}, in={self.input_size}, h={self.hidden_size}, "
+            f"strategy={self._strategy.value})"
         )
 
     # =========================================================================
     # BENCHMARK INTERFACE
     # =========================================================================
 
-    # Sequential is only for debugging - it's always slower than baseline
     BENCHMARK_STRATEGIES = ['fused']
-    BENCHMARK_STRATEGIES_ALL = ['fused', 'sequential']  # For validation
+    BENCHMARK_STRATEGIES_ALL = ['fused', 'sequential']
 
     @classmethod
     def _get_sweep_params_class(cls):
@@ -358,7 +434,7 @@ class WideLSTM(nn.Module):
 
     @staticmethod
     def _bench_model(d_model: int, hidden_sizes: int, **_) -> nn.Module:
-        """d_model=input_size, hidden_sizes=hidden_size."""
+        """Create single LSTM for benchmarking."""
         class LSTMWrapper(nn.Module):
             def __init__(self, input_size, hidden_size):
                 super().__init__()
@@ -400,11 +476,7 @@ class WideLSTM(nn.Module):
         rtol: float = 1e-3,
         atol: float = 1e-3,
     ) -> Tuple[bool, str]:
-        """Validate wide output matches concatenated baseline.
-
-        Note: RNNs accumulate numerical differences over timesteps,
-        so we use relaxed tolerances (1e-3 vs 1e-5 for feedforward).
-        """
+        """Validate wide output matches concatenated baseline."""
         if isinstance(wide_output, tuple):
             wide_output = wide_output[0]
 
@@ -430,10 +502,10 @@ __all__ = ['WideLSTM', 'LSTMStrategy']
 # =============================================================================
 
 def _test_basic_forward():
-    """Test basic forward pass."""
+    """Test basic forward pass shapes."""
     N, B, T, I, H = 4, 2, 10, 32, 64
 
-    wide = WideLSTM(n=N, input_size=I, hidden_size=H, batch_first=True)
+    wide = WideLSTM(n=N, input_size=I, hidden_size=H)
     x = torch.randn(B, T, N * I)
 
     out, (h_n, c_n) = wide(x)
@@ -445,74 +517,70 @@ def _test_basic_forward():
 
 
 def _test_from_modules():
-    """Test from_modules factory."""
-    N, B, T, I, H = 4, 2, 10, 32, 64
+    """Test from_modules factory preserves weights."""
+    N, I, H = 4, 32, 64
 
-    # Create N separate LSTMs
     lstms = [nn.LSTM(I, H, batch_first=True) for _ in range(N)]
-
-    # Create WideLSTM from them
     wide = WideLSTM.from_modules(lstms)
 
     assert wide.n == N
     assert wide.input_size == I
     assert wide.hidden_size == H
 
-    # Test that weights were copied
+    # Verify weights were copied to correct blocks
     for i, lstm in enumerate(lstms):
-        for (name, p1), (_, p2) in zip(lstm.named_parameters(), wide.lstms[i].named_parameters()):
-            assert torch.equal(p1, p2), f"Weight mismatch at lstm[{i}].{name}"
+        w_ih_block = wide.weight_ih[i*4*H:(i+1)*4*H, i*I:(i+1)*I]
+        w_hh_block = wide.weight_hh[i*4*H:(i+1)*4*H, i*H:(i+1)*H]
+
+        assert torch.equal(w_ih_block, lstm.weight_ih_l0), f"weight_ih mismatch at {i}"
+        assert torch.equal(w_hh_block, lstm.weight_hh_l0), f"weight_hh mismatch at {i}"
 
     print("✓ from_modules")
 
 
 def _test_correctness():
-    """Test that fused output matches sequential baseline."""
+    """Test fused output matches N separate LSTMs."""
     N, B, T, I, H = 4, 2, 16, 32, 64
 
-    # Create N LSTMs with random weights
     lstms = [nn.LSTM(I, H, batch_first=True) for _ in range(N)]
-
-    # Create inputs
     inputs = [torch.randn(B, T, I) for _ in range(N)]
 
     # Baseline: run each LSTM separately
     baseline_outputs = []
-    for i, (lstm, inp) in enumerate(zip(lstms, inputs)):
-        out, _ = lstm(inp)
-        baseline_outputs.append(out)
+    with torch.no_grad():
+        for lstm, inp in zip(lstms, inputs):
+            out, _ = lstm(inp)
+            baseline_outputs.append(out)
     baseline_concat = torch.cat(baseline_outputs, dim=-1)
 
-    # Fused: run WideLSTM
+    # Fused
     wide = WideLSTM.from_modules(lstms, strategy='fused')
     packed = torch.cat(inputs, dim=-1)
-    wide_out, _ = wide(packed)
+    with torch.no_grad():
+        wide_out, _ = wide(packed)
 
-    # Compare
-    assert wide_out.shape == baseline_concat.shape, \
-        f"Shape mismatch: {wide_out.shape} vs {baseline_concat.shape}"
+    assert wide_out.shape == baseline_concat.shape
     assert torch.allclose(wide_out, baseline_concat, rtol=1e-4, atol=1e-4), \
-        f"Value mismatch: max diff = {(wide_out - baseline_concat).abs().max().item()}"
+        f"Max diff: {(wide_out - baseline_concat).abs().max().item()}"
 
     print("✓ correctness")
 
 
 def _test_correctness_with_hidden():
-    """Test correctness when initial hidden state is provided."""
+    """Test correctness with initial hidden state."""
     N, B, T, I, H = 4, 2, 16, 32, 64
 
     lstms = [nn.LSTM(I, H, batch_first=True) for _ in range(N)]
     inputs = [torch.randn(B, T, I) for _ in range(N)]
-
-    # Create initial hidden states
     h_0s = [torch.randn(1, B, H) for _ in range(N)]
     c_0s = [torch.randn(1, B, H) for _ in range(N)]
 
     # Baseline
     baseline_outputs = []
-    for lstm, inp, h0, c0 in zip(lstms, inputs, h_0s, c_0s):
-        out, _ = lstm(inp, (h0, c0))
-        baseline_outputs.append(out)
+    with torch.no_grad():
+        for lstm, inp, h0, c0 in zip(lstms, inputs, h_0s, c_0s):
+            out, _ = lstm(inp, (h0, c0))
+            baseline_outputs.append(out)
     baseline_concat = torch.cat(baseline_outputs, dim=-1)
 
     # Fused
@@ -520,16 +588,18 @@ def _test_correctness_with_hidden():
     packed = torch.cat(inputs, dim=-1)
     h_0_packed = torch.cat(h_0s, dim=-1)
     c_0_packed = torch.cat(c_0s, dim=-1)
-    wide_out, _ = wide(packed, (h_0_packed, c_0_packed))
+
+    with torch.no_grad():
+        wide_out, _ = wide(packed, (h_0_packed, c_0_packed))
 
     assert torch.allclose(wide_out, baseline_concat, rtol=1e-4, atol=1e-4), \
-        f"Value mismatch with hidden: max diff = {(wide_out - baseline_concat).abs().max().item()}"
+        f"Max diff: {(wide_out - baseline_concat).abs().max().item()}"
 
     print("✓ correctness_with_hidden")
 
 
 def _test_strategy_equivalence():
-    """Test that fused and sequential strategies produce same output."""
+    """Test fused and sequential strategies produce same output."""
     N, B, T, I, H = 4, 2, 16, 32, 64
 
     lstms = [nn.LSTM(I, H, batch_first=True) for _ in range(N)]
@@ -539,100 +609,20 @@ def _test_strategy_equivalence():
 
     x = torch.cat([torch.randn(B, T, I) for _ in range(N)], dim=-1)
 
-    out_fused, (h_fused, c_fused) = wide_fused(x)
-    out_seq, (h_seq, c_seq) = wide_seq(x)
+    with torch.no_grad():
+        out_fused, (h_fused, c_fused) = wide_fused(x)
+        out_seq, (h_seq, c_seq) = wide_seq(x)
 
     assert torch.allclose(out_fused, out_seq, rtol=1e-5, atol=1e-5), \
-        f"Output mismatch: {(out_fused - out_seq).abs().max().item()}"
-    assert torch.allclose(h_fused, h_seq, rtol=1e-5, atol=1e-5), \
-        f"h_n mismatch: {(h_fused - h_seq).abs().max().item()}"
-    assert torch.allclose(c_fused, c_seq, rtol=1e-5, atol=1e-5), \
-        f"c_n mismatch: {(c_fused - c_seq).abs().max().item()}"
+        f"Output diff: {(out_fused - out_seq).abs().max().item()}"
+    assert torch.allclose(h_fused, h_seq, rtol=1e-5, atol=1e-5)
+    assert torch.allclose(c_fused, c_seq, rtol=1e-5, atol=1e-5)
 
     print("✓ strategy_equivalence")
 
 
-def _test_multilayer():
-    """Test multi-layer LSTM."""
-    N, B, T, I, H, L = 4, 2, 16, 32, 64, 3
-
-    lstms = [nn.LSTM(I, H, num_layers=L, batch_first=True) for _ in range(N)]
-    inputs = [torch.randn(B, T, I) for _ in range(N)]
-
-    # Baseline
-    baseline_outputs = []
-    for lstm, inp in zip(lstms, inputs):
-        out, _ = lstm(inp)
-        baseline_outputs.append(out)
-    baseline_concat = torch.cat(baseline_outputs, dim=-1)
-
-    # Fused
-    wide = WideLSTM.from_modules(lstms, strategy='fused')
-    packed = torch.cat(inputs, dim=-1)
-    wide_out, (h_n, c_n) = wide(packed)
-
-    assert wide_out.shape == (B, T, N * H)
-    assert h_n.shape == (L, B, N * H)
-    assert c_n.shape == (L, B, N * H)
-    assert torch.allclose(wide_out, baseline_concat, rtol=1e-4, atol=1e-4)
-
-    print("✓ multilayer")
-
-
-def _test_bidirectional():
-    """Test bidirectional LSTM."""
-    N, B, T, I, H = 4, 2, 16, 32, 64
-
-    lstms = [nn.LSTM(I, H, batch_first=True, bidirectional=True) for _ in range(N)]
-    inputs = [torch.randn(B, T, I) for _ in range(N)]
-
-    # Baseline
-    baseline_outputs = []
-    for lstm, inp in zip(lstms, inputs):
-        out, _ = lstm(inp)
-        baseline_outputs.append(out)
-    baseline_concat = torch.cat(baseline_outputs, dim=-1)
-
-    # Fused
-    wide = WideLSTM.from_modules(lstms, strategy='fused')
-    packed = torch.cat(inputs, dim=-1)
-    wide_out, (h_n, c_n) = wide(packed)
-
-    # Bidirectional doubles output size
-    assert wide_out.shape == (B, T, N * H * 2), f"Got {wide_out.shape}"
-    assert h_n.shape == (2, B, N * H), f"h_n shape: {h_n.shape}"
-    assert torch.allclose(wide_out, baseline_concat, rtol=1e-4, atol=1e-4)
-
-    print("✓ bidirectional")
-
-
-def _test_batch_first_false():
-    """Test with batch_first=False."""
-    N, B, T, I, H = 4, 2, 16, 32, 64
-
-    lstms = [nn.LSTM(I, H, batch_first=False) for _ in range(N)]
-    inputs = [torch.randn(T, B, I) for _ in range(N)]  # [T, B, I]
-
-    # Baseline
-    baseline_outputs = []
-    for lstm, inp in zip(lstms, inputs):
-        out, _ = lstm(inp)
-        baseline_outputs.append(out)
-    baseline_concat = torch.cat(baseline_outputs, dim=-1)
-
-    # Fused
-    wide = WideLSTM.from_modules(lstms, strategy='fused')
-    packed = torch.cat(inputs, dim=-1)  # [T, B, N*I]
-    wide_out, _ = wide(packed)
-
-    assert wide_out.shape == (T, B, N * H)
-    assert torch.allclose(wide_out, baseline_concat, rtol=1e-4, atol=1e-4)
-
-    print("✓ batch_first_false")
-
-
 def _test_gradient_flow():
-    """Test that gradients flow correctly."""
+    """Test gradients flow correctly."""
     N, B, T, I, H = 4, 2, 16, 32, 64
 
     lstms = [nn.LSTM(I, H, batch_first=True) for _ in range(N)]
@@ -644,15 +634,34 @@ def _test_gradient_flow():
     loss = out.sum()
     loss.backward()
 
-    assert x.grad is not None, "Input gradient is None"
-    assert x.grad.shape == x.shape, f"Gradient shape mismatch"
-
-    # Check that all LSTM parameters have gradients
-    for i, lstm in enumerate(wide.lstms):
-        for name, p in lstm.named_parameters():
-            assert p.grad is not None, f"No gradient for lstm[{i}].{name}"
+    assert x.grad is not None
+    assert x.grad.shape == x.shape
+    assert wide.weight_ih.grad is not None
+    assert wide.weight_hh.grad is not None
 
     print("✓ gradient_flow")
+
+
+def _test_block_diagonal_structure():
+    """Verify weight matrices are truly block-diagonal."""
+    N, I, H = 4, 32, 64
+
+    lstms = [nn.LSTM(I, H, batch_first=True) for _ in range(N)]
+    wide = WideLSTM.from_modules(lstms)
+
+    # Check off-diagonal blocks are zero
+    for i in range(N):
+        for j in range(N):
+            if i != j:
+                # weight_ih block [i,j] should be zero
+                block_ih = wide.weight_ih[i*4*H:(i+1)*4*H, j*I:(j+1)*I]
+                assert block_ih.abs().max() == 0, f"Non-zero off-diagonal at weight_ih[{i},{j}]"
+
+                # weight_hh block [i,j] should be zero
+                block_hh = wide.weight_hh[i*4*H:(i+1)*4*H, j*H:(j+1)*H]
+                assert block_hh.abs().max() == 0, f"Non-zero off-diagonal at weight_hh[{i},{j}]"
+
+    print("✓ block_diagonal_structure")
 
 
 def _test_compilation():
@@ -664,21 +673,18 @@ def _test_compilation():
 
     x = torch.randn(B, T, N * I)
 
-    # Get uncompiled output
     with torch.no_grad():
         out_eager, _ = wide(x)
 
-    # Compile and run
     wide_compiled = torch.compile(wide, mode='reduce-overhead')
 
     with torch.no_grad():
-        # Warmup
         for _ in range(3):
             wide_compiled(x)
         out_compiled, _ = wide_compiled(x)
 
     assert torch.allclose(out_eager, out_compiled, rtol=1e-4, atol=1e-4), \
-        f"Compiled output differs: max diff = {(out_eager - out_compiled).abs().max().item()}"
+        f"Compiled diff: {(out_eager - out_compiled).abs().max().item()}"
 
     print("✓ compilation")
 
@@ -707,8 +713,7 @@ def _test_compilation_cuda():
             wide_compiled(x)
         out_compiled, _ = wide_compiled(x)
 
-    assert torch.allclose(out_eager, out_compiled, rtol=1e-4, atol=1e-4), \
-        f"CUDA compiled output differs: max diff = {(out_eager - out_compiled).abs().max().item()}"
+    assert torch.allclose(out_eager, out_compiled, rtol=1e-4, atol=1e-4)
 
     print("✓ compilation_cuda")
 
@@ -721,12 +726,10 @@ def run_tests():
 
     _test_basic_forward()
     _test_from_modules()
+    _test_block_diagonal_structure()
     _test_correctness()
     _test_correctness_with_hidden()
     _test_strategy_equivalence()
-    _test_multilayer()
-    _test_bidirectional()
-    _test_batch_first_false()
     _test_gradient_flow()
     _test_compilation()
     _test_compilation_cuda()
