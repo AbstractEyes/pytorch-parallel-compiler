@@ -252,7 +252,9 @@ class WideLSTM(nn.Module):
     # BENCHMARK INTERFACE
     # =========================================================================
 
-    BENCHMARK_STRATEGIES = ['baseline', 'fused', 'sequential']
+    # Sequential is only for debugging - it's always slower than baseline
+    BENCHMARK_STRATEGIES = ['fused']
+    BENCHMARK_STRATEGIES_ALL = ['fused', 'sequential']  # For validation
 
     @classmethod
     def _get_sweep_params_class(cls):
@@ -296,19 +298,26 @@ class WideLSTM(nn.Module):
             return
 
         cls.BENCHMARK_SWEEPS = {
+            'smoke': SweepParams(
+                n_values=[8, 32],
+                batch_sizes=[4],
+                seq_lengths=[32],
+                d_model=[64],
+                hidden_sizes=[128],
+            ),
             'quick': SweepParams(
-                n_values=[4, 8, 16, 32],
+                n_values=[8, 16, 32],
                 batch_sizes=[8],
-                seq_lengths=[64],
-                d_model=[128],  # input_size
-                hidden_sizes=[256],
+                seq_lengths=[32],
+                d_model=[64],
+                hidden_sizes=[128],
             ),
             'full': SweepParams(
-                n_values=[2, 4, 8, 16, 32],
+                n_values=[4, 8, 16, 32, 64],
                 batch_sizes=[4, 8, 16],
-                seq_lengths=[32, 64, 128],
-                d_model=[64, 128, 256],
-                hidden_sizes=[128, 256, 512],
+                seq_lengths=[32, 64],
+                d_model=[64, 128],
+                hidden_sizes=[128, 256],
             ),
             'ci': SweepParams(
                 n_values=[4, 8],
@@ -344,6 +353,7 @@ class WideLSTM(nn.Module):
             wide_factory=cls._bench_wide,
             pack_fn=cls._bench_pack,
             unpack_fn=cls._bench_unpack,
+            validate_fn=cls._bench_validate,
         )
 
     @staticmethod
@@ -383,5 +393,348 @@ class WideLSTM(nn.Module):
         chunks = output.shape[-1] // n
         return [output[..., i*chunks:(i+1)*chunks] for i in range(n)]
 
+    @staticmethod
+    def _bench_validate(
+        wide_output: Tensor,
+        baseline_outputs: List[Tensor],
+        rtol: float = 1e-3,
+        atol: float = 1e-3,
+    ) -> Tuple[bool, str]:
+        """Validate wide output matches concatenated baseline.
+
+        Note: RNNs accumulate numerical differences over timesteps,
+        so we use relaxed tolerances (1e-3 vs 1e-5 for feedforward).
+        """
+        if isinstance(wide_output, tuple):
+            wide_output = wide_output[0]
+
+        baseline_concat = torch.cat(baseline_outputs, dim=-1)
+
+        if wide_output.shape != baseline_concat.shape:
+            return False, f"Shape mismatch: {wide_output.shape} vs {baseline_concat.shape}"
+
+        if not torch.allclose(wide_output, baseline_concat, rtol=rtol, atol=atol):
+            diff = (wide_output - baseline_concat).abs()
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+            return False, f"Value mismatch: max={max_diff:.6f}, mean={mean_diff:.6f}"
+
+        return True, "OK"
+
 
 __all__ = ['WideLSTM', 'LSTMStrategy']
+
+
+# =============================================================================
+# TESTS
+# =============================================================================
+
+def _test_basic_forward():
+    """Test basic forward pass."""
+    N, B, T, I, H = 4, 2, 10, 32, 64
+
+    wide = WideLSTM(n=N, input_size=I, hidden_size=H, batch_first=True)
+    x = torch.randn(B, T, N * I)
+
+    out, (h_n, c_n) = wide(x)
+
+    assert out.shape == (B, T, N * H), f"Output shape: {out.shape}"
+    assert h_n.shape == (1, B, N * H), f"h_n shape: {h_n.shape}"
+    assert c_n.shape == (1, B, N * H), f"c_n shape: {c_n.shape}"
+    print("✓ basic_forward")
+
+
+def _test_from_modules():
+    """Test from_modules factory."""
+    N, B, T, I, H = 4, 2, 10, 32, 64
+
+    # Create N separate LSTMs
+    lstms = [nn.LSTM(I, H, batch_first=True) for _ in range(N)]
+
+    # Create WideLSTM from them
+    wide = WideLSTM.from_modules(lstms)
+
+    assert wide.n == N
+    assert wide.input_size == I
+    assert wide.hidden_size == H
+
+    # Test that weights were copied
+    for i, lstm in enumerate(lstms):
+        for (name, p1), (_, p2) in zip(lstm.named_parameters(), wide.lstms[i].named_parameters()):
+            assert torch.equal(p1, p2), f"Weight mismatch at lstm[{i}].{name}"
+
+    print("✓ from_modules")
+
+
+def _test_correctness():
+    """Test that fused output matches sequential baseline."""
+    N, B, T, I, H = 4, 2, 16, 32, 64
+
+    # Create N LSTMs with random weights
+    lstms = [nn.LSTM(I, H, batch_first=True) for _ in range(N)]
+
+    # Create inputs
+    inputs = [torch.randn(B, T, I) for _ in range(N)]
+
+    # Baseline: run each LSTM separately
+    baseline_outputs = []
+    for i, (lstm, inp) in enumerate(zip(lstms, inputs)):
+        out, _ = lstm(inp)
+        baseline_outputs.append(out)
+    baseline_concat = torch.cat(baseline_outputs, dim=-1)
+
+    # Fused: run WideLSTM
+    wide = WideLSTM.from_modules(lstms, strategy='fused')
+    packed = torch.cat(inputs, dim=-1)
+    wide_out, _ = wide(packed)
+
+    # Compare
+    assert wide_out.shape == baseline_concat.shape, \
+        f"Shape mismatch: {wide_out.shape} vs {baseline_concat.shape}"
+    assert torch.allclose(wide_out, baseline_concat, rtol=1e-4, atol=1e-4), \
+        f"Value mismatch: max diff = {(wide_out - baseline_concat).abs().max().item()}"
+
+    print("✓ correctness")
+
+
+def _test_correctness_with_hidden():
+    """Test correctness when initial hidden state is provided."""
+    N, B, T, I, H = 4, 2, 16, 32, 64
+
+    lstms = [nn.LSTM(I, H, batch_first=True) for _ in range(N)]
+    inputs = [torch.randn(B, T, I) for _ in range(N)]
+
+    # Create initial hidden states
+    h_0s = [torch.randn(1, B, H) for _ in range(N)]
+    c_0s = [torch.randn(1, B, H) for _ in range(N)]
+
+    # Baseline
+    baseline_outputs = []
+    for lstm, inp, h0, c0 in zip(lstms, inputs, h_0s, c_0s):
+        out, _ = lstm(inp, (h0, c0))
+        baseline_outputs.append(out)
+    baseline_concat = torch.cat(baseline_outputs, dim=-1)
+
+    # Fused
+    wide = WideLSTM.from_modules(lstms, strategy='fused')
+    packed = torch.cat(inputs, dim=-1)
+    h_0_packed = torch.cat(h_0s, dim=-1)
+    c_0_packed = torch.cat(c_0s, dim=-1)
+    wide_out, _ = wide(packed, (h_0_packed, c_0_packed))
+
+    assert torch.allclose(wide_out, baseline_concat, rtol=1e-4, atol=1e-4), \
+        f"Value mismatch with hidden: max diff = {(wide_out - baseline_concat).abs().max().item()}"
+
+    print("✓ correctness_with_hidden")
+
+
+def _test_strategy_equivalence():
+    """Test that fused and sequential strategies produce same output."""
+    N, B, T, I, H = 4, 2, 16, 32, 64
+
+    lstms = [nn.LSTM(I, H, batch_first=True) for _ in range(N)]
+
+    wide_fused = WideLSTM.from_modules(lstms, strategy='fused')
+    wide_seq = WideLSTM.from_modules(lstms, strategy='sequential')
+
+    x = torch.cat([torch.randn(B, T, I) for _ in range(N)], dim=-1)
+
+    out_fused, (h_fused, c_fused) = wide_fused(x)
+    out_seq, (h_seq, c_seq) = wide_seq(x)
+
+    assert torch.allclose(out_fused, out_seq, rtol=1e-5, atol=1e-5), \
+        f"Output mismatch: {(out_fused - out_seq).abs().max().item()}"
+    assert torch.allclose(h_fused, h_seq, rtol=1e-5, atol=1e-5), \
+        f"h_n mismatch: {(h_fused - h_seq).abs().max().item()}"
+    assert torch.allclose(c_fused, c_seq, rtol=1e-5, atol=1e-5), \
+        f"c_n mismatch: {(c_fused - c_seq).abs().max().item()}"
+
+    print("✓ strategy_equivalence")
+
+
+def _test_multilayer():
+    """Test multi-layer LSTM."""
+    N, B, T, I, H, L = 4, 2, 16, 32, 64, 3
+
+    lstms = [nn.LSTM(I, H, num_layers=L, batch_first=True) for _ in range(N)]
+    inputs = [torch.randn(B, T, I) for _ in range(N)]
+
+    # Baseline
+    baseline_outputs = []
+    for lstm, inp in zip(lstms, inputs):
+        out, _ = lstm(inp)
+        baseline_outputs.append(out)
+    baseline_concat = torch.cat(baseline_outputs, dim=-1)
+
+    # Fused
+    wide = WideLSTM.from_modules(lstms, strategy='fused')
+    packed = torch.cat(inputs, dim=-1)
+    wide_out, (h_n, c_n) = wide(packed)
+
+    assert wide_out.shape == (B, T, N * H)
+    assert h_n.shape == (L, B, N * H)
+    assert c_n.shape == (L, B, N * H)
+    assert torch.allclose(wide_out, baseline_concat, rtol=1e-4, atol=1e-4)
+
+    print("✓ multilayer")
+
+
+def _test_bidirectional():
+    """Test bidirectional LSTM."""
+    N, B, T, I, H = 4, 2, 16, 32, 64
+
+    lstms = [nn.LSTM(I, H, batch_first=True, bidirectional=True) for _ in range(N)]
+    inputs = [torch.randn(B, T, I) for _ in range(N)]
+
+    # Baseline
+    baseline_outputs = []
+    for lstm, inp in zip(lstms, inputs):
+        out, _ = lstm(inp)
+        baseline_outputs.append(out)
+    baseline_concat = torch.cat(baseline_outputs, dim=-1)
+
+    # Fused
+    wide = WideLSTM.from_modules(lstms, strategy='fused')
+    packed = torch.cat(inputs, dim=-1)
+    wide_out, (h_n, c_n) = wide(packed)
+
+    # Bidirectional doubles output size
+    assert wide_out.shape == (B, T, N * H * 2), f"Got {wide_out.shape}"
+    assert h_n.shape == (2, B, N * H), f"h_n shape: {h_n.shape}"
+    assert torch.allclose(wide_out, baseline_concat, rtol=1e-4, atol=1e-4)
+
+    print("✓ bidirectional")
+
+
+def _test_batch_first_false():
+    """Test with batch_first=False."""
+    N, B, T, I, H = 4, 2, 16, 32, 64
+
+    lstms = [nn.LSTM(I, H, batch_first=False) for _ in range(N)]
+    inputs = [torch.randn(T, B, I) for _ in range(N)]  # [T, B, I]
+
+    # Baseline
+    baseline_outputs = []
+    for lstm, inp in zip(lstms, inputs):
+        out, _ = lstm(inp)
+        baseline_outputs.append(out)
+    baseline_concat = torch.cat(baseline_outputs, dim=-1)
+
+    # Fused
+    wide = WideLSTM.from_modules(lstms, strategy='fused')
+    packed = torch.cat(inputs, dim=-1)  # [T, B, N*I]
+    wide_out, _ = wide(packed)
+
+    assert wide_out.shape == (T, B, N * H)
+    assert torch.allclose(wide_out, baseline_concat, rtol=1e-4, atol=1e-4)
+
+    print("✓ batch_first_false")
+
+
+def _test_gradient_flow():
+    """Test that gradients flow correctly."""
+    N, B, T, I, H = 4, 2, 16, 32, 64
+
+    lstms = [nn.LSTM(I, H, batch_first=True) for _ in range(N)]
+    wide = WideLSTM.from_modules(lstms, strategy='fused')
+
+    x = torch.randn(B, T, N * I, requires_grad=True)
+    out, _ = wide(x)
+
+    loss = out.sum()
+    loss.backward()
+
+    assert x.grad is not None, "Input gradient is None"
+    assert x.grad.shape == x.shape, f"Gradient shape mismatch"
+
+    # Check that all LSTM parameters have gradients
+    for i, lstm in enumerate(wide.lstms):
+        for name, p in lstm.named_parameters():
+            assert p.grad is not None, f"No gradient for lstm[{i}].{name}"
+
+    print("✓ gradient_flow")
+
+
+def _test_compilation():
+    """Test torch.compile compatibility."""
+    N, B, T, I, H = 4, 2, 16, 32, 64
+
+    lstms = [nn.LSTM(I, H, batch_first=True) for _ in range(N)]
+    wide = WideLSTM.from_modules(lstms, strategy='fused')
+
+    x = torch.randn(B, T, N * I)
+
+    # Get uncompiled output
+    with torch.no_grad():
+        out_eager, _ = wide(x)
+
+    # Compile and run
+    wide_compiled = torch.compile(wide, mode='reduce-overhead')
+
+    with torch.no_grad():
+        # Warmup
+        for _ in range(3):
+            wide_compiled(x)
+        out_compiled, _ = wide_compiled(x)
+
+    assert torch.allclose(out_eager, out_compiled, rtol=1e-4, atol=1e-4), \
+        f"Compiled output differs: max diff = {(out_eager - out_compiled).abs().max().item()}"
+
+    print("✓ compilation")
+
+
+def _test_compilation_cuda():
+    """Test torch.compile on CUDA."""
+    if not torch.cuda.is_available():
+        print("⊘ compilation_cuda (no CUDA)")
+        return
+
+    N, B, T, I, H = 8, 4, 32, 64, 128
+    device = 'cuda'
+
+    lstms = [nn.LSTM(I, H, batch_first=True).to(device) for _ in range(N)]
+    wide = WideLSTM.from_modules(lstms, strategy='fused')
+
+    x = torch.randn(B, T, N * I, device=device)
+
+    with torch.no_grad():
+        out_eager, _ = wide(x)
+
+    wide_compiled = torch.compile(wide, mode='reduce-overhead')
+
+    with torch.no_grad():
+        for _ in range(3):
+            wide_compiled(x)
+        out_compiled, _ = wide_compiled(x)
+
+    assert torch.allclose(out_eager, out_compiled, rtol=1e-4, atol=1e-4), \
+        f"CUDA compiled output differs: max diff = {(out_eager - out_compiled).abs().max().item()}"
+
+    print("✓ compilation_cuda")
+
+
+def run_tests():
+    """Run all tests."""
+    print("=" * 50)
+    print("WideLSTM Tests")
+    print("=" * 50)
+
+    _test_basic_forward()
+    _test_from_modules()
+    _test_correctness()
+    _test_correctness_with_hidden()
+    _test_strategy_equivalence()
+    _test_multilayer()
+    _test_bidirectional()
+    _test_batch_first_false()
+    _test_gradient_flow()
+    _test_compilation()
+    _test_compilation_cuda()
+
+    print("=" * 50)
+    print("All tests passed!")
+    print("=" * 50)
+
+
+if __name__ == '__main__':
+    run_tests()
