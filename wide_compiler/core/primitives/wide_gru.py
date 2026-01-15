@@ -368,7 +368,9 @@ class WideGRU(nn.Module):
     # BENCHMARK INTERFACE
     # =========================================================================
 
-    BENCHMARK_STRATEGIES = ['baseline', 'fused', 'sequential']
+    # Sequential is only for debugging - it's always slower than baseline
+    BENCHMARK_STRATEGIES = ['fused']
+    BENCHMARK_STRATEGIES_ALL = ['fused', 'sequential']  # For validation
 
     @classmethod
     def _get_sweep_params_class(cls):
@@ -412,19 +414,26 @@ class WideGRU(nn.Module):
             return
 
         cls.BENCHMARK_SWEEPS = {
+            'smoke': SweepParams(
+                n_values=[8, 32],
+                batch_sizes=[4],
+                seq_lengths=[32],
+                d_model=[64],
+                hidden_sizes=[128],
+            ),
             'quick': SweepParams(
-                n_values=[4, 8, 16, 32],
+                n_values=[8, 16, 32],
                 batch_sizes=[8],
-                seq_lengths=[64],
-                d_model=[128],
-                hidden_sizes=[256],
+                seq_lengths=[32],
+                d_model=[64],
+                hidden_sizes=[128],
             ),
             'full': SweepParams(
-                n_values=[2, 4, 8, 16, 32],
+                n_values=[4, 8, 16, 32, 64],
                 batch_sizes=[4, 8, 16],
-                seq_lengths=[32, 64, 128],
-                d_model=[64, 128, 256],
-                hidden_sizes=[128, 256, 512],
+                seq_lengths=[32, 64],
+                d_model=[64, 128],
+                hidden_sizes=[128, 256],
             ),
             'ci': SweepParams(
                 n_values=[4, 8],
