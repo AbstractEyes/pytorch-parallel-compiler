@@ -171,9 +171,16 @@ class WideLSTM(nn.Module):
             # Combined gates: [B, N*4H]
             gates = gates_x[:, t, :] + gates_h
 
-            # Split into 4 gates: each [B, N*H]
-            # PyTorch LSTM order: i, f, g, o
-            i_gate, f_gate, g_gate, o_gate = gates.chunk(4, dim=-1)
+            # Reshape to [B, N, 4H] then split into 4 gates of [B, N, H]
+            # Layout after matmul: [i₀,f₀,g₀,o₀, i₁,f₁,g₁,o₁, ...]
+            gates = gates.view(B, N, 4 * H)
+            i_gate, f_gate, g_gate, o_gate = gates.chunk(4, dim=-1)  # each [B, N, H]
+
+            # Flatten back to [B, N*H]
+            i_gate = i_gate.reshape(B, N * H)
+            f_gate = f_gate.reshape(B, N * H)
+            g_gate = g_gate.reshape(B, N * H)
+            o_gate = o_gate.reshape(B, N * H)
 
             # Apply activations
             i_t = torch.sigmoid(i_gate)
@@ -538,6 +545,76 @@ def _test_from_modules():
     print("✓ from_modules")
 
 
+def _test_single_lstm_cell():
+    """Test N=1 case matches nn.LSTM exactly - validates our manual cell impl."""
+    B, T, I, H = 2, 8, 32, 64
+
+    lstm = nn.LSTM(I, H, batch_first=True)
+    x = torch.randn(B, T, I)
+
+    with torch.no_grad():
+        expected, _ = lstm(x)
+
+    # Create WideLSTM with N=1 from this LSTM
+    wide = WideLSTM.from_modules([lstm], strategy='fused')
+
+    with torch.no_grad():
+        actual, _ = wide(x)
+
+    if not torch.allclose(actual, expected, rtol=1e-5, atol=1e-5):
+        diff = (actual - expected).abs()
+        print(f"  N=1 test failed!")
+        print(f"  Max diff: {diff.max().item():.6f}")
+        print(f"  Mean diff: {diff.mean().item():.6f}")
+
+        # Check per-timestep
+        for t in range(min(T, 4)):
+            diff_t = (actual[:, t, :] - expected[:, t, :]).abs().max().item()
+            print(f"  t={t}: max diff = {diff_t:.6f}")
+
+        raise AssertionError("N=1 mismatch - manual cell implementation is wrong")
+
+    print("✓ single_lstm_cell")
+
+
+def _test_single_timestep():
+    """Test single timestep to isolate gate computation issues."""
+    N, B, I, H = 4, 2, 32, 64
+    T = 1  # Single timestep
+
+    lstms = [nn.LSTM(I, H, batch_first=True) for _ in range(N)]
+    inputs = [torch.randn(B, T, I) for _ in range(N)]
+
+    # Baseline
+    baseline_outputs = []
+    with torch.no_grad():
+        for lstm, inp in zip(lstms, inputs):
+            out, _ = lstm(inp)
+            baseline_outputs.append(out)
+    baseline_concat = torch.cat(baseline_outputs, dim=-1)
+
+    # Fused
+    wide = WideLSTM.from_modules(lstms, strategy='fused')
+    packed = torch.cat(inputs, dim=-1)
+    with torch.no_grad():
+        wide_out, _ = wide(packed)
+
+    if not torch.allclose(wide_out, baseline_concat, rtol=1e-4, atol=1e-4):
+        print(f"  Single timestep failed!")
+        print(f"  Max diff: {(wide_out - baseline_concat).abs().max().item():.6f}")
+
+        # Check each LSTM separately
+        for i in range(N):
+            wide_i = wide_out[:, :, i*H:(i+1)*H]
+            base_i = baseline_outputs[i]
+            diff_i = (wide_i - base_i).abs().max().item()
+            print(f"  LSTM {i}: max diff = {diff_i:.6f}")
+
+        raise AssertionError("Single timestep mismatch")
+
+    print("✓ single_timestep")
+
+
 def _test_correctness():
     """Test fused output matches N separate LSTMs."""
     N, B, T, I, H = 4, 2, 16, 32, 64
@@ -559,9 +636,30 @@ def _test_correctness():
     with torch.no_grad():
         wide_out, _ = wide(packed)
 
-    assert wide_out.shape == baseline_concat.shape
-    assert torch.allclose(wide_out, baseline_concat, rtol=1e-4, atol=1e-4), \
-        f"Max diff: {(wide_out - baseline_concat).abs().max().item()}"
+    assert wide_out.shape == baseline_concat.shape, \
+        f"Shape: {wide_out.shape} vs {baseline_concat.shape}"
+
+    if not torch.allclose(wide_out, baseline_concat, rtol=1e-4, atol=1e-4):
+        diff = (wide_out - baseline_concat).abs()
+        print(f"  Max diff: {diff.max().item():.6f}")
+        print(f"  Mean diff: {diff.mean().item():.6f}")
+
+        # Debug: check per-LSTM outputs
+        for i in range(N):
+            wide_i = wide_out[:, :, i*H:(i+1)*H]
+            base_i = baseline_outputs[i]
+            diff_i = (wide_i - base_i).abs().max().item()
+            print(f"  LSTM {i} max diff: {diff_i:.6f}")
+
+        # Debug: check first timestep only
+        print("\n  First timestep analysis:")
+        for i in range(N):
+            wide_t0_i = wide_out[:, 0, i*H:(i+1)*H]
+            base_t0_i = baseline_outputs[i][:, 0, :]
+            diff_t0 = (wide_t0_i - base_t0_i).abs().max().item()
+            print(f"  LSTM {i} t=0 diff: {diff_t0:.6f}")
+
+        raise AssertionError("Value mismatch")
 
     print("✓ correctness")
 
@@ -727,6 +825,8 @@ def run_tests():
     _test_basic_forward()
     _test_from_modules()
     _test_block_diagonal_structure()
+    _test_single_lstm_cell()
+    _test_single_timestep()
     _test_correctness()
     _test_correctness_with_hidden()
     _test_strategy_equivalence()
