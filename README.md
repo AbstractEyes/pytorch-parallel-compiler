@@ -1,6 +1,6 @@
 # WideCompiler
 
-### Version 0.4.0
+### Version 0.5.0
 
 Compile-friendly batched model execution. Fuse N identical models into a single Wide model for massive speedups.
 
@@ -21,6 +21,13 @@ output = wide(packed_input)  # 1 kernel launch
 
 **Speedups:** 2-40x depending on model type, N, and compilation mode.
 
+## What's New in 0.5.0
+
+- **WideGRU** - N parallel GRUs via einsum fusion (**8x speedup** at N=32)
+- **WideLSTM** - N parallel LSTMs via block-diagonal weights (**3x speedup** at N=4-8)
+- **Primitive Benchmarks with Compilation** - `benchmark gru -p quick -c` for torch.compile testing
+- **Validation Checkmarks** - Benchmark output shows ✓ when correctness verified
+
 ## What's New in 0.4.0
 
 - **WideAttention** - N parallel attention in single Flash Attention call (**11x speedup**)
@@ -37,6 +44,30 @@ pip install -e .
 ```
 
 ## Quick Start
+
+### RNN Fusion (WideGRU / WideLSTM)
+
+```python
+import torch
+from wide_compiler import WideGRU
+
+# Create 8 separate GRUs with different weights
+grus = [torch.nn.GRU(64, 128, batch_first=True).cuda() for _ in range(8)]
+
+# Fuse into single WideGRU (copies weights)
+wide_gru = WideGRU.from_modules(grus)
+
+# Compile for best performance
+wide_gru = torch.compile(wide_gru, mode='reduce-overhead')
+
+# Input: concatenate along feature dim [B, T, N*input_size]
+x = torch.randn(4, 32, 8 * 64).cuda()  # [4, 32, 512]
+
+# Output: [B, T, N*hidden_size] = [4, 32, 1024]
+out, h_n = wide_gru(x)
+```
+
+### Full Model Fusion (TracedWideModel)
 
 ```python
 import torch
@@ -142,24 +173,32 @@ config = WideConfig(
 wide_compiler benchmark
 
 # Benchmark specific primitive
+wide_compiler benchmark gru
+wide_compiler benchmark lstm
 wide_compiler benchmark attention
-wide_compiler benchmark conv2d
 wide_compiler benchmark linear
 
 # Benchmark all primitives
 wide_compiler benchmark all
 
-# With options
-wide_compiler benchmark attention -p quick    # Quick preset (fewer configs)
-wide_compiler benchmark attention -p full     # Full sweep (default)
-wide_compiler benchmark attention -p ci       # CI preset (minimal)
+# With presets
+wide_compiler benchmark gru -p smoke     # Fastest (2 configs)
+wide_compiler benchmark gru -p quick     # Quick (fewer configs)
+wide_compiler benchmark gru -p full      # Full sweep (default)
+wide_compiler benchmark gru -p ci        # CI preset (minimal)
 
+# With torch.compile (recommended for accurate timing)
+wide_compiler benchmark gru -p quick -c                  # Default: reduce-overhead
+wide_compiler benchmark gru -p quick -c max-autotune    # Max performance
+
+# Other options
 wide_compiler benchmark conv1d -t 20          # Show top 20 results
 wide_compiler benchmark conv1d -q             # Quiet mode (no progress)
 wide_compiler benchmark conv1d -s             # Auto-save with timestamp
 wide_compiler benchmark conv1d -o results.json  # Save to specific file
+wide_compiler benchmark gru --no-validate     # Skip validation (faster)
 
-wide_compiler benchmark all -q -s             # All primitives, quiet, auto-save
+wide_compiler benchmark all -q -s -c          # All primitives, quiet, auto-save, compiled
 ```
 
 ### Other Commands
@@ -180,6 +219,8 @@ wide_compiler info
 
 | Layer | Wide Version | Strategies | Best Speedup |
 |-------|--------------|------------|--------------|
+| `nn.GRU` | `WideGRU` | fused (einsum) | **7.8x** |
+| `nn.LSTM` | `WideLSTM` | fused (block-diag) | **3.3x** |
 | `nn.MultiheadAttention` | `WideAttention` | fused, sequential | **11.4x** |
 | `nn.Linear` | `WideLinear` | einsum, sequential | **12.8x** |
 | `nn.Embedding` | `WideEmbedding` | indexed, gather, sequential | **6.4x** |
@@ -192,6 +233,25 @@ wide_compiler info
 | `+`, `-`, `*`, `/`, `@` | `BinaryOp` | — | — |
 
 ## Primitive Benchmarks (A100)
+
+### GRU (NEW in 0.5.0)
+
+| N | Fused | Baseline | Notes |
+|---|-------|----------|-------|
+| 8 | **5.0x** | 1.0x | Einsum fusion |
+| 16 | **6.2x** | 1.0x | |
+| 32 | **7.8x** | 1.0x | Scales well with N |
+
+### LSTM (NEW in 0.5.0)
+
+| N | Fused | Baseline | Notes |
+|---|-------|----------|-------|
+| 4 | **3.3x** | 1.0x | Sweet spot |
+| 8 | **2.1x** | 1.0x | |
+| 16 | 1.0x | 1.0x | Crossover point |
+| 32 | 0.8x | 1.0x | Block-diagonal overhead |
+
+> **Note:** WideLSTM uses block-diagonal weight matrices which become inefficient at large N due to sparsity overhead. For N > 16, consider using multiple smaller WideLSTMs or WideGRU instead.
 
 ### Attention (NEW in 0.4.0)
 
@@ -267,14 +327,16 @@ wide_compiler/
     ├── config.py             # WideConfig
     ├── registry.py           # Primitive registration
     ├── traced_wide.py        # FX tracing + TracedWideModel
-    ├── benchmark/            # NEW: Benchmark system
+    ├── benchmark/            # Benchmark system
     │   ├── __init__.py
     │   ├── benchmark_api.py
     │   ├── benchmark_runner.py
     │   ├── benchmark_schema.py
     │   └── benchmark_registry.py
     └── primitives/
-        ├── wide_attention.py   # NEW: 11x speedup
+        ├── wide_gru.py         # NEW: 8x speedup (einsum fusion)
+        ├── wide_lstm.py        # NEW: 3x speedup (block-diagonal)
+        ├── wide_attention.py   # 11x speedup
         ├── wide_linear.py
         ├── wide_conv1d.py
         ├── wide_conv2d.py
@@ -286,9 +348,23 @@ wide_compiler/
 
 ## Limitations
 
+### General
 - **Identical architecture required** - All N models must have same structure
 - **Static shapes** - FX tracing requires fixed tensor shapes
 - **No dynamic control flow** - `if`/`for` based on tensor values won't trace
+
+### RNN Primitives (WideGRU, WideLSTM)
+- **Single layer only** - `num_layers=1` currently required
+- **Unidirectional only** - `bidirectional=False` required
+- **batch_first only** - `batch_first=True` required
+
+### WideLSTM Performance
+Block-diagonal matrices become inefficient at large N:
+- **Best:** N ≤ 8 (2-3x speedup)
+- **Crossover:** N ≈ 16 (no benefit)
+- **Overhead:** N > 16 (slower than baseline)
+
+**Workaround:** Group large N into smaller chunks (e.g., N=64 as 8 × WideLSTM(N=8))
 
 ## Use Cases
 
@@ -296,7 +372,8 @@ wide_compiler/
 - **Hyperparameter search** - Evaluate N configurations simultaneously  
 - **Population-based training** - Evolve N agents together
 - **Monte Carlo dropout** - N stochastic forward passes
-- **Transformer ensembles** - N attention heads across models (NEW)
+- **Transformer ensembles** - N attention heads across models
+- **RNN ensembles** - N sequence models in parallel (NEW)
 
 ## License
 
