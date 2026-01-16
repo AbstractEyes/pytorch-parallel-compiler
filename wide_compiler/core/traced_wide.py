@@ -451,15 +451,22 @@ class TracedWideModel(nn.Module):
         """
         Execute graph with N-first internal format.
 
-        Input:  [B, ..., N*D] channel-packed
-        Internal: [N, B, ..., D] N-first format
-        Output: [B, ..., N*D] channel-packed
+        Input:  [B, N*C, ...] channel-packed (C is first feature dim)
+        Internal: [N, B, C, ...] N-first format
+        Output: [B, N*C, ...] channel-packed
         """
-        # Unpack: [B, ..., N*D] -> [N, B, ..., D]
-        *batch_dims, nd = x.shape
-        d = nd // self.n
-        x = x.view(*batch_dims, self.n, d)  # [B, ..., N, D]
-        x = x.movedim(-2, 0)                 # [N, B, ..., D]
+        # Unpack: [B, N*C, ...] -> [N, B, C, ...]
+        # For images: [B, N*C, H, W] -> [N, B, C, H, W]
+        # For sequences: [B, N*D, T] -> [N, B, D, T]
+        # For 1D: [B, N*D] -> [N, B, D]
+
+        B = x.shape[0]
+        nc = x.shape[1]
+        spatial = x.shape[2:]  # Could be (H, W), (T,), or ()
+
+        c = nc // self.n
+        x = x.view(B, self.n, c, *spatial)  # [B, N, C, ...]
+        x = x.movedim(1, 0)                  # [N, B, C, ...]
 
         values: Dict[str, Tensor] = {self._input_name: x}
 
@@ -508,13 +515,21 @@ class TracedWideModel(nn.Module):
 
         out = values[self._output_name]
 
-        # Pack: [N, B, ..., D] -> [B, ..., N*D]
+        # Pack: [N, B, C, ...] -> [B, N*C, ...]
+        # For images: [N, B, C, H, W] -> [B, N*C, H, W]
+        # For sequences: [N, B, D, T] -> [B, N*D, T]
+        # For 1D: [N, B, D] -> [B, N*D]
+
         # Handle tuple outputs (e.g., from attention)
         if isinstance(out, tuple):
             out = out[0]
 
-        out = out.movedim(0, -2)             # [B, ..., N, D]
-        out = out.flatten(-2)                # [B, ..., N*D]
+        N, B = out.shape[0], out.shape[1]
+        C = out.shape[2]
+        spatial = out.shape[3:]  # Could be (H, W), (T,), or ()
+
+        out = out.movedim(0, 1)                    # [B, N, C, ...]
+        out = out.reshape(B, N * C, *spatial)      # [B, N*C, ...]
 
         return out
 
