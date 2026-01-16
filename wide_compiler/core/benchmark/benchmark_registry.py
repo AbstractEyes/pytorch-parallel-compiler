@@ -96,20 +96,8 @@ def _auto_register():
     # Register those with benchmark interface
     for name, cls in primitives.items():
         if hasattr(cls, 'benchmark_job'):
-            # Initialize sweeps if needed
-            if hasattr(cls, '_init_benchmark_sweeps'):
-                try:
-                    cls._init_benchmark_sweeps()
-                except Exception as e:
-                    _IMPORT_ERRORS.append(f"{name}._init_benchmark_sweeps: {e}")
-                    continue
-
-            # Check if BENCHMARK_SWEEPS is populated
-            sweeps = getattr(cls, 'BENCHMARK_SWEEPS', None)
-            if sweeps:  # Non-empty dict
-                _PRIMITIVE_REGISTRY[name] = cls
-            else:
-                _IMPORT_ERRORS.append(f"{name}: BENCHMARK_SWEEPS is empty")
+            # Register immediately - sweeps will be lazily initialized when benchmark_job() is called
+            _PRIMITIVE_REGISTRY[name] = cls
 
 
 def register(name: str, primitive_class: Any) -> None:

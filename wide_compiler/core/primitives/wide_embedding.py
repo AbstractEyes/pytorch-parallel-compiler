@@ -260,8 +260,8 @@ class WideEmbedding(nn.Module):
             model_factory=cls._bench_model,
             input_factory=cls._bench_input,
             wide_factory=cls._bench_wide,
-            pack_fn=cls._bench_pack,
-            unpack_fn=cls._bench_unpack,
+            pack_fn=cls._bench_pack,  # Custom: return single input (all N use same indices)
+            # unpack_fn: use default (output is already N-first [N, B, T, D])
         )
 
     @staticmethod
@@ -271,7 +271,7 @@ class WideEmbedding(nn.Module):
 
     @staticmethod
     def _bench_input(n: int, batch_sizes: int, vocab_sizes: int, seq_lengths: int, device: str = 'cpu', **_) -> Tensor:
-        """Create single input tensor (indices)."""
+        """Create single input tensor [B, T] of indices."""
         return torch.randint(0, vocab_sizes, (batch_sizes, seq_lengths), device=device)
 
     @classmethod
@@ -287,15 +287,16 @@ class WideEmbedding(nn.Module):
 
     @staticmethod
     def _bench_pack(inputs: List[Tensor]) -> Tensor:
-        """Pack N inputs - for embedding, all inputs are the same indices."""
-        return inputs[0]
+        """
+        Pack N inputs - for embedding, all N models use the same input indices.
 
-    @staticmethod
-    def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
-        """Unpack wide output to N outputs."""
-        B, T, ND = output.shape
-        D = ND // n
-        return [output[..., i*D:(i+1)*D] for i in range(n)]
+        Args:
+            inputs: List of N tensors, each [B, T] of indices
+
+        Returns:
+            Single tensor [B, T] (all inputs are identical for embeddings)
+        """
+        return inputs[0]
 
 
 __all__ = ['WideEmbedding', 'EmbeddingStrategy']

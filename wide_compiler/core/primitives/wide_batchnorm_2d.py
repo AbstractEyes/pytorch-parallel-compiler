@@ -207,8 +207,7 @@ class WideBatchNorm2d(nn.Module):
             model_factory=cls._bench_model,
             input_factory=cls._bench_input,
             wide_factory=cls._bench_wide,
-            pack_fn=cls._bench_pack,
-            unpack_fn=cls._bench_unpack,
+            # pack_fn/unpack_fn: use default N-first format [N, B, C, H, W]
         )
 
     @staticmethod
@@ -218,28 +217,13 @@ class WideBatchNorm2d(nn.Module):
 
     @staticmethod
     def _bench_input(n: int, batch_sizes: int, channels: int, heights: int, widths: int, device: str = 'cpu', **_) -> Tensor:
-        """Create single input tensor."""
+        """Create single input tensor [B, C, H, W]."""
         return torch.randn(batch_sizes, channels, heights, widths, device=device)
 
     @classmethod
     def _bench_wide(cls, modules: List[nn.BatchNorm2d], strategy: str) -> 'WideBatchNorm2d':
         """Create WideBatchNorm2d from modules."""
         return cls.from_modules(modules)
-
-    @staticmethod
-    def _bench_pack(inputs: List[Tensor]) -> Tensor:
-        """Pack N inputs into wide format."""
-        stacked = torch.stack(inputs, dim=1)  # [B, N, C, H, W]
-        B, N, C, H, W = stacked.shape
-        return stacked.view(B, N * C, H, W)
-
-    @staticmethod
-    def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
-        """Unpack wide output to N outputs."""
-        B, NC, H, W = output.shape
-        C = NC // n
-        reshaped = output.view(B, n, C, H, W)
-        return [reshaped[:, i] for i in range(n)]
 
 
 __all__ = ['WideBatchNorm2d']
