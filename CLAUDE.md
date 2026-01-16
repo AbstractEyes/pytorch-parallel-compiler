@@ -1,6 +1,6 @@
 # CLAUDE.md - WideCompiler Quick Reference
 
-VERSION = 0.4.0
+VERSION = 0.6.0
 
 Read this first when working on this codebase.
 
@@ -8,7 +8,7 @@ Read this first when working on this codebase.
 
 Fuses N identical PyTorch models into ONE wide model. Instead of N sequential forward passes, one batched forward pass using grouped operations.
 
-**Key insight:** Reshape N models into batch dimension, run single fused kernel.
+**Key insight:** Wide primitives use N-first format `[N, B, C, ...]` internally. TracedWideModel handles packing/unpacking at boundaries.
 
 ## Core Concept
 
@@ -20,7 +20,9 @@ N separate models:        Wide model:
 [Model_N] → out_N
 ```
 
-**Memory layout:** `[B, N*C, ...]` - N models' channels concatenated.
+**Two packing formats:**
+1. **N-first** `[N, B, C, ...]` - Used by Wide primitives internally
+2. **Channel-packed** `[B, N*C, ...]` - Used by TracedWideModel I/O
 
 ## Entry Point
 
@@ -45,22 +47,26 @@ wide_compiler/
     ├── config.py        → WideConfig dataclass
     ├── registry.py      → Maps 'Linear' → WideLinear.from_modules
     ├── traced_wide.py   → FX tracing, graph execution (THE CORE)
-    ├── wide_model.py    → pack_inputs(), unpack_outputs(), tree utils
     ├── benchmark/       → Primitive benchmarking system (NEW)
     │   ├── __init__.py
     │   ├── benchmark_api.py      → run_benchmark(), list_primitives()
     │   ├── benchmark_runner.py   → Execution engine
     │   ├── benchmark_schema.py   → BenchmarkJob, SweepParams, results
     │   └── benchmark_registry.py → Auto-discovers primitives
-    └── primitives/      → One file per Wide op
-        ├── wide_attention.py   → MHA via batched SDPA (11x speedup)
-        ├── wide_linear.py      → Linear via einsum
-        ├── wide_conv1d.py      → Conv1d with groups=N
-        ├── wide_conv2d.py      → Conv2d with groups=N
-        ├── wide_embedding.py   → Batched index lookup (6x speedup)
-        ├── wide_layernorm.py   → Per-group normalization
-        ├── wide_batchnorm_1d.py
-        └── wide_batchnorm_2d.py
+    └── primitives/      → One file per Wide op (14 total)
+        ├── wide_attention.py      → MHA via batched SDPA (11x speedup)
+        ├── wide_linear.py         → Linear via einsum (12x speedup)
+        ├── wide_embedding.py      → Batched index lookup (6x speedup)
+        ├── wide_conv1d.py         → Conv1d with groups=N
+        ├── wide_conv2d.py         → Conv2d with groups=N
+        ├── wide_conv3d.py         → Conv3d with groups=N
+        ├── wide_gru.py            → GRU with fused projections
+        ├── wide_lstm.py           → LSTM with fused projections
+        ├── wide_batchnorm_1d.py   → BatchNorm1d N-first
+        ├── wide_batchnorm_2d.py   → BatchNorm2d N-first
+        ├── wide_layernorm.py      → LayerNorm N-first
+        ├── wide_groupnorm.py      → GroupNorm N-first
+        └── wide_instancenorm.py   → InstanceNorm1d/2d N-first
 ```
 
 ## How It Works
@@ -79,40 +85,54 @@ for node in traced.graph.nodes:
         wide_op = WIDE_BUILDERS[module_type](modules)
 ```
 
-### 3. Graph Execution
+### 3. Graph Execution (v0.6.0 - N-first internal format)
 ```python
 def forward(self, x):
+    # Unpack ONCE: [B, N*C, ...] → [N, B, C, ...]
+    B, nc, *spatial = x.shape[0], x.shape[1], x.shape[2:]
+    c = nc // self.n
+    x = x.view(B, self.n, c, *spatial).movedim(1, 0)
+
+    # Execute graph (all stages operate on N-first)
     values = {self._input_name: x}
     for node_name in self._execution_order:
         args = [values[arg] for arg in self._node_args[node_name]]
         values[node_name] = self.stages[node_name](*args)
-    return values[self._output_name]
+
+    # Pack ONCE: [N, B, C, ...] → [B, N*C, ...]
+    out = values[self._output_name]
+    out = out.movedim(0, 1).reshape(B, self.n * c, *spatial)
+    return out
 ```
 
-## Wide Primitives Pattern
+**Key optimization:** Only 2 reshapes per forward pass (unpack + pack), zero intermediate conversions.
+
+## Wide Primitives Pattern (v0.6.0 - N-first format)
 
 Every primitive follows this pattern:
 
 ```python
 class WideLinear(nn.Module):
     """N parallel Linear layers fused."""
-    
+
     def __init__(self, n, in_features, out_features, strategy='auto'):
         self.weight = nn.Parameter(torch.empty(n, out_features, in_features))
         self._strategy = strategy
-    
+
     def forward(self, x):
-        # x: [B, N*D_in] → [B, N*D_out]
+        # x: [N, B, ..., D_in] → [N, B, ..., D_out] (N-first!)
         if self._use_einsum:
             return self._forward_einsum(x)
         return self._forward_sequential(x)
-    
+
     @classmethod
     def from_modules(cls, modules: List[nn.Linear], strategy='auto'):
         # Stack weights from N modules
 ```
 
-**Critical:** Each primitive has multiple strategies. AUTO selects the fastest.
+**Critical:**
+- All primitives use **N-first format** `[N, B, ...]` internally
+- Each primitive has multiple strategies. AUTO selects the fastest.
 
 ## Strategy Pattern (NEW in 0.4.0)
 
@@ -131,7 +151,7 @@ Each primitive defines strategies with different performance tradeoffs:
 wide = WideLinear.from_modules(modules, strategy='einsum')
 ```
 
-## Benchmark System (NEW in 0.4.0)
+## Benchmark System (v0.6.0 - N-first validation)
 
 Each primitive defines its own benchmark interface:
 
@@ -142,23 +162,35 @@ class WideAttention(nn.Module):
         'quick': SweepParams(n_values=[4,8,16,32], ...),
         'full': SweepParams(n_values=[2,4,8,16,32,64], ...),
     }
-    
+
     @classmethod
     def benchmark_job(cls, preset='full'):
-        return BenchmarkJob(...)
-    
+        return BenchmarkJob(
+            name=f'attention_{preset}',
+            primitive='attention',
+            strategies=cls.BENCHMARK_STRATEGIES,
+            sweep=sweep,
+            model_factory=cls._bench_model,
+            input_factory=cls._bench_input,
+            wide_factory=cls._bench_wide,
+            # pack_fn/unpack_fn: use default N-first [N, B, ...]
+            # validate_fn: optional custom validation
+        )
+
     @staticmethod
-    def _bench_model(**params): ...
+    def _bench_model(**params): ...  # Returns nn.Module
     @staticmethod
-    def _bench_input(**params): ...
+    def _bench_input(**params): ...  # Returns [B, ...] single input
     @classmethod
-    def _bench_wide(cls, modules, strategy): ...
+    def _bench_wide(cls, modules, strategy): ...  # Returns WideModule
 ```
 
-Run via CLI:
+Run via CLI (14 primitives available):
 ```bash
 wide_compiler benchmark attention -p quick
-wide_compiler benchmark all -s  # Save results
+wide_compiler benchmark layernorm -p quick
+wide_compiler benchmark lstm -p quick
+wide_compiler benchmark all  # Run all primitives
 ```
 
 ## Key Speedups
@@ -171,14 +203,23 @@ wide_compiler benchmark all -s  # Save results
 | **WideConv1d** | 3.2x | Grouped convolution |
 | **WideConv2d** | 2.5x | Grouped convolution |
 
-## CLI
+## CLI (v0.6.0 - All 14 primitives)
 
 ```bash
-# Benchmark primitives
-wide_compiler benchmark              # List available
-wide_compiler benchmark attention    # Benchmark one
-wide_compiler benchmark all          # Benchmark all
-wide_compiler benchmark conv2d -p quick -s  # Quick preset, save results
+# Benchmark primitives (auto-discovered from registry)
+wide_compiler benchmark attention -p quick      # Benchmark attention
+wide_compiler benchmark layernorm -p quick      # Benchmark layernorm
+wide_compiler benchmark lstm -p quick           # Benchmark LSTM
+wide_compiler benchmark all -p quick            # Benchmark all 14 primitives
+
+# Available primitives (auto-registered):
+# attention, batchnorm1d, batchnorm2d, conv1d, conv2d, conv3d,
+# embedding, gru, groupnorm, instancenorm1d, instancenorm2d,
+# layernorm, linear, lstm
+
+# Benchmark full models (TracedWideModel)
+wide_compiler benchmark resblock --n 100        # Benchmark sample model
+wide_compiler benchmark mlp --n 50              # Benchmark MLP
 
 # Other commands
 wide_compiler test                   # Correctness tests
@@ -221,36 +262,74 @@ WideConfig.debug()  # Verbose, strict
 | `BenchmarkJob` | benchmark_schema.py | Defines a benchmark sweep |
 | `WideAttention` | wide_attention.py | N parallel MHA (11x speedup) |
 
-## Adding a New Primitive
+## Adding a New Primitive (v0.6.0 checklist)
 
 1. Create `primitives/wide_foo.py`:
 ```python
 class WideFoo(nn.Module):
-    BENCHMARK_STRATEGIES = ['baseline', 'fast', 'sequential']
-    BENCHMARK_SWEEPS = {...}
-    
+    """N parallel Foo modules fused."""
+
+    BENCHMARK_STRATEGIES = ['baseline', 'fused', 'sequential']
+    BENCHMARK_SWEEPS = {}  # Populated lazily
+    _SWEEPS_INITIALIZED = False
+
     def __init__(self, n, ...): ...
-    def forward(self, x): ...
-    
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Forward pass with N-first format.
+
+        Input:  [N, B, ...] N-first format
+        Output: [N, B, ...] N-first format
+        """
+        # Implementation here
+
     @classmethod
-    def from_modules(cls, modules): ...
-    
+    def from_modules(cls, modules: List[nn.Module]): ...
+
     @classmethod
-    def benchmark_job(cls, preset='full'): ...
+    def _init_benchmark_sweeps(cls):
+        """Initialize sweep configs (called once)."""
+        if cls._SWEEPS_INITIALIZED:
+            return
+        cls._SWEEPS_INITIALIZED = True
+        SweepParams = cls._get_sweep_params_class()
+        if SweepParams is None:
+            return
+        cls.BENCHMARK_SWEEPS = {
+            'quick': SweepParams(...),
+            'full': SweepParams(...),
+            'ci': SweepParams(...),
+        }
+
+    @classmethod
+    def benchmark_job(cls, preset='full'):
+        cls._init_benchmark_sweeps()
+        # Return BenchmarkJob with factories
+        # DON'T specify pack_fn/unpack_fn unless non-standard format
 ```
 
-2. Add to `primitives/__init__.py`
-3. Add to `benchmark_registry.py` imports
-4. Register in `registry.py`
+2. Add to `primitives/__init__.py` (import and `__all__`)
+3. Add to `benchmark_registry.py` imports (will auto-register if has `benchmark_job()`)
+4. Add to `registry.py` WIDE_BUILDERS dict (for TracedWideModel support)
 
-## Debugging
+## Debugging (v0.6.0)
 
-1. **Benchmark errors?** Run with verbose to see stack trace
-2. **Wrong outputs?** Check `pack_inputs` produces `[B, N*C, ...]`
-3. **Strategy selection?** Print `wide.strategy` to see which was chosen
-4. **Slow first run?** Warmup iterations. Benchmark after 5+ runs.
+1. **Benchmark errors?** CLI shows full stack trace automatically
+2. **Validation failures?** Check shapes:
+   - Wide output should be `[N, B, ...]`
+   - Baseline outputs should be list of `[B, ...]`
+   - Default validation stacks baseline to `[N, B, ...]` and compares
+3. **Wrong outputs?** Verify primitive uses N-first format internally
+4. **TracedWideModel errors?** Check:
+   - Input is `[B, N*C, ...]` (channel-packed)
+   - Output is `[B, N*C, ...]` (channel-packed)
+   - Internal stages operate on `[N, B, C, ...]` (N-first)
+5. **Strategy selection?** Print `wide.strategy` to see which was chosen
+6. **Slow first run?** Warmup iterations. Benchmark after 5+ runs.
+7. **Missing primitive in CLI?** Check `benchmark_registry.py` imports
 
-## Quick Test
+## Quick Test (v0.6.0 - N-first format)
 
 ```python
 import torch
@@ -258,19 +337,42 @@ from wide_compiler.core.primitives import WideAttention
 
 # Create N attention modules
 n, d_model, n_heads = 8, 256, 8
-modules = [torch.nn.MultiheadAttention(d_model, n_heads, batch_first=True).cuda() 
+modules = [torch.nn.MultiheadAttention(d_model, n_heads, batch_first=True).cuda()
            for _ in range(n)]
 
 # Fuse them
 wide = WideAttention.from_modules(modules, strategy='fused')
 print(wide)  # WideAttention(8x[d=256, h=8], strategy=fused)
 
-# Test
-x = torch.randn(4, 128, n * d_model).cuda()  # [B, T, N*D]
+# Test with N-first format
+x = torch.randn(n, 4, 128, d_model).cuda()  # [N, B, T, D] N-first!
 out = wide(x)
-print(out.shape)  # [4, 128, 2048]
+print(out.shape)  # [8, 4, 128, 256] N-first output
+```
+
+**For TracedWideModel (channel-packed I/O):**
+```python
+import wide_compiler
+
+# Create N models
+models = [MyModel() for _ in range(n)]
+sample = torch.randn(4, 64)  # Single model input
+
+# Compile
+wide = wide_compiler.compile(models, sample)
+
+# Use with channel-packed format
+inputs = [torch.randn(4, 64) for _ in range(n)]
+packed = wide_compiler.pack(inputs)  # [4, N*64]
+output = wide(packed)  # [4, N*output_dim]
+outputs = wide_compiler.unpack(output, n)  # List of [4, output_dim]
 ```
 
 ---
 
-**TL;DR:** `wide_compiler.compile(models, sample)` → FX traces → builds Wide ops with auto-selected strategies → returns `TracedWideModel`. Each primitive benchmarks itself via `wide_compiler benchmark <name>`.
+**TL;DR:**
+- `wide_compiler.compile(models, sample)` → FX traces → builds Wide ops → returns `TracedWideModel`
+- Wide primitives use **N-first** `[N, B, ...]` internally for maximum efficiency
+- TracedWideModel uses **channel-packed** `[B, N*C, ...]` at I/O boundaries
+- Zero intermediate pack/unpack between stages
+- 14 primitives with auto-discovered benchmarking via `wide_compiler benchmark <name>`

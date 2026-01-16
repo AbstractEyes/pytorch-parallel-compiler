@@ -1,6 +1,6 @@
 # WideCompiler
 
-### Version 0.5.0
+### Version 0.6.0
 
 Compile-friendly batched model execution. Fuse N identical models into a single Wide model for massive speedups.
 
@@ -21,19 +21,21 @@ output = wide(packed_input)  # 1 kernel launch
 
 **Speedups:** 2-40x depending on model type, N, and compilation mode.
 
+## What's New in 0.6.0
+
+- **N-First Internal Format** - Wide primitives use `[N, B, ...]` format internally for optimal performance
+- **Zero Intermediate Pack/Unpack** - Only 2 reshapes per forward pass (at boundaries), zero conversions between stages
+- **14 Registered Primitives** - All primitives auto-discovered via registry, accessible via CLI
+- **Fixed TracedWideModel** - Correctly handles spatial inputs (images `[B, N*C, H, W]`)
+- **Comprehensive Error Messages** - Full stack traces for easier debugging
+- **Unified Benchmark System** - All primitives use consistent N-first validation protocol
+
 ## What's New in 0.5.0
 
 - **WideGRU** - N parallel GRUs via einsum fusion (**8x speedup** at N=32)
-- **WideLSTM** - N parallel LSTMs via block-diagonal weights (**3.3x speedup** at N=4)
+- **WideLSTM** - N parallel LSTMs via fused projections (**3.3x speedup** at N=4)
 - **Primitive Benchmarks with Compilation** - `benchmark gru -p quick -c` for torch.compile testing
 - **Validation Checkmarks** - Benchmark output shows ✓ when correctness verified
-
-## What's New in 0.4.0
-
-- **WideAttention** - N parallel attention in single Flash Attention call (**11x speedup**)
-- **Benchmark System** - Per-primitive benchmarking with strategy comparison
-- **Improved WideEmbedding** - Batched indexing strategy (**6x speedup**)
-- **Strategy Selection** - Each primitive auto-selects optimal execution strategy
 
 ## Installation
 
@@ -166,23 +168,24 @@ config = WideConfig(
 
 ## CLI
 
-### Benchmark Primitives
+### Benchmark Primitives (v0.6.0 - 14 primitives)
 
 ```bash
-# List available primitives
-wide_compiler benchmark
+# Benchmark specific primitive (auto-discovered from registry)
+wide_compiler benchmark attention -p quick
+wide_compiler benchmark layernorm -p quick
+wide_compiler benchmark lstm -p quick
+wide_compiler benchmark conv2d -p quick
 
-# Benchmark specific primitive
-wide_compiler benchmark gru
-wide_compiler benchmark lstm
-wide_compiler benchmark attention
-wide_compiler benchmark linear
+# All 14 available primitives:
+# attention, batchnorm1d, batchnorm2d, conv1d, conv2d, conv3d,
+# embedding, gru, groupnorm, instancenorm1d, instancenorm2d,
+# layernorm, linear, lstm
 
 # Benchmark all primitives
-wide_compiler benchmark all
+wide_compiler benchmark all -p quick
 
 # With presets
-wide_compiler benchmark gru -p smoke     # Fastest (2 configs)
 wide_compiler benchmark gru -p quick     # Quick (fewer configs)
 wide_compiler benchmark gru -p full      # Full sweep (default)
 wide_compiler benchmark gru -p ci        # CI preset (minimal)
@@ -190,6 +193,10 @@ wide_compiler benchmark gru -p ci        # CI preset (minimal)
 # With torch.compile (recommended for accurate timing)
 wide_compiler benchmark gru -p quick -c                  # Default: reduce-overhead
 wide_compiler benchmark gru -p quick -c max-autotune    # Max performance
+
+# Benchmark full models (TracedWideModel)
+wide_compiler benchmark resblock --n 100     # Benchmark sample model
+wide_compiler benchmark mlp --n 50           # Benchmark MLP
 
 # Other options
 wide_compiler benchmark conv1d -t 20          # Show top 20 results
@@ -215,25 +222,27 @@ wide_compiler trace -m resblock
 wide_compiler info
 ```
 
-## Supported Layers
+## Supported Layers (v0.6.0 - 14 primitives)
 
-| Layer | Wide Version | Strategies | Best Speedup |
-|-------|--------------|------------|--------------|
-| `nn.GRU` | `WideGRU` | fused (einsum) | **7.8x** |
-| `nn.LSTM` | `WideLSTM` | fused (block-diag) | **3.3x** (N=4 only) |
-| `nn.MultiheadAttention` | `WideAttention` | fused, sequential | **11.4x** |
-| `nn.Linear` | `WideLinear` | einsum, sequential | **12.8x** |
-| `nn.Embedding` | `WideEmbedding` | indexed, gather, sequential | **6.4x** |
-| `nn.Conv1d` | `WideConv1d` | grouped, sequential | **3.2x** |
-| `nn.Conv2d` | `WideConv2d` | grouped, channels_last, sequential | **2.5x** |
-| `nn.Conv3d` | `WideConv3d` | grouped, sequential | **~2x** |
-| `nn.GroupNorm` | `WideGroupNorm` | fused, sequential | **~2x** |
-| `nn.InstanceNorm1d/2d` | `WideInstanceNorm1d/2d` | fused, sequential | **~2x** |
-| `nn.LayerNorm` | `WideLayerNorm` | wide | **1.8x** |
-| `nn.BatchNorm1d` | `WideBatchNorm1d` | wide | **1.5x** |
-| `nn.BatchNorm2d` | `WideBatchNorm2d` | wide | **1.5x** |
-| `F.relu`, `F.gelu`, etc. | Passthrough | — | — |
-| `+`, `-`, `*`, `/`, `@` | `BinaryOp` | — | — |
+| Layer | Wide Version | Format | Strategies | Best Speedup |
+|-------|--------------|--------|------------|--------------|
+| `nn.GRU` | `WideGRU` | N-first | fused (einsum) | **7.8x** |
+| `nn.LSTM` | `WideLSTM` | N-first | fused | **3.3x** (N=4) |
+| `nn.MultiheadAttention` | `WideAttention` | N-first | fused, sequential | **11.4x** |
+| `nn.Linear` | `WideLinear` | N-first | einsum, sequential | **12.8x** |
+| `nn.Embedding` | `WideEmbedding` | N-first | indexed, gather, sequential | **6.4x** |
+| `nn.Conv1d` | `WideConv1d` | N-first | grouped, sequential | **3.2x** |
+| `nn.Conv2d` | `WideConv2d` | N-first | grouped, channels_last, sequential | **2.5x** |
+| `nn.Conv3d` | `WideConv3d` | N-first | grouped, sequential | **~2x** |
+| `nn.GroupNorm` | `WideGroupNorm` | N-first | fused, sequential | **~2x** |
+| `nn.InstanceNorm1d/2d` | `WideInstanceNorm1d/2d` | N-first | fused, sequential | **~2x** |
+| `nn.LayerNorm` | `WideLayerNorm` | N-first | wide | **1.8x** |
+| `nn.BatchNorm1d` | `WideBatchNorm1d` | N-first | wide | **1.5x** |
+| `nn.BatchNorm2d` | `WideBatchNorm2d` | N-first | wide | **1.5x** |
+| `F.relu`, `F.gelu`, etc. | `FunctionalOp` | agnostic | — | — |
+| `+`, `-`, `*`, `/`, `@` | `BinaryOp` | agnostic | — | — |
+
+**All primitives operate on N-first format `[N, B, ...]` internally for optimal performance.**
 
 ## Primitive Benchmarks (A100)
 
@@ -300,32 +309,40 @@ wide_compiler info
 | **ResNet18** | 10 | 8 | eager | **2.3x** |
 | **ResNet18** | 10 | 8 | compile | **1.9x** |
 
-## How it Works
+## How it Works (v0.6.0)
 
 1. **FX Tracing** - `torch.fx.symbolic_trace` captures the computation graph
-2. **Wide Primitives** - Each layer replaced with fused equivalent:
-   - `GRU` → Einsum fusion for input projections
-   - `LSTM` → Block-diagonal weight matrices (N≤4)
-   - `Linear` → Batched einsum
-   - `Conv2d` → Grouped convolution  
+2. **Wide Primitives** - Each layer replaced with N-first fused equivalent:
+   - `GRU` → Einsum fusion for input projections `[N, B, T, I] @ [N, I, 3H]`
+   - `LSTM` → Fused projections `[N, B, T, I] @ [N, I, 4H]`
+   - `Linear` → Batched einsum `[N, B, I] @ [N, I, O]`
+   - `Conv2d` → Grouped convolution on `[N, B, C, H, W]`
    - `Attention` → Reshape N→batch, single Flash Attention call
-   - `BatchNorm` → Single BN over N*C channels
-   - `GroupNorm` → Single GN with N*num_groups
-   - `InstanceNorm` → Single IN over N*C channels
+   - All normalization layers operate on N-first `[N, B, C, ...]`
 3. **Strategy Selection** - Each primitive auto-selects optimal strategy based on N
 4. **Compile-Friendly** - 0 graph breaks, all native PyTorch ops
+5. **Optimal Data Flow** - Only 2 reshapes per forward pass:
+   ```
+   Input [B, N*C, ...] → Unpack → [N, B, C, ...]
+     ↓ All stages operate on N-first (zero intermediate conversions)
+   Output [N, B, C, ...] → Pack → [B, N*C, ...]
+   ```
 
-**Why WideGRU is fast:**
+**Why N-first format is optimal:**
 ```python
-# Einsum fuses N input projections: [B,T,I] @ [N,I,3H] → [B,T,N,3H]
-# One kernel for all N models' input gates
+# All primitives operate on [N, B, ...] format
+# Data flows through without any intermediate packing
+# Only reshape at boundaries (input/output)
+# Result: Maximum kernel fusion, minimum overhead
 ```
 
 **Why WideAttention is so fast:**
 ```python
-# Reshape: [N, B, H, T, D] → [N*B, H, T, D]
+# Input: [N, B, T, D] (N-first)
+# Reshape: [N, B, H, T, Dh] → [N*B, H, T, Dh]
 # Run single F.scaled_dot_product_attention (Flash Attention)
 # All N models processed in ONE kernel call
+# Output: [N, B, T, D] (stays N-first for next stage)
 ```
 
 ## Project Structure

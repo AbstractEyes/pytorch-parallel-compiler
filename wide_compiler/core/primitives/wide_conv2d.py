@@ -13,6 +13,10 @@ Strategies:
 - 'sequential': N separate F.conv2d (exact, slowest)
 - 'auto': Heuristic selection (prefers grouped NCHW)
 
+Input/Output Format (v0.6.0):
+- Input:  [N, B, C_in, H, W]   (N-first)
+- Output: [N, B, C_out, H', W'] (N-first)
+
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
@@ -163,16 +167,34 @@ class WideConv2d(nn.Module):
         return self._strategy
 
     def forward(self, x: Tensor) -> Tensor:
-        """Forward pass - strategy resolved at construction, no runtime selection."""
-        if self._use_channels_last:
-            return self._forward_channels_last(x)
-        elif self._use_grouped:
-            return self.grouped_conv(x)
-        else:
-            return self._forward_sequential(x)
+        """
+        Forward pass with N-first format.
 
-    def _forward_channels_last(self, x: Tensor) -> Tensor:
-        """Execute grouped conv in NHWC format (channels_last)."""
+        Input:  [N, B, C_in, H, W]
+        Output: [N, B, C_out, H', W']
+        """
+        N, B, C, H, W = x.shape
+
+        # Convert N-first to channel-packed: [N, B, C, H, W] -> [B, N*C, H, W]
+        x_packed = x.permute(1, 0, 2, 3, 4).reshape(B, N * C, H, W)
+
+        # Run conv in channel-packed format
+        if self._use_channels_last:
+            out = self._forward_channels_last_internal(x_packed)
+        elif self._use_grouped:
+            out = self.grouped_conv(x_packed)
+        else:
+            out = self._forward_sequential_internal(x_packed)
+
+        # Convert back to N-first: [B, N*C_out, H', W'] -> [N, B, C_out, H', W']
+        B, NC_out, H_out, W_out = out.shape
+        C_out = NC_out // N
+        out = out.view(B, N, C_out, H_out, W_out).permute(1, 0, 2, 3, 4)
+
+        return out.contiguous()
+
+    def _forward_channels_last_internal(self, x: Tensor) -> Tensor:
+        """Execute grouped conv in NHWC format on channel-packed input."""
         x_nhwc = x.to(memory_format=torch.channels_last)
         w_nhwc = self.grouped_conv.weight.to(memory_format=torch.channels_last)
 
@@ -188,8 +210,8 @@ class WideConv2d(nn.Module):
 
         return out.contiguous()
 
-    def _forward_sequential(self, x: Tensor) -> Tensor:
-        """N separate convolutions, concatenated."""
+    def _forward_sequential_internal(self, x: Tensor) -> Tensor:
+        """N separate convolutions on channel-packed input."""
         B = x.shape[0]
         H, W = x.shape[2], x.shape[3]
 
@@ -368,8 +390,7 @@ class WideConv2d(nn.Module):
             model_factory=cls._bench_model,
             input_factory=cls._bench_input,
             wide_factory=cls._bench_wide,
-            pack_fn=cls._bench_pack,
-            unpack_fn=cls._bench_unpack,
+            # pack_fn/unpack_fn/validate_fn: use defaults (N-first format)
         )
 
     @staticmethod
@@ -379,7 +400,7 @@ class WideConv2d(nn.Module):
 
     @staticmethod
     def _bench_input(n: int, batch_sizes: int, channels: int, heights: int, widths: int, device: str = 'cpu', **_) -> Tensor:
-        """Create single input tensor."""
+        """Create single input tensor [B, C, H, W]."""
         return torch.randn(batch_sizes, channels, heights, widths, device=device)
 
     @classmethod
@@ -392,21 +413,6 @@ class WideConv2d(nn.Module):
         }
         strat = strat_map.get(strategy, ConvStrategy.GROUPED)
         return cls.from_modules(modules, strategy=strat)
-
-    @staticmethod
-    def _bench_pack(inputs: List[Tensor]) -> Tensor:
-        """Pack N inputs into wide format."""
-        stacked = torch.stack(inputs, dim=1)  # [B, N, C, H, W]
-        B, N, C, H, W = stacked.shape
-        return stacked.view(B, N * C, H, W)
-
-    @staticmethod
-    def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
-        """Unpack wide output to N outputs."""
-        B, NC, H, W = output.shape
-        C = NC // n
-        reshaped = output.view(B, n, C, H, W)
-        return [reshaped[:, i] for i in range(n)]
 
 
 # Convenience function

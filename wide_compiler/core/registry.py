@@ -44,7 +44,6 @@ class WideRegistry:
         Or directly:
             registry.register('Linear', WideLinear)
         """
-
         def decorator(cls: Type[nn.Module]) -> Type[nn.Module]:
             if not hasattr(cls, 'from_modules'):
                 raise TypeError(
@@ -168,23 +167,61 @@ def auto_register_primitives() -> None:
     Called on import.
     """
     try:
-        from .primitives import (
-            WideLinear,
-            WideConv2d,
-            WideConv1d,
-            WideBatchNorm2d,
-            WideBatchNorm1d,
-            WideLayerNorm,
-            WideEmbedding,
-        )
+        try:
+            from .primitives import (
+                WideLinear,
+                WideConv1d,
+                WideConv2d,
+                WideConv3d,
+                WideBatchNorm1d,
+                WideBatchNorm2d,
+                WideLayerNorm,
+                WideGroupNorm,
+                WideInstanceNorm1d,
+                WideInstanceNorm2d,
+                WideEmbedding,
+                WideAttention,
+                WideGRU,
+                WideLSTM,
+            )
+        except ImportError:
+            from wide_compiler.core.primitives import (
+                WideLinear,
+                WideConv1d,
+                WideConv2d,
+                WideConv3d,
+                WideBatchNorm1d,
+                WideBatchNorm2d,
+                WideLayerNorm,
+                WideGroupNorm,
+                WideInstanceNorm1d,
+                WideInstanceNorm2d,
+                WideEmbedding,
+                WideAttention,
+                WideGRU,
+                WideLSTM,
+            )
 
+        # Linear
         _global_registry.register('Linear', WideLinear)
-        _global_registry.register('Conv2d', WideConv2d)
+        # Convolutions
         _global_registry.register('Conv1d', WideConv1d)
-        _global_registry.register('BatchNorm2d', WideBatchNorm2d)
+        _global_registry.register('Conv2d', WideConv2d)
+        _global_registry.register('Conv3d', WideConv3d)
+        # Normalization
         _global_registry.register('BatchNorm1d', WideBatchNorm1d)
+        _global_registry.register('BatchNorm2d', WideBatchNorm2d)
         _global_registry.register('LayerNorm', WideLayerNorm)
+        _global_registry.register('GroupNorm', WideGroupNorm)
+        _global_registry.register('InstanceNorm1d', WideInstanceNorm1d)
+        _global_registry.register('InstanceNorm2d', WideInstanceNorm2d)
+        # Embedding
         _global_registry.register('Embedding', WideEmbedding)
+        # Attention
+        _global_registry.register('MultiheadAttention', WideAttention)
+        # RNNs
+        _global_registry.register('GRU', WideGRU)
+        _global_registry.register('LSTM', WideLSTM)
 
     except ImportError:
         # Primitives not available - skip
@@ -193,6 +230,7 @@ def auto_register_primitives() -> None:
 
 # Auto-register on module load
 auto_register_primitives()
+
 
 __all__ = [
     'WideRegistry',

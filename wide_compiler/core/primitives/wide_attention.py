@@ -32,14 +32,29 @@ class WideAttention(nn.Module):
     """
     N parallel Multi-Head Attention modules fused into single operations.
 
-    Input shape:  [B, T, N*D]
-    Output shape: [B, T, N*D]
+    Calling conventions:
+
+    1. Direct self-attention (channel-packed):
+       - attn(x) where x: [B, T, N*D]
+       - Returns: Tensor [B, T, N*D]
+
+    2. MHA-style self-attention (sequence-packed from TracedWideModel):
+       - attn(query, key, value) where each is [B, N*T, D]
+       - Auto-repacks to channel format internally
+       - Returns: Tuple[Tensor [B, N*T, D], None]
+
+    3. Cross-attention:
+       - attn(query, key, value) where query: [B, N*Tq, D], key/value: [B, N*Tkv, D]
+       - Q projected from query, K from key, V from value
+       - Returns: Tuple[Tensor [B, N*Tq, D], None]
 
     Internally:
-    1. Project Q, K, V using fused linear (or per-model weights)
-    2. Reshape to [N*B, H, T, D_head] for batched attention
-    3. Run F.scaled_dot_product_attention (Flash Attention)
-    4. Reshape back and project output
+    1. Auto-detect packing format from input shape
+    2. Separate Q projection from query, KV projection from key
+    3. Reshape to [N*B, H, T, D_head] for batched attention
+    4. Run F.scaled_dot_product_attention (Flash Attention)
+    5. Reshape and apply output projection
+    6. Repack to original format if needed
 
     Strategies:
         'fused': Reshape N models into batch dim, single SDPA call
@@ -78,13 +93,18 @@ class WideAttention(nn.Module):
         self._strategy = strategy
         self._use_fused = (strategy == AttentionStrategy.FUSED)
 
-        # QKV projection weights: [N, 3*D, D] for fused QKV
-        # Stored as [N, 3, D, D] for clarity then reshaped
-        self.qkv_weight = nn.Parameter(torch.empty(n, 3 * d_model, d_model))
+        # Separate Q and KV projections to support cross-attention
+        # Q projection: [N, D, D]
+        self.q_weight = nn.Parameter(torch.empty(n, d_model, d_model))
+        # KV projection: [N, 2*D, D] (K and V concatenated)
+        self.kv_weight = nn.Parameter(torch.empty(n, 2 * d_model, d_model))
+
         if bias:
-            self.qkv_bias = nn.Parameter(torch.empty(n, 3 * d_model))
+            self.q_bias = nn.Parameter(torch.empty(n, d_model))
+            self.kv_bias = nn.Parameter(torch.empty(n, 2 * d_model))
         else:
-            self.register_parameter('qkv_bias', None)
+            self.register_parameter('q_bias', None)
+            self.register_parameter('kv_bias', None)
 
         # Output projection: [N, D, D]
         self.out_weight = nn.Parameter(torch.empty(n, d_model, d_model))
@@ -101,12 +121,15 @@ class WideAttention(nn.Module):
 
     def _reset_parameters(self):
         """Initialize like nn.Linear."""
-        import math
         for i in range(self.n):
-            # QKV
-            nn.init.xavier_uniform_(self.qkv_weight[i].view(3, self.d_model, self.d_model))
-            if self.qkv_bias is not None:
-                nn.init.zeros_(self.qkv_bias[i])
+            # Q projection
+            nn.init.xavier_uniform_(self.q_weight[i])
+            if self.q_bias is not None:
+                nn.init.zeros_(self.q_bias[i])
+            # KV projection
+            nn.init.xavier_uniform_(self.kv_weight[i].view(2, self.d_model, self.d_model))
+            if self.kv_bias is not None:
+                nn.init.zeros_(self.kv_bias[i])
             # Output
             nn.init.xavier_uniform_(self.out_weight[i])
             if self.out_bias is not None:
@@ -114,108 +137,152 @@ class WideAttention(nn.Module):
 
     def forward(
         self,
-        x: Tensor,
+        query: Tensor,
+        key: Optional[Tensor] = None,
+        value: Optional[Tensor] = None,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
-    ) -> Tensor:
+        need_weights: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, None]]:
         """
-        Forward pass.
+        Forward pass with N-first format.
 
-        Args:
-            x: [B, T, N*D] input hidden states
-            attn_mask: Optional attention mask [T, T] or [B, T, T]
-            is_causal: If True, apply causal mask (for decoder)
+        Input:  [N, B, T, D] N-first format for query/key/value
+        Output: [N, B, T, D] or Tuple[[N, B, T, D], None]
 
-        Returns:
-            [B, T, N*D] output hidden states
+        For self-attention, key and value default to query.
         """
+        N, D = self.n, self.d_model
+
+        # Determine if MHA-style call (3 args) or direct call (1 arg)
+        mha_mode = key is not None
+
+        # Handle self-attention: key/value default to query
+        if key is None:
+            key = query
+        if value is None:
+            value = key
+
+        # Run attention (inputs already N-first)
         if self._use_fused:
-            return self._forward_fused(x, attn_mask, is_causal)
+            out = self._forward_fused(query, key, value, attn_mask, is_causal)
         else:
-            return self._forward_sequential(x, attn_mask, is_causal)
+            out = self._forward_sequential(query, key, value, attn_mask, is_causal)
+
+        # Return appropriate type
+        if mha_mode:
+            return out, None
+        else:
+            return out
 
     def _forward_fused(
         self,
-        x: Tensor,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
         attn_mask: Optional[Tensor],
         is_causal: bool,
     ) -> Tensor:
         """
         Fused attention using batched SDPA.
 
-        Reshape N parallel models into batch dimension to leverage
-        Flash Attention / memory-efficient attention.
+        Input:  [N, B, Tq, D] query, [N, B, Tkv, D] key/value (N-first)
+        Output: [N, B, Tq, D]
         """
-        B, T, ND = x.shape
         N, D, H, Dh = self.n, self.d_model, self.n_heads, self.d_head
+        _, B, Tq, _ = query.shape
+        Tkv = key.size(2)
 
-        # Reshape input: [B, T, N*D] -> [N, B, T, D]
-        x = x.view(B, T, N, D).permute(2, 0, 1, 3)  # [N, B, T, D]
+        # Inputs already N-first: [N, B, T, D]
 
-        # QKV projection via einsum: [N, B, T, D] @ [N, D, 3D] -> [N, B, T, 3D]
-        qkv = torch.einsum('nbtd,nod->nbto', x, self.qkv_weight)
-        if self.qkv_bias is not None:
-            qkv = qkv + self.qkv_bias.view(N, 1, 1, 3 * D)
+        # Q projection: [N, B, Tq, D] @ [N, D, D] -> [N, B, Tq, D]
+        q = torch.einsum('nbtd,nod->nbto', query, self.q_weight)
+        if self.q_bias is not None:
+            q = q + self.q_bias.view(N, 1, 1, D)
 
-        # Split Q, K, V: [N, B, T, 3D] -> 3x [N, B, T, D]
-        q, k, v = qkv.chunk(3, dim=-1)
+        # K projection from key: [N, B, Tkv, D] @ [N, D, D] -> [N, B, Tkv, D]
+        k_weight = self.kv_weight[:, :D, :]  # [N, D, D]
+        k = torch.einsum('nbtd,nod->nbto', key, k_weight)
 
-        # Reshape for multi-head: [N, B, T, D] -> [N, B, H, T, Dh] -> [N*B, H, T, Dh]
-        q = q.view(N, B, T, H, Dh).permute(0, 1, 3, 2, 4).reshape(N * B, H, T, Dh)
-        k = k.view(N, B, T, H, Dh).permute(0, 1, 3, 2, 4).reshape(N * B, H, T, Dh)
-        v = v.view(N, B, T, H, Dh).permute(0, 1, 3, 2, 4).reshape(N * B, H, T, Dh)
+        # V projection from value: [N, B, Tkv, D] @ [N, D, D] -> [N, B, Tkv, D]
+        v_weight = self.kv_weight[:, D:, :]  # [N, D, D]
+        v = torch.einsum('nbtd,nod->nbto', value, v_weight)
+
+        if self.kv_bias is not None:
+            k = k + self.kv_bias[:, :D].view(N, 1, 1, D)
+            v = v + self.kv_bias[:, D:].view(N, 1, 1, D)
+
+        # Reshape for multi-head attention
+        # [N, B, T, D] -> [N, B, H, T, Dh] -> [N*B, H, T, Dh]
+        q = q.view(N, B, Tq, H, Dh).permute(0, 1, 3, 2, 4).reshape(N * B, H, Tq, Dh)
+        k = k.view(N, B, Tkv, H, Dh).permute(0, 1, 3, 2, 4).reshape(N * B, H, Tkv, Dh)
+        v = v.view(N, B, Tkv, H, Dh).permute(0, 1, 3, 2, 4).reshape(N * B, H, Tkv, Dh)
 
         # Scaled dot-product attention (Flash Attention when available)
-        # [N*B, H, T, Dh]
         dropout_p = self.dropout if self.training else 0.0
         attn_out = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
             dropout_p=dropout_p,
             is_causal=is_causal,
-        )
+        )  # [N*B, H, Tq, Dh]
 
-        # Reshape back: [N*B, H, T, Dh] -> [N, B, T, D]
-        attn_out = attn_out.view(N, B, H, T, Dh).permute(0, 1, 3, 2, 4).reshape(N, B, T, D)
+        # Reshape back: [N*B, H, Tq, Dh] -> [N, B, Tq, D]
+        attn_out = attn_out.view(N, B, H, Tq, Dh).permute(0, 1, 3, 2, 4).reshape(N, B, Tq, D)
 
-        # Output projection: [N, B, T, D] @ [N, D, D] -> [N, B, T, D]
+        # Output projection: [N, B, Tq, D] @ [N, D, D] -> [N, B, Tq, D]
         out = torch.einsum('nbtd,nod->nbto', attn_out, self.out_weight)
         if self.out_bias is not None:
             out = out + self.out_bias.view(N, 1, 1, D)
-
-        # Reshape output: [N, B, T, D] -> [B, T, N*D]
-        out = out.permute(1, 2, 0, 3).reshape(B, T, N * D)
 
         return out
 
     def _forward_sequential(
         self,
-        x: Tensor,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
         attn_mask: Optional[Tensor],
         is_causal: bool,
     ) -> Tensor:
-        """N separate attention computations - baseline."""
-        B, T, ND = x.shape
-        N, D, H, Dh = self.n, self.d_model, self.n_heads, self.d_head
+        """
+        N separate attention computations - baseline.
 
-        # Reshape input: [B, T, N*D] -> [B, T, N, D]
-        x = x.view(B, T, N, D)
+        Input:  [N, B, Tq, D] query, [N, B, Tkv, D] key/value (N-first)
+        Output: [N, B, Tq, D]
+        """
+        N, D, H, Dh = self.n, self.d_model, self.n_heads, self.d_head
+        _, B, Tq, _ = query.shape
+        Tkv = key.size(2)
+
+        # Split KV weight into K and V parts
+        k_weight = self.kv_weight[:, :D, :]  # [N, D, D]
+        v_weight = self.kv_weight[:, D:, :]  # [N, D, D]
 
         outputs = []
         dropout_p = self.dropout if self.training else 0.0
 
         for i in range(N):
-            xi = x[:, :, i, :]  # [B, T, D]
+            qi = query[i]  # [B, Tq, D]
+            ki = key[i]    # [B, Tkv, D]
+            vi = value[i]  # [B, Tkv, D]
 
-            # QKV projection
-            qkv = F.linear(xi, self.qkv_weight[i],
-                          self.qkv_bias[i] if self.qkv_bias is not None else None)
-            q, k, v = qkv.chunk(3, dim=-1)  # 3x [B, T, D]
+            # Q projection
+            q = F.linear(qi, self.q_weight[i],
+                        self.q_bias[i] if self.q_bias is not None else None)
+
+            # K projection from key
+            k_bias = self.kv_bias[i, :D] if self.kv_bias is not None else None
+            k = F.linear(ki, k_weight[i], k_bias)
+
+            # V projection from value
+            v_bias = self.kv_bias[i, D:] if self.kv_bias is not None else None
+            v = F.linear(vi, v_weight[i], v_bias)
 
             # Reshape for multi-head: [B, T, D] -> [B, H, T, Dh]
-            q = q.view(B, T, H, Dh).permute(0, 2, 1, 3)
-            k = k.view(B, T, H, Dh).permute(0, 2, 1, 3)
-            v = v.view(B, T, H, Dh).permute(0, 2, 1, 3)
+            q = q.view(B, Tq, H, Dh).permute(0, 2, 1, 3)
+            k = k.view(B, Tkv, H, Dh).permute(0, 2, 1, 3)
+            v = v.view(B, Tkv, H, Dh).permute(0, 2, 1, 3)
 
             # SDPA
             attn_out = F.scaled_dot_product_attention(
@@ -223,18 +290,18 @@ class WideAttention(nn.Module):
                 attn_mask=attn_mask,
                 dropout_p=dropout_p,
                 is_causal=is_causal,
-            )
+            )  # [B, H, Tq, Dh]
 
-            # Reshape: [B, H, T, Dh] -> [B, T, D]
-            attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, T, D)
+            # Reshape: [B, H, Tq, Dh] -> [B, Tq, D]
+            attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, Tq, D)
 
             # Output projection
             out = F.linear(attn_out, self.out_weight[i],
                           self.out_bias[i] if self.out_bias is not None else None)
             outputs.append(out)
 
-        # Concatenate: [B, T, N*D]
-        return torch.cat(outputs, dim=-1)
+        # Stack: [N, B, Tq, D]
+        return torch.stack(outputs, dim=0)
 
     @classmethod
     def from_modules(
@@ -245,7 +312,7 @@ class WideAttention(nn.Module):
         """
         Create from N existing MultiheadAttention modules.
 
-        Note: Assumes modules use self-attention (q=k=v input).
+        Supports both self-attention and cross-attention patterns.
         """
         n = len(modules)
         t = modules[0]
@@ -261,13 +328,26 @@ class WideAttention(nn.Module):
 
         # Copy to same device/dtype
         wide = wide.to(device=t.in_proj_weight.device, dtype=t.in_proj_weight.dtype)
+        D = t.embed_dim
 
         with torch.no_grad():
             for i, m in enumerate(modules):
-                # in_proj_weight is [3*D, D], in_proj_bias is [3*D]
-                wide.qkv_weight[i] = m.in_proj_weight
+                # in_proj_weight is [3*D, D] = [Q; K; V] stacked
+                # in_proj_bias is [3*D]
+                in_w = m.in_proj_weight  # [3D, D]
+
+                # Split into Q [D, D] and KV [2D, D]
+                q_w = in_w[:D, :]         # [D, D]
+                kv_w = in_w[D:, :]        # [2D, D]
+
+                wide.q_weight[i] = q_w
+                wide.kv_weight[i] = kv_w
+
                 if m.in_proj_bias is not None:
-                    wide.qkv_bias[i] = m.in_proj_bias
+                    in_b = m.in_proj_bias  # [3D]
+                    wide.q_bias[i] = in_b[:D]
+                    wide.kv_bias[i] = in_b[D:]
+
                 # out_proj
                 wide.out_weight[i] = m.out_proj.weight
                 if m.out_proj.bias is not None:
@@ -375,8 +455,7 @@ class WideAttention(nn.Module):
             model_factory=cls._bench_model,
             input_factory=cls._bench_input,
             wide_factory=cls._bench_wide,
-            pack_fn=cls._bench_pack,
-            unpack_fn=cls._bench_unpack,
+            # pack_fn/unpack_fn: use default N-first format [N, B, T, D]
         )
 
     @staticmethod
@@ -396,6 +475,7 @@ class WideAttention(nn.Module):
 
     @staticmethod
     def _bench_input(n: int, batch_sizes: int, d_model: int, seq_lengths: int, device: str = 'cpu', **_) -> Tensor:
+        """Create single input tensor [B, T, D]."""
         return torch.randn(batch_sizes, seq_lengths, d_model, device=device)
 
     @classmethod
@@ -410,17 +490,6 @@ class WideAttention(nn.Module):
         # Extract MHA from wrappers
         mha_modules = [m.mha for m in modules]
         return cls.from_modules(mha_modules, strategy=strat)
-
-    @staticmethod
-    def _bench_pack(inputs: List[Tensor]) -> Tensor:
-        # inputs: list of [B, T, D]
-        return torch.cat(inputs, dim=-1)  # [B, T, N*D]
-
-    @staticmethod
-    def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
-        B, T, ND = output.shape
-        D = ND // n
-        return [output[..., i*D:(i+1)*D] for i in range(n)]
 
 
 __all__ = ['WideAttention', 'AttentionStrategy']

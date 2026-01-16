@@ -117,22 +117,36 @@ except ImportError:
 try:
     from .core.primitives import (
         WideLinear,
-        WideConv2d,
         WideConv1d,
-        WideBatchNorm2d,
+        WideConv2d,
+        WideConv3d,
         WideBatchNorm1d,
+        WideBatchNorm2d,
         WideLayerNorm,
+        WideGroupNorm,
+        WideInstanceNorm1d,
+        WideInstanceNorm2d,
         WideEmbedding,
+        WideAttention,
+        WideGRU,
+        WideLSTM,
     )
 except ImportError:
     from wide_compiler.core.primitives import (
         WideLinear,
-        WideConv2d,
         WideConv1d,
-        WideBatchNorm2d,
+        WideConv2d,
+        WideConv3d,
         WideBatchNorm1d,
+        WideBatchNorm2d,
         WideLayerNorm,
+        WideGroupNorm,
+        WideInstanceNorm1d,
+        WideInstanceNorm2d,
         WideEmbedding,
+        WideAttention,
+        WideGRU,
+        WideLSTM,
     )
 
 # Benchmark API (optional - may not be installed)
@@ -196,12 +210,19 @@ __all__ = [
 
     # Primitives
     'WideLinear',
-    'WideConv2d',
     'WideConv1d',
-    'WideBatchNorm2d',
+    'WideConv2d',
+    'WideConv3d',
     'WideBatchNorm1d',
+    'WideBatchNorm2d',
     'WideLayerNorm',
+    'WideGroupNorm',
+    'WideInstanceNorm1d',
+    'WideInstanceNorm2d',
     'WideEmbedding',
+    'WideAttention',
+    'WideGRU',
+    'WideLSTM',
 
     # Benchmark (if available)
     'benchmark_primitive',

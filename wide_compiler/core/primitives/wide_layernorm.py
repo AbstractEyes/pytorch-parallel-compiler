@@ -39,29 +39,30 @@ class WideLayerNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(n * normalized_shape))
 
     def forward(self, x: Tensor) -> Tensor:
-        # x: [B, N*D] or [B, T, N*D]
+        """
+        Layer normalization with N-first format.
+
+        Input:  [N, B, ..., D] N-first format
+        Output: [N, B, ..., D]
+        """
         D = self.normalized_shape
+        N = self.n
 
-        if x.dim() == 2:
-            B, ND = x.shape
-            N = ND // D
+        # Get per-model weight/bias: [N, D]
+        weight = self.weight.view(N, D)
+        bias = self.bias.view(N, D)
 
-            # Reshape to [B, N, D], normalize over D, reshape back
-            x = x.view(B, N, D)
-            x = F.layer_norm(x, (D,), eps=self.eps)
-            x = x.view(B, ND)
+        # Expand weight/bias to match x dimensions
+        # x: [N, B, ..., D], need weight: [N, 1, ..., 1, D]
+        for _ in range(x.dim() - 2):
+            weight = weight.unsqueeze(1)
+            bias = bias.unsqueeze(1)
 
-            # Apply per-group affine
-            x = x * self.weight + self.bias
-
-        elif x.dim() == 3:
-            B, T, ND = x.shape
-            N = ND // D
-
-            x = x.view(B, T, N, D)
-            x = F.layer_norm(x, (D,), eps=self.eps)
-            x = x.view(B, T, ND)
-            x = x * self.weight + self.bias
+        # Manual layer norm: normalize over last dim, per-model affine
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, unbiased=False, keepdim=True)
+        x = (x - mean) / torch.sqrt(var + self.eps)
+        x = x * weight + bias
 
         return x
 
@@ -184,8 +185,7 @@ class WideLayerNorm(nn.Module):
             model_factory=cls._bench_model,
             input_factory=cls._bench_input,
             wide_factory=cls._bench_wide,
-            pack_fn=cls._bench_pack,
-            unpack_fn=cls._bench_unpack,
+            # pack_fn/unpack_fn: use default N-first format [N, B, T, D]
         )
 
     @staticmethod
@@ -195,26 +195,13 @@ class WideLayerNorm(nn.Module):
 
     @staticmethod
     def _bench_input(n: int, batch_sizes: int, d_model: int, seq_lengths: int, device: str = 'cpu', **_) -> Tensor:
-        """Create single input tensor."""
+        """Create single input tensor [B, T, D]."""
         return torch.randn(batch_sizes, seq_lengths, d_model, device=device)
 
     @classmethod
     def _bench_wide(cls, modules: List[nn.LayerNorm], strategy: str) -> 'WideLayerNorm':
         """Create WideLayerNorm from modules."""
         return cls.from_modules(modules)
-
-    @staticmethod
-    def _bench_pack(inputs: List[Tensor]) -> Tensor:
-        """Pack N inputs into wide format."""
-        # inputs: list of [B, T, D]
-        return torch.cat(inputs, dim=-1)  # [B, T, N*D]
-
-    @staticmethod
-    def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
-        """Unpack wide output to N outputs."""
-        B, T, ND = output.shape
-        D = ND // n
-        return [output[..., i * D:(i + 1) * D] for i in range(n)]
 
 
 __all__ = ['WideLayerNorm']

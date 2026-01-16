@@ -11,6 +11,10 @@ Strategies:
 - 'sequential': N separate F.linear (baseline, exact)
 - 'auto': Heuristic selection (picks einsum for N>=8 or low B)
 
+Input/Output Format (v0.6.0):
+- Input:  [N, B, ..., in_features]  (N-first)
+- Output: [N, B, ..., out_features] (N-first)
+
 Speedup examples (compiled, A100):
 - N=20, B=32:  3.0x
 - N=50, B=16:  5.1x
@@ -132,58 +136,67 @@ class WideLinear(nn.Module):
                 nn.init.uniform_(self.bias[i], -bound, bound)
 
     def forward(self, x: Tensor) -> Tensor:
-        """Forward pass - strategy resolved at construction, no runtime selection."""
+        """
+        Forward pass with N-first format.
+
+        Input:  [N, B, ..., I] N-first with any batch dims
+        Output: [N, B, ..., O]
+        """
         if self._use_einsum:
             return self._forward_einsum(x)
         else:
             return self._forward_sequential(x)
 
     def _forward_einsum(self, x: Tensor) -> Tensor:
-        """Batched matrix multiply via einsum."""
-        input_2d = x.dim() == 2
+        """
+        Batched matrix multiply via einsum.
 
-        if input_2d:
-            # [B, N*in] -> [N, B, in]
-            B = x.shape[0]
-            x = x.view(B, self.n, self.in_features).permute(1, 0, 2)
-        elif x.shape[0] == self.n:
-            # Already [N, B, in]
-            pass
-        else:
-            # [B, N, in] -> [N, B, in]
-            x = x.permute(1, 0, 2)
+        Input:  [N, B, ..., I] - N-first format
+        Output: [N, B, ..., O]
+        """
+        N = self.n
+        orig_shape = x.shape  # [N, B, ..., I]
+        batch_shape = orig_shape[1:-1]  # [B, ...]
 
-        # Einsum: [N, out, in] @ [N, B, in] -> [N, B, out]
+        # Flatten batch dims: [N, B, ..., I] -> [N, B*, I]
+        x = x.reshape(N, -1, self.in_features)
+
+        # Einsum: [N, out, in] @ [N, B*, in] -> [N, B*, out]
         out = torch.einsum('noi,nbi->nbo', self.weight, x)
 
         if self.bias is not None:
             out = out + self.bias.unsqueeze(1)  # [N, 1, out]
 
-        if input_2d:
-            # [N, B, out] -> [B, N*out]
-            out = out.permute(1, 0, 2).reshape(B, -1)
+        # Restore batch dims: [N, B*, O] -> [N, B, ..., O]
+        out = out.reshape(N, *batch_shape, self.out_features)
 
         return out
 
     def _forward_sequential(self, x: Tensor) -> Tensor:
-        """N separate linear operations. Exact but slower."""
-        input_2d = x.dim() == 2
+        """
+        N separate linear operations. Exact but slower.
 
-        if input_2d:
-            B = x.shape[0]
-            x = x.view(B, self.n, self.in_features)
+        Input:  [N, B, ..., I] N-first format
+        Output: [N, B, ..., O]
+        """
+        N = self.n
+        orig_shape = x.shape  # [N, B, ..., I]
+        batch_shape = orig_shape[1:-1]  # [B, ...]
+
+        # Flatten batch dims: [N, B, ..., I] -> [N, B*, I]
+        x = x.reshape(N, -1, self.in_features)
 
         outputs = []
-        for i in range(self.n):
-            xi = x[:, i] if x.dim() == 3 and x.shape[1] == self.n else x[i]
+        for i in range(N):
+            xi = x[i]  # [B*, I]
             bi = self.bias[i] if self.bias is not None else None
-            out = F.linear(xi, self.weight[i], bi)
+            out = F.linear(xi, self.weight[i], bi)  # [B*, O]
             outputs.append(out)
 
-        out = torch.stack(outputs, dim=1)  # [B, N, out]
+        out = torch.stack(outputs, dim=0)  # [N, B*, O]
 
-        if input_2d:
-            out = out.view(out.shape[0], -1)  # [B, N*out]
+        # Restore batch dims: [N, B*, O] -> [N, B, ..., O]
+        out = out.reshape(N, *batch_shape, self.out_features)
 
         return out
 
@@ -313,8 +326,7 @@ class WideLinear(nn.Module):
             model_factory=cls._bench_model,
             input_factory=cls._bench_input,
             wide_factory=cls._bench_wide,
-            pack_fn=cls._bench_pack,
-            unpack_fn=cls._bench_unpack,
+            # pack_fn/unpack_fn/validate_fn: use defaults (N-first format)
         )
 
     @staticmethod
@@ -324,7 +336,7 @@ class WideLinear(nn.Module):
 
     @staticmethod
     def _bench_input(n: int, batch_sizes: int, d_model: int, device: str = 'cpu', **_) -> Tensor:
-        """Create single input tensor."""
+        """Create single input tensor [B, D]."""
         return torch.randn(batch_sizes, d_model, device=device)
 
     @classmethod
@@ -336,18 +348,6 @@ class WideLinear(nn.Module):
         }
         strat = strat_map.get(strategy, LinearStrategy.EINSUM)
         return cls.from_modules(modules, strategy=strat)
-
-    @staticmethod
-    def _bench_pack(inputs: List[Tensor]) -> Tensor:
-        """Pack N inputs into wide format."""
-        return torch.cat(inputs, dim=1)  # [B, N*d]
-
-    @staticmethod
-    def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
-        """Unpack wide output to N outputs."""
-        B = output.shape[0]
-        d = output.shape[1] // n
-        return [output[:, i*d:(i+1)*d] for i in range(n)]
 
 
 __all__ = [

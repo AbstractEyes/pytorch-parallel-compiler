@@ -8,6 +8,30 @@ Forward uses dict-based value lookup which compiles cleanly (0 graph breaks).
 All string ops, isinstance checks, and per-stage allocations are traced through
 by torch.compile without issue.
 
+PACKING CONVENTION:
+    TracedWideModel uses channel-packing: input [B, D] becomes [B, N*D].
+    All Wide primitives (WideLinear, WideConv2d, etc.) expect this convention.
+
+LIMITATIONS:
+    Models with data-dependent reshapes (e.g., `x.view(B, H, W, C)`) will fail
+    because the packed tensor has N*D elements, not D. Supported patterns:
+
+    ✓ MLPs (Linear → activation → Linear)
+    ✓ CNNs (Conv2d → BatchNorm → ReLU → Pool)
+    ✓ Transformers WITHOUT explicit reshapes in forward()
+
+    ✗ ViT with `x.view(B, num_patches, patch_dim)` - patch dim changes with N
+    ✗ Any model using `.view()` or `.reshape()` with hardcoded dimensions
+
+    For models with reshapes, use manual Wide construction with einsum (see demos).
+
+ATTENTION HANDLING:
+    WideAttention auto-detects input format and handles both conventions:
+    - Direct call: [B, T, N*D] channel-packed → returns Tensor
+    - MHA trace: [B, N*T, D] sequence-packed → auto-repacks, returns Tuple
+
+    No wrapper needed - WideAttention handles repacking internally.
+
 FUTURE OPTIMIZATION:
     Yield-tree execution (pre-compiled index-based plan with generator traversal)
     showed ~7% eager speedup in prototyping. The pattern:
@@ -46,19 +70,21 @@ import operator
 
 try:
     from .primitives import (
-        WideLinear, WideConv2d, WideConv1d,
-        WideBatchNorm2d, WideBatchNorm1d, WideLayerNorm,
-        WideEmbedding
+        WideLinear, WideConv1d, WideConv2d, WideConv3d,
+        WideBatchNorm1d, WideBatchNorm2d, WideLayerNorm,
+        WideGroupNorm, WideInstanceNorm1d, WideInstanceNorm2d,
+        WideEmbedding, WideAttention, WideGRU, WideLSTM
     )
 
-    from .wide_model import pack_inputs, unpack_outputs
+    from .ensemble_util import pack_inputs, unpack_outputs
 except ImportError:
     from wide_compiler.core.primitives import (
-        WideLinear, WideConv2d, WideConv1d,
-        WideBatchNorm2d, WideBatchNorm1d, WideLayerNorm,
-        WideEmbedding
+        WideLinear, WideConv1d, WideConv2d, WideConv3d,
+        WideBatchNorm1d, WideBatchNorm2d, WideLayerNorm,
+        WideGroupNorm, WideInstanceNorm1d, WideInstanceNorm2d,
+        WideEmbedding, WideAttention, WideGRU, WideLSTM
     )
-    from wide_compiler.core.wide_model import pack_inputs, unpack_outputs
+    from wide_compiler.core.ensemble_util import pack_inputs, unpack_outputs
 
 
 # =============================================================================
@@ -66,13 +92,26 @@ except ImportError:
 # =============================================================================
 
 WIDE_BUILDERS = {
+    # Linear
     'Linear': WideLinear.from_modules,
-    'Conv2d': WideConv2d.from_modules,
+    # Convolutions
     'Conv1d': WideConv1d.from_modules,
-    'BatchNorm2d': WideBatchNorm2d.from_modules,
+    'Conv2d': WideConv2d.from_modules,
+    'Conv3d': WideConv3d.from_modules,
+    # Normalization
     'BatchNorm1d': WideBatchNorm1d.from_modules,
+    'BatchNorm2d': WideBatchNorm2d.from_modules,
     'LayerNorm': WideLayerNorm.from_modules,
+    'GroupNorm': WideGroupNorm.from_modules,
+    'InstanceNorm1d': WideInstanceNorm1d.from_modules,
+    'InstanceNorm2d': WideInstanceNorm2d.from_modules,
+    # Embedding
     'Embedding': WideEmbedding.from_modules,
+    # Attention
+    'MultiheadAttention': WideAttention.from_modules,
+    # RNNs
+    'GRU': WideGRU.from_modules,
+    'LSTM': WideLSTM.from_modules,
 }
 
 
@@ -409,7 +448,26 @@ class TracedWideModel(nn.Module):
         return wide_model
 
     def forward(self, x: Tensor) -> Tensor:
-        """Execute graph respecting dataflow."""
+        """
+        Execute graph with N-first internal format.
+
+        Input:  [B, N*C, ...] channel-packed (C is first feature dim)
+        Internal: [N, B, C, ...] N-first format
+        Output: [B, N*C, ...] channel-packed
+        """
+        # Unpack: [B, N*C, ...] -> [N, B, C, ...]
+        # For images: [B, N*C, H, W] -> [N, B, C, H, W]
+        # For sequences: [B, N*D, T] -> [N, B, D, T]
+        # For 1D: [B, N*D] -> [N, B, D]
+
+        B = x.shape[0]
+        nc = x.shape[1]
+        spatial = x.shape[2:]  # Could be (H, W), (T,), or ()
+
+        c = nc // self.n
+        x = x.view(B, self.n, c, *spatial)  # [B, N, C, ...]
+        x = x.movedim(1, 0)                  # [N, B, C, ...]
+
         values: Dict[str, Tensor] = {self._input_name: x}
 
         # Pre-populate get_attr values
@@ -455,7 +513,25 @@ class TracedWideModel(nn.Module):
             else:
                 values[node_name] = op(*args)
 
-        return values[self._output_name]
+        out = values[self._output_name]
+
+        # Pack: [N, B, C, ...] -> [B, N*C, ...]
+        # For images: [N, B, C, H, W] -> [B, N*C, H, W]
+        # For sequences: [N, B, D, T] -> [B, N*D, T]
+        # For 1D: [N, B, D] -> [B, N*D]
+
+        # Handle tuple outputs (e.g., from attention)
+        if isinstance(out, tuple):
+            out = out[0]
+
+        N, B = out.shape[0], out.shape[1]
+        C = out.shape[2]
+        spatial = out.shape[3:]  # Could be (H, W), (T,), or ()
+
+        out = out.movedim(0, 1)                    # [B, N, C, ...]
+        out = out.reshape(B, N * C, *spatial)      # [B, N*C, ...]
+
+        return out
 
     def summary(self) -> str:
         """Print model summary."""

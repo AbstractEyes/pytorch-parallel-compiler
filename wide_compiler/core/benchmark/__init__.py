@@ -29,6 +29,10 @@ from .benchmark_schema import (
     BenchmarkJob,
     SingleResult,
     BenchmarkResult,
+    CompilationMode,
+    default_pack_fn,
+    default_unpack_fn,
+    default_validate_fn,
 )
 
 # Runner
@@ -62,6 +66,10 @@ __all__ = [
     'BenchmarkJob',
     'SingleResult',
     'BenchmarkResult',
+    'CompilationMode',
+    'default_pack_fn',
+    'default_unpack_fn',
+    'default_validate_fn',
 
     # Runner
     'run',

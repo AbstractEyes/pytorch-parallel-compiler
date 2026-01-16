@@ -40,6 +40,7 @@ try:
         print_trace,
     )
     from .core.registry import list_registered
+    from .core.benchmark import list_primitives
 except ImportError:
     from wide_compiler.core import (
         TracedWideModel,
@@ -48,6 +49,7 @@ except ImportError:
         print_trace,
     )
     from wide_compiler.core.registry import list_registered
+    from wide_compiler.core.benchmark import list_primitives
 
 
 # =============================================================================
@@ -209,7 +211,7 @@ def cmd_benchmark(args):
 
     # Check if this is a primitive benchmark or TracedWideModel benchmark
     primitive = args.primitive
-    PRIMITIVES = ['gru', 'lstm', 'linear', 'conv2d', 'attention', 'conv1d', 'embedding']
+    PRIMITIVES = list_primitives()  # Get list from registry
 
     # If primitive is a known primitive, use primitive benchmark mode
     if primitive in PRIMITIVES:
@@ -221,7 +223,7 @@ def cmd_benchmark(args):
         # Maybe they meant a primitive?
         if primitive:
             print(f"Unknown primitive or model: {primitive}")
-            print(f"Primitives: {', '.join(PRIMITIVES)}")
+            print(f"Primitives: {', '.join(sorted(PRIMITIVES))}")
             print(f"Sample models: {', '.join(MODELS.keys())}")
         else:
             print(f"Unknown model: {model_name}")
@@ -236,12 +238,15 @@ def cmd_benchmark_primitive(args, device: str):
     try:
         from .core.benchmark.benchmark_runner import run
         from .core.benchmark.benchmark_schema import CompilationMode, compilation_available
+        from .core.benchmark.benchmark_registry import get_primitive
     except ImportError:
         try:
             from wide_compiler.core.benchmark.benchmark_runner import run
             from wide_compiler.core.benchmark.benchmark_schema import CompilationMode, compilation_available
-        except ImportError:
-            print("Benchmark framework not found. Install with benchmark support.")
+            from wide_compiler.core.benchmark.benchmark_registry import get_primitive
+        except ImportError as e:
+            print(f"Benchmark framework not found. Install with benchmark support.")
+            print(f"Error: {e}")
             return 1
 
     primitive = args.primitive
@@ -256,39 +261,29 @@ def cmd_benchmark_primitive(args, device: str):
     }
     compilation = compile_map.get(args.compile, CompilationMode.EAGER)
 
-    # Load primitive and create benchmark job
-    job = None
+    # Load primitive and create benchmark job using registry
     try:
-        if primitive == 'gru':
-            from .core.primitives import WideGRU
-            job = WideGRU.benchmark_job(preset)
-        elif primitive == 'lstm':
-            from .core.primitives import WideLSTM
-            job = WideLSTM.benchmark_job(preset)
-        elif primitive == 'linear':
-            from .core.primitives import WideLinear
-            job = WideLinear.benchmark_job(preset)
-        elif primitive == 'conv2d':
-            from .core.primitives import WideConv2d
-            job = WideConv2d.benchmark_job(preset)
-        elif primitive == 'conv1d':
-            from .core.primitives import WideConv1d
-            job = WideConv1d.benchmark_job(preset)
-        elif primitive == 'attention':
-            from .core.primitives import WideAttention
-            job = WideAttention.benchmark_job(preset)
-        elif primitive == 'embedding':
-            from .core.primitives import WideEmbedding
-            job = WideEmbedding.benchmark_job(preset)
+        primitive_class = get_primitive(primitive)
+        job = primitive_class.benchmark_job(preset)
+    except KeyError as e:
+        print(f"Unknown primitive: {primitive}")
+        print(f"Available primitives: {', '.join(sorted(list_primitives()))}")
+        return 1
     except ImportError as e:
-        print(f"Could not import {primitive}: {e}")
+        print(f"Could not import benchmark dependencies for {primitive}:")
+        print(f"  {e}")
+        import traceback
+        traceback.print_exc()
         return 1
-    except AttributeError:
-        print(f"Primitive {primitive} does not support benchmarking yet")
+    except AttributeError as e:
+        print(f"Primitive {primitive} does not support benchmarking:")
+        print(f"  {e}")
         return 1
-
-    if job is None:
-        print(f"Could not create benchmark job for {primitive}")
+    except Exception as e:
+        print(f"Could not create benchmark job for {primitive}:")
+        print(f"  {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         return 1
 
     # Print compilation info

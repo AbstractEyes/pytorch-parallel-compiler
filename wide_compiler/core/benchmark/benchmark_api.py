@@ -126,6 +126,7 @@ def benchmark_custom(
     warmup: int = 3,
     iterations: int = 10,
     verbose: bool = True,
+    pack_fn: Optional[Any] = None,
     **model_kwargs,
 ) -> BenchmarkResult:
     """
@@ -145,6 +146,8 @@ def benchmark_custom(
         warmup: Warmup iterations
         iterations: Timing iterations
         verbose: Print progress
+        pack_fn: Optional custom pack function (List[Tensor] -> Tensor).
+                 Defaults to channel concatenation [B, N*C, ...] for TracedWideModel.
         **model_kwargs: Arguments passed to model_class()
 
     Returns:
@@ -166,10 +169,14 @@ def benchmark_custom(
 
     try:
         from ..traced_wide import TracedWideModel
-        from ..ensemble_util import pack_inputs, unpack_outputs
+        from ..ensemble_util import pack_inputs as default_pack
     except ImportError:
         from wide_compiler.core.traced_wide import TracedWideModel
-        from wide_compiler.core.ensemble_util import pack_inputs, unpack_outputs
+        from wide_compiler.core.ensemble_util import pack_inputs as default_pack
+
+    # Use channel concatenation by default (for TracedWideModel compatibility)
+    if pack_fn is None:
+        pack_fn = default_pack
 
     if device == 'cuda' and not torch.cuda.is_available():
         if verbose:
@@ -193,7 +200,7 @@ def benchmark_custom(
 
         # Build wide model
         wide_model = TracedWideModel.from_models(models, sample).to(device).eval()
-        packed = pack_inputs(inputs)
+        packed = pack_fn(inputs)
 
         # Warmup
         with torch.no_grad():
