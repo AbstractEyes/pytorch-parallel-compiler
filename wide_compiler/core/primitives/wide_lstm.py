@@ -455,8 +455,7 @@ class WideLSTM(nn.Module):
             model_factory=cls._bench_model,
             input_factory=cls._bench_input,
             wide_factory=cls._bench_wide,
-            pack_fn=cls._bench_pack,
-            unpack_fn=cls._bench_unpack,
+            # pack_fn/unpack_fn: use default N-first format
             validate_fn=cls._bench_validate,
         )
 
@@ -485,17 +484,6 @@ class WideLSTM(nn.Module):
         strat = strat_map.get(strategy, LSTMStrategy.FUSED)
         lstms = [m.lstm for m in modules]
         return cls.from_modules(lstms, strategy=strat)
-
-    @staticmethod
-    def _bench_pack(inputs: List[Tensor]) -> Tensor:
-        return torch.cat(inputs, dim=-1)
-
-    @staticmethod
-    def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
-        if isinstance(output, tuple):
-            output = output[0]
-        chunks = output.shape[-1] // n
-        return [output[..., i*chunks:(i+1)*chunks] for i in range(n)]
 
     @staticmethod
     def _bench_validate(

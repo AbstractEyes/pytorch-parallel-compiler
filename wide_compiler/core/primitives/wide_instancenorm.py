@@ -384,8 +384,7 @@ class WideInstanceNorm2d(nn.Module):
             model_factory=cls._bench_model,
             input_factory=cls._bench_input,
             wide_factory=cls._bench_wide,
-            pack_fn=cls._bench_pack,
-            unpack_fn=cls._bench_unpack,
+            # pack_fn/unpack_fn: use default N-first format
         )
 
     @staticmethod
@@ -404,16 +403,6 @@ class WideInstanceNorm2d(nn.Module):
             'sequential': InstanceNormStrategy.SEQUENTIAL,
         }
         return cls.from_modules(modules, strategy=strat_map.get(strategy, InstanceNormStrategy.FUSED))
-
-    @staticmethod
-    def _bench_pack(inputs: List[Tensor]) -> Tensor:
-        return torch.cat(inputs, dim=1)
-
-    @staticmethod
-    def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
-        B, NC = output.shape[:2]
-        C = NC // n
-        return [output[:, i*C:(i+1)*C] for i in range(n)]
 
 
 __all__ = ['WideInstanceNorm1d', 'WideInstanceNorm2d', 'InstanceNormStrategy']

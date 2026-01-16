@@ -185,8 +185,7 @@ class WideLayerNorm(nn.Module):
             model_factory=cls._bench_model,
             input_factory=cls._bench_input,
             wide_factory=cls._bench_wide,
-            pack_fn=cls._bench_pack,
-            unpack_fn=cls._bench_unpack,
+            # pack_fn/unpack_fn: use default N-first format [N, B, T, D]
         )
 
     @staticmethod
@@ -196,26 +195,13 @@ class WideLayerNorm(nn.Module):
 
     @staticmethod
     def _bench_input(n: int, batch_sizes: int, d_model: int, seq_lengths: int, device: str = 'cpu', **_) -> Tensor:
-        """Create single input tensor."""
+        """Create single input tensor [B, T, D]."""
         return torch.randn(batch_sizes, seq_lengths, d_model, device=device)
 
     @classmethod
     def _bench_wide(cls, modules: List[nn.LayerNorm], strategy: str) -> 'WideLayerNorm':
         """Create WideLayerNorm from modules."""
         return cls.from_modules(modules)
-
-    @staticmethod
-    def _bench_pack(inputs: List[Tensor]) -> Tensor:
-        """Pack N inputs into wide format."""
-        # inputs: list of [B, T, D]
-        return torch.cat(inputs, dim=-1)  # [B, T, N*D]
-
-    @staticmethod
-    def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
-        """Unpack wide output to N outputs."""
-        B, T, ND = output.shape
-        D = ND // n
-        return [output[..., i * D:(i + 1) * D] for i in range(n)]
 
 
 __all__ = ['WideLayerNorm']

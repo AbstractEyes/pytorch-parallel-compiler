@@ -9,6 +9,16 @@ v0.6.0: N-first format support
 - pack_fn/unpack_fn are optional - only needed for non-standard formats
 - validate_fn optional - default compares output[i] vs baseline[i]
 
+IMPORTANT: Two different packing schemes in WideCompiler:
+1. N-first format [N, B, ...] - Used by Wide primitives (WideLinear, WideGRU, etc.)
+   - Pack: torch.stack(inputs, dim=0)
+   - Used by benchmark system default
+
+2. Channel concatenation [B, N*C, ...] - Used by TracedWideModel
+   - Pack: torch.stack(inputs, dim=1) then flatten to [B, N*C, ...]
+   - Defined in ensemble_util.pack_inputs()
+   - Used by benchmark_custom() for full model benchmarks
+
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
