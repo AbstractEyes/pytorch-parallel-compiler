@@ -40,6 +40,7 @@ try:
         print_trace,
     )
     from .core.registry import list_registered
+    from .core.benchmark import list_primitives
 except ImportError:
     from wide_compiler.core import (
         TracedWideModel,
@@ -48,6 +49,7 @@ except ImportError:
         print_trace,
     )
     from wide_compiler.core.registry import list_registered
+    from wide_compiler.core.benchmark import list_primitives
 
 
 # =============================================================================
@@ -209,7 +211,7 @@ def cmd_benchmark(args):
 
     # Check if this is a primitive benchmark or TracedWideModel benchmark
     primitive = args.primitive
-    PRIMITIVES = ['gru', 'lstm', 'linear', 'conv2d', 'attention', 'conv1d', 'embedding']
+    PRIMITIVES = list_primitives()  # Get list from registry
 
     # If primitive is a known primitive, use primitive benchmark mode
     if primitive in PRIMITIVES:
@@ -221,7 +223,7 @@ def cmd_benchmark(args):
         # Maybe they meant a primitive?
         if primitive:
             print(f"Unknown primitive or model: {primitive}")
-            print(f"Primitives: {', '.join(PRIMITIVES)}")
+            print(f"Primitives: {', '.join(sorted(PRIMITIVES))}")
             print(f"Sample models: {', '.join(MODELS.keys())}")
         else:
             print(f"Unknown model: {model_name}")
