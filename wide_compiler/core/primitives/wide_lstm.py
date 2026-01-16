@@ -492,22 +492,35 @@ class WideLSTM(nn.Module):
         rtol: float = 1e-3,
         atol: float = 1e-3,
     ) -> Tuple[bool, str]:
-        """Validate wide output matches concatenated baseline."""
+        """
+        Validate wide output matches stacked baseline outputs (N-first format).
+
+        Note: LSTMs accumulate numerical differences over timesteps,
+        so we use relaxed tolerances (1e-3 vs 1e-5 for feedforward).
+
+        Args:
+            wide_output: (output, (h_n, c_n)) tuple from WideLSTM, output is [N, B, T, H]
+            baseline_outputs: List of N x [B, T, H] from individual LSTMs
+        """
+        # Handle tuple output from WideLSTM
         if isinstance(wide_output, tuple):
             wide_output = wide_output[0]
 
-        baseline_concat = torch.cat(baseline_outputs, dim=-1)
+        n = len(baseline_outputs)
 
-        if wide_output.shape != baseline_concat.shape:
-            return False, f"Shape mismatch: {wide_output.shape} vs {baseline_concat.shape}"
+        # Stack baseline: N x [B, T, H] -> [N, B, T, H]
+        baseline_stacked = torch.stack(baseline_outputs, dim=0)
 
-        if not torch.allclose(wide_output, baseline_concat, rtol=rtol, atol=atol):
-            diff = (wide_output - baseline_concat).abs()
+        if wide_output.shape != baseline_stacked.shape:
+            return False, f"Shape mismatch: {wide_output.shape} vs {baseline_stacked.shape}"
+
+        if not torch.allclose(wide_output, baseline_stacked, rtol=rtol, atol=atol):
+            diff = (wide_output - baseline_stacked).abs()
             max_diff = diff.max().item()
             mean_diff = diff.mean().item()
             return False, f"Value mismatch: max={max_diff:.6f}, mean={mean_diff:.6f}"
 
-        return True, "OK"
+        return True, f"OK (max_diff={(wide_output - baseline_stacked).abs().max().item():.2e})"
 
 
 __all__ = ['WideLSTM', 'LSTMStrategy']
