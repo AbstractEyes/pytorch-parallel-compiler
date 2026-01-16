@@ -7,6 +7,10 @@ Strategy auto-selected based on N:
   - SEQUENTIAL (N < 10): Loop over individual convs
   - GROUPED (N >= 10): Single grouped convolution
 
+Input/Output Format (v0.6.0):
+- Input:  [N, B, C_in, L]   (N-first)
+- Output: [N, B, C_out, L'] (N-first)
+
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
@@ -35,8 +39,8 @@ class WideConv1d(nn.Module):
     """
     N parallel Conv1d layers as single fused operation.
 
-    Input shape:  [B, N*C_in, L]
-    Output shape: [B, N*C_out, L_out]
+    Input shape:  [N, B, C_in, L]
+    Output shape: [N, B, C_out, L_out]
 
     Strategies:
         GROUPED: Single nn.Conv1d with groups=N
@@ -219,39 +223,31 @@ class WideConv1d(nn.Module):
     @classmethod
     def _get_sweep_params_class(cls):
         """Get SweepParams class with multiple import attempts."""
-        # Try relative import
         try:
             from ..benchmark.benchmark_schema import SweepParams
             return SweepParams
         except ImportError:
             pass
-
-        # Try absolute import
         try:
             from wide_compiler.core.benchmark.benchmark_schema import SweepParams
             return SweepParams
         except ImportError:
             pass
-
         return None
 
     @classmethod
     def _get_benchmark_job_class(cls):
         """Get BenchmarkJob class with multiple import attempts."""
-        # Try relative import
         try:
             from ..benchmark.benchmark_schema import BenchmarkJob
             return BenchmarkJob
         except ImportError:
             pass
-
-        # Try absolute import
         try:
             from wide_compiler.core.benchmark.benchmark_schema import BenchmarkJob
             return BenchmarkJob
         except ImportError:
             pass
-
         return None
 
     # Sweep configurations - populated on first access
@@ -326,8 +322,7 @@ class WideConv1d(nn.Module):
             model_factory=cls._bench_model,
             input_factory=cls._bench_input,
             wide_factory=cls._bench_wide,
-            pack_fn=cls._bench_pack,
-            unpack_fn=cls._bench_unpack,
+            # pack_fn/unpack_fn/validate_fn: use defaults (N-first format)
         )
 
     @staticmethod
@@ -337,7 +332,7 @@ class WideConv1d(nn.Module):
 
     @staticmethod
     def _bench_input(n: int, batch_sizes: int, channels: int, seq_lengths: int, device: str = 'cpu', **_) -> Tensor:
-        """Create single input tensor (will be replicated for N models)."""
+        """Create single input tensor [B, C, L]."""
         return torch.randn(batch_sizes, channels, seq_lengths, device=device)
 
     @classmethod
@@ -345,21 +340,6 @@ class WideConv1d(nn.Module):
         """Create WideConv1d with specific strategy."""
         strat = Conv1dStrategy.GROUPED if strategy == 'grouped' else Conv1dStrategy.SEQUENTIAL
         return cls.from_modules(modules, strategy=strat)
-
-    @staticmethod
-    def _bench_pack(inputs: List[Tensor]) -> Tensor:
-        """Pack N inputs into wide format."""
-        stacked = torch.stack(inputs, dim=1)  # [B, N, C, L]
-        B, N, C, L = stacked.shape
-        return stacked.view(B, N * C, L)
-
-    @staticmethod
-    def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
-        """Unpack wide output to N outputs."""
-        B, NC, L = output.shape
-        C = NC // n
-        reshaped = output.view(B, n, C, L)
-        return [reshaped[:, i] for i in range(n)]
 
 
 __all__ = ['WideConv1d', 'Conv1dStrategy']

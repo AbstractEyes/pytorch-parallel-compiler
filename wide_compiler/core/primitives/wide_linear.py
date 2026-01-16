@@ -11,6 +11,10 @@ Strategies:
 - 'sequential': N separate F.linear (baseline, exact)
 - 'auto': Heuristic selection (picks einsum for N>=8 or low B)
 
+Input/Output Format (v0.6.0):
+- Input:  [N, B, ..., in_features]  (N-first)
+- Output: [N, B, ..., out_features] (N-first)
+
 Speedup examples (compiled, A100):
 - N=20, B=32:  3.0x
 - N=50, B=16:  5.1x
@@ -322,8 +326,7 @@ class WideLinear(nn.Module):
             model_factory=cls._bench_model,
             input_factory=cls._bench_input,
             wide_factory=cls._bench_wide,
-            pack_fn=cls._bench_pack,
-            unpack_fn=cls._bench_unpack,
+            # pack_fn/unpack_fn/validate_fn: use defaults (N-first format)
         )
 
     @staticmethod
@@ -333,7 +336,7 @@ class WideLinear(nn.Module):
 
     @staticmethod
     def _bench_input(n: int, batch_sizes: int, d_model: int, device: str = 'cpu', **_) -> Tensor:
-        """Create single input tensor."""
+        """Create single input tensor [B, D]."""
         return torch.randn(batch_sizes, d_model, device=device)
 
     @classmethod
@@ -345,18 +348,6 @@ class WideLinear(nn.Module):
         }
         strat = strat_map.get(strategy, LinearStrategy.EINSUM)
         return cls.from_modules(modules, strategy=strat)
-
-    @staticmethod
-    def _bench_pack(inputs: List[Tensor]) -> Tensor:
-        """Pack N inputs into wide format."""
-        return torch.cat(inputs, dim=1)  # [B, N*d]
-
-    @staticmethod
-    def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
-        """Unpack wide output to N outputs."""
-        B = output.shape[0]
-        d = output.shape[1] // n
-        return [output[:, i*d:(i+1)*d] for i in range(n)]
 
 
 __all__ = [

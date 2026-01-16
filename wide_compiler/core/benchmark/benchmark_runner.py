@@ -4,6 +4,11 @@ WideCompiler.core.benchmark.benchmark_runner
 Execute benchmark jobs and time functions.
 Supports torch.compile for fair Wide vs baseline comparison.
 
+v0.6.0: N-first format
+- Uses torch.stack(dim=0) for default packing: [N, B, ...]
+- Default validation compares output[i] vs baseline[i]
+- Primitives only need custom pack/validate for non-standard formats
+
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
@@ -15,7 +20,8 @@ from torch import nn, Tensor
 
 from .benchmark_schema import (
     BenchmarkJob, BenchmarkResult, SingleResult,
-    CompilationMode, compilation_available, get_compile_fn
+    CompilationMode, compilation_available, get_compile_fn,
+    default_pack_fn, default_unpack_fn, default_validate_fn,
 )
 
 
@@ -88,6 +94,10 @@ def run_single(
     compiled = compile_fn is not None
     extra_warmup = job.compile_warmup_extra if compiled else 0
 
+    # Get pack/validate functions (use defaults if not specified)
+    pack_fn = job.get_pack_fn()
+    validate_fn = job.get_validate_fn()
+
     # Create N models (uncompiled for validation)
     models = [job.model_factory(**params).to(device).eval() for _ in range(n)]
 
@@ -98,7 +108,7 @@ def run_single(
     else:
         baseline_model_compiled = models[0]
 
-    # Create input
+    # Create N input tensors (each is [B, ...])
     sample = job.input_factory(n=n, device=device, **params)
     inputs = [sample.clone() for _ in range(n)]
 
@@ -134,17 +144,19 @@ def run_single(
 
     # Build wide model with strategy (uncompiled first for validation)
     wide_model = job.wide_factory(models, strategy).to(device).eval()
-    packed = job.pack_fn(inputs)
+
+    # Pack inputs to N-first format: [N, B, ...]
+    packed = pack_fn(inputs)
 
     # Run validation BEFORE compilation
     is_valid = True
     validation_msg = "OK"
 
-    if validate and hasattr(job, 'validate_fn') and job.validate_fn is not None:
+    if validate:
         with torch.no_grad():
             wide_output = wide_model(packed)
 
-        is_valid, validation_msg = job.validate_fn(wide_output, baseline_outputs)
+        is_valid, validation_msg = validate_fn(wide_output, baseline_outputs)
 
         if not is_valid:
             # Return immediately with validation failure - no timing

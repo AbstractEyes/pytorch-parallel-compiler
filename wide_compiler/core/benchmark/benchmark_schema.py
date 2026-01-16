@@ -4,15 +4,21 @@ WideCompiler.core.benchmark.benchmark_schema
 Data classes for benchmark configuration and results.
 Includes compilation clause support for torch.compile optimization.
 
+v0.6.0: N-first format support
+- Default pack/unpack use torch.stack(dim=0) for [N, B, ...] format
+- pack_fn/unpack_fn are optional - only needed for non-standard formats
+- validate_fn optional - default compares output[i] vs baseline[i]
+
 Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
 
 from dataclasses import dataclass, field, replace
-from typing import List, Dict, Any, Optional, Callable, Union
+from typing import List, Dict, Any, Optional, Callable, Union, Tuple
 from enum import Enum
 import json
 import torch
+from torch import Tensor
 
 
 class CompilationMode(Enum):
@@ -53,6 +59,87 @@ def get_compile_fn(mode: CompilationMode) -> Optional[Callable]:
     elif mode == CompilationMode.MAX_AUTOTUNE:
         return lambda m: torch.compile(m, mode='max-autotune')
     return None
+
+
+# =============================================================================
+# DEFAULT N-FIRST PACK/UNPACK/VALIDATE
+# =============================================================================
+
+def default_pack_fn(inputs: List[Tensor]) -> Tensor:
+    """
+    Default N-first packing: stack inputs along dim 0.
+
+    Args:
+        inputs: List of N tensors, each [B, ...]
+
+    Returns:
+        Stacked tensor [N, B, ...]
+    """
+    return torch.stack(inputs, dim=0)
+
+
+def default_unpack_fn(output: Tensor, n: int) -> List[Tensor]:
+    """
+    Default N-first unpacking: index along dim 0.
+
+    Args:
+        output: Tensor [N, B, ...] or tuple where first element is [N, B, ...]
+        n: Number of models
+
+    Returns:
+        List of N tensors, each [B, ...]
+    """
+    # Handle tuple outputs (e.g., GRU returns (output, h_n))
+    if isinstance(output, tuple):
+        output = output[0]
+    return [output[i] for i in range(n)]
+
+
+def default_validate_fn(
+    wide_output: Tensor,
+    baseline_outputs: List[Tensor],
+    rtol: float = 1e-4,
+    atol: float = 1e-5,
+) -> Tuple[bool, str]:
+    """
+    Default N-first validation: compare output[i] vs baseline[i].
+
+    Args:
+        wide_output: [N, B, ...] or tuple with first element [N, B, ...]
+        baseline_outputs: List of N tensors [B, ...]
+        rtol: Relative tolerance
+        atol: Absolute tolerance
+
+    Returns:
+        (is_valid, message)
+    """
+    # Handle tuple outputs
+    if isinstance(wide_output, tuple):
+        wide_output = wide_output[0]
+
+    n = len(baseline_outputs)
+
+    # Check shape compatibility
+    if wide_output.shape[0] != n:
+        return False, f"N mismatch: wide has {wide_output.shape[0]}, expected {n}"
+
+    # Compare each output
+    max_diff = 0.0
+    for i in range(n):
+        wide_i = wide_output[i]
+        base_i = baseline_outputs[i]
+
+        if wide_i.shape != base_i.shape:
+            return False, f"Shape mismatch at i={i}: {wide_i.shape} vs {base_i.shape}"
+
+        diff = (wide_i - base_i).abs()
+        max_diff = max(max_diff, diff.max().item())
+
+        if not torch.allclose(wide_i, base_i, rtol=rtol, atol=atol):
+            mean_diff = diff.mean().item()
+            return False, f"Value mismatch at i={i}: max={max_diff:.6f}, mean={mean_diff:.6f}"
+
+    return True, f"OK (max_diff={max_diff:.2e})"
 
 
 @dataclass
@@ -106,25 +193,34 @@ class BenchmarkJob:
     Contains sweep params and factory functions for creating
     models, inputs, and wide versions.
 
+    v0.6.0 N-first format:
+    - pack_fn/unpack_fn are OPTIONAL - defaults use torch.stack(dim=0)
+    - validate_fn is OPTIONAL - default compares output[i] vs baseline[i]
+    - Only override these for non-standard formats (e.g., tuple outputs)
+
     Compilation settings apply to BOTH Wide and baseline models
-    for fair comparison. The compilation clause is critical:
-    Wide models with torch.compile can achieve massive speedups
-    that aren't visible in eager mode.
+    for fair comparison.
     """
     name: str
     primitive: str
     strategies: List[str]
     sweep: SweepParams
 
-    # Factory functions
+    # Factory functions (required)
     model_factory: Callable[..., Any]  # (**params) -> nn.Module
-    input_factory: Callable[..., Any]  # (n, device, **params) -> Tensor
+    input_factory: Callable[..., Any]  # (n, device, **params) -> Tensor [B, ...]
     wide_factory: Callable[..., Any]   # (models, strategy) -> WideModule
-    pack_fn: Callable[..., Any]        # (inputs) -> packed
-    unpack_fn: Callable[..., Any]      # (output, n) -> outputs
 
-    # Optional validation function
+    # Pack/unpack functions (optional - defaults to N-first)
+    pack_fn: Optional[Callable[..., Any]] = None   # (inputs) -> packed [N, B, ...]
+    unpack_fn: Optional[Callable[..., Any]] = None # (output, n) -> list of [B, ...]
+
+    # Validation function (optional - defaults to N-first comparison)
     validate_fn: Optional[Callable[..., Any]] = None  # (wide_out, baseline_outs) -> (bool, str)
+
+    # Validation tolerances (used by default validate_fn)
+    validate_rtol: float = 1e-4
+    validate_atol: float = 1e-5
 
     # Compilation settings
     compilation: CompilationMode = CompilationMode.EAGER
@@ -133,6 +229,21 @@ class BenchmarkJob:
     # Validation settings
     validate: bool = True  # Run consistency check
     fail_on_invalid: bool = False  # Raise exception vs mark invalid
+
+    def get_pack_fn(self) -> Callable:
+        """Get pack function, using default if not specified."""
+        return self.pack_fn if self.pack_fn is not None else default_pack_fn
+
+    def get_unpack_fn(self) -> Callable:
+        """Get unpack function, using default if not specified."""
+        return self.unpack_fn if self.unpack_fn is not None else default_unpack_fn
+
+    def get_validate_fn(self) -> Callable:
+        """Get validation function, using default if not specified."""
+        if self.validate_fn is not None:
+            return self.validate_fn
+        # Return default with configured tolerances
+        return lambda w, b: default_validate_fn(w, b, self.validate_rtol, self.validate_atol)
 
 
 @dataclass
@@ -356,4 +467,8 @@ __all__ = [
     'BenchmarkJob',
     'SingleResult',
     'BenchmarkResult',
+    # Default functions (for custom use)
+    'default_pack_fn',
+    'default_unpack_fn',
+    'default_validate_fn',
 ]

@@ -313,56 +313,6 @@ class WideGRU(nn.Module):
         )
 
     # =========================================================================
-    # VALIDATION
-    # =========================================================================
-
-    @staticmethod
-    def validate_outputs(
-        wide_out: Tuple[Tensor, Tensor],
-        baseline_outs: List[Tuple[Tensor, Tensor]],
-        rtol: float = 1e-4,
-        atol: float = 1e-5,
-    ) -> Tuple[bool, str]:
-        """
-        Validate wide outputs match stacked baseline outputs.
-
-        Args:
-            wide_out: (output, h_n) from WideGRU - [N, B, T, H] format
-            baseline_outs: List of (output, h_n) from N individual GRUs - [B, T, H] each
-            rtol: Relative tolerance
-            atol: Absolute tolerance
-
-        Returns:
-            (is_valid, message)
-        """
-        wide_output, wide_hn = wide_out
-
-        # Stack baseline outputs: N x [B, T, H] -> [N, B, T, H]
-        baseline_output = torch.stack([o[0] for o in baseline_outs], dim=0)
-        baseline_hn = torch.stack([o[1].squeeze(0) for o in baseline_outs], dim=0)
-
-        # Check shapes
-        if wide_output.shape != baseline_output.shape:
-            return False, f"Output shape mismatch: {wide_output.shape} vs {baseline_output.shape}"
-        if wide_hn.shape != baseline_hn.shape:
-            return False, f"Hidden shape mismatch: {wide_hn.shape} vs {baseline_hn.shape}"
-
-        # Check values
-        if not torch.allclose(wide_output, baseline_output, rtol=rtol, atol=atol):
-            diff = (wide_output - baseline_output).abs()
-            max_diff = diff.max().item()
-            mean_diff = diff.mean().item()
-            return False, f"Output mismatch: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}"
-
-        if not torch.allclose(wide_hn, baseline_hn, rtol=rtol, atol=atol):
-            diff = (wide_hn - baseline_hn).abs()
-            max_diff = diff.max().item()
-            mean_diff = diff.mean().item()
-            return False, f"Hidden mismatch: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}"
-
-        return True, "OK"
-
-    # =========================================================================
     # BENCHMARK INTERFACE
     # =========================================================================
 
@@ -420,7 +370,7 @@ class WideGRU(nn.Module):
                 hidden_sizes=[128],
             ),
             'quick': SweepParams(
-                n_values=[2, 3, 4, 5, 6, 7, 8],
+                n_values=[8, 16, 32],
                 batch_sizes=[8],
                 seq_lengths=[32],
                 d_model=[64],
@@ -465,9 +415,11 @@ class WideGRU(nn.Module):
             model_factory=cls._bench_model,
             input_factory=cls._bench_input,
             wide_factory=cls._bench_wide,
-            pack_fn=cls._bench_pack,
-            unpack_fn=cls._bench_unpack,
-            validate_fn=cls._bench_validate,
+            # pack_fn: use default (torch.stack dim=0)
+            # unpack_fn: use default
+            validate_fn=cls._bench_validate,  # Custom: handles tuple output
+            validate_rtol=1e-3,  # Relaxed for RNN accumulation
+            validate_atol=1e-3,
         )
 
     @staticmethod
@@ -484,7 +436,7 @@ class WideGRU(nn.Module):
 
     @staticmethod
     def _bench_input(n: int, batch_sizes: int, seq_lengths: int, d_model: int, device: str = 'cpu', **_) -> Tensor:
-        """Create single input tensor for one model: [B, T, D]."""
+        """Create single input tensor [B, T, D]."""
         return torch.randn(batch_sizes, seq_lengths, d_model, device=device)
 
     @classmethod
@@ -497,18 +449,6 @@ class WideGRU(nn.Module):
         strat = strat_map.get(strategy, GRUStrategy.FUSED)
         grus = [m.gru for m in modules]
         return cls.from_modules(grus, strategy=strat)
-
-    @staticmethod
-    def _bench_pack(inputs: List[Tensor]) -> Tensor:
-        """Pack N inputs into N-first format: [N, B, T, D]."""
-        return torch.stack(inputs, dim=0)
-
-    @staticmethod
-    def _bench_unpack(output: Tensor, n: int) -> List[Tensor]:
-        """Unpack N-first output to list of [B, T, H]."""
-        if isinstance(output, tuple):
-            output = output[0]
-        return [output[i] for i in range(n)]
 
     @staticmethod
     def _bench_validate(
@@ -524,11 +464,14 @@ class WideGRU(nn.Module):
         so we use relaxed tolerances (1e-3 vs 1e-5 for feedforward).
 
         Args:
-            wide_output: [N, B, T, H] from WideGRU
+            wide_output: (output, h_n) tuple from WideGRU, output is [N, B, T, H]
             baseline_outputs: List of N x [B, T, H] from individual GRUs
         """
+        # Handle tuple output from WideGRU
         if isinstance(wide_output, tuple):
             wide_output = wide_output[0]
+
+        n = len(baseline_outputs)
 
         # Stack baseline: N x [B, T, H] -> [N, B, T, H]
         baseline_stacked = torch.stack(baseline_outputs, dim=0)
@@ -542,7 +485,7 @@ class WideGRU(nn.Module):
             mean_diff = diff.mean().item()
             return False, f"Value mismatch: max={max_diff:.6f}, mean={mean_diff:.6f}"
 
-        return True, "OK"
+        return True, f"OK (max_diff={(wide_output - baseline_stacked).abs().max().item():.2e})"
 
 
 __all__ = ['WideGRU', 'GRUStrategy']
