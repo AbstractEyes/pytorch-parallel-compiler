@@ -129,11 +129,9 @@ class WidePReLU(nn.Module):
         sweep = SweepParams(
             n_values=sweep_config['n_values'],
             batch_sizes=[16],
-            custom_params=[
-                {'channels': 64, 'spatial': (32, 32)},   # 2D spatial
-                {'channels': 128, 'spatial': (16, 16)},  # Smaller spatial
-                {'channels': 256, 'spatial': None},      # Just channels (1D)
-            ]
+            channels=[64, 128],
+            heights=[32],
+            widths=[32],
         )
 
         return BenchmarkJob(
@@ -147,7 +145,7 @@ class WidePReLU(nn.Module):
         )
 
     @staticmethod
-    def _bench_model(channels=64, spatial=(32, 32), **kwargs):
+    def _bench_model(channels=64, **kwargs):
         """Create a single PReLU module (per-channel)."""
         return nn.PReLU(num_parameters=channels)
 
@@ -157,16 +155,12 @@ class WidePReLU(nn.Module):
         device: str,
         batch_sizes: int,
         channels=64,
-        spatial=(32, 32),
+        heights=32,
+        widths=32,
         **kwargs
     ):
-        """Create input: [B, C, ...] matching channels and spatial dims."""
-        if spatial is None:
-            # 1D case: [B, C]
-            return torch.randn(batch_sizes, channels, device=device)
-        else:
-            # 2D case: [B, C, H, W]
-            return torch.randn(batch_sizes, channels, *spatial, device=device)
+        """Create input: [B, C, H, W] for 2D case."""
+        return torch.randn(batch_sizes, channels, heights, widths, device=device)
 
     @classmethod
     def _bench_wide(cls, modules: List[nn.Module], strategy: str):

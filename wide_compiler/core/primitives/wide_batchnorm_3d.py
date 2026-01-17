@@ -163,15 +163,13 @@ class WideBatchNorm3d(nn.Module):
                 n_values=[4, 8, 16, 32],
                 batch_sizes=[8],
                 channels=[64],
-                depths=[16],      # Depth dimension
-                heights=[16],     # Height dimension
+                heights=[16],     # Height dimension (depth fixed at 16)
                 widths=[16],      # Width dimension
             ),
             'full': SweepParams(
                 n_values=[2, 4, 8, 16, 32, 64],
                 batch_sizes=[8],
                 channels=[32, 64, 128],
-                depths=[8, 16],
                 heights=[16, 32],
                 widths=[16, 32],
             ),
@@ -179,7 +177,6 @@ class WideBatchNorm3d(nn.Module):
                 n_values=[4, 8],
                 batch_sizes=[4],
                 channels=[32],
-                depths=[8],
                 heights=[8],
                 widths=[8],
             ),
@@ -216,13 +213,7 @@ class WideBatchNorm3d(nn.Module):
         )
 
     @staticmethod
-    def _bench_model(
-        channels: int = 64,
-        depths: int = 16,
-        heights: int = 16,
-        widths: int = 16,
-        **kwargs
-    ):
+    def _bench_model(channels: int = 64, **kwargs):
         """Create a single BatchNorm3d module."""
         return nn.BatchNorm3d(num_features=channels)
 
@@ -232,14 +223,17 @@ class WideBatchNorm3d(nn.Module):
         device: str,
         batch_sizes: int,
         channels: int = 64,
-        depths: int = 16,
         heights: int = 16,
         widths: int = 16,
         **kwargs
     ):
-        """Create input tensor [B, C, D, H, W]."""
+        """
+        Create input tensor [B, C, D, H, W].
+        Depth dimension fixed at 16 for benchmarking.
+        """
+        depth = 16  # Fixed depth dimension
         return torch.randn(
-            batch_sizes, channels, depths, heights, widths,
+            batch_sizes, channels, depth, heights, widths,
             device=device
         )
 

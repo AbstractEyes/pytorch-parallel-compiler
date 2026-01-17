@@ -233,8 +233,6 @@ class WideConvTranspose2d(nn.Module):
             kernel_sizes=[4],  # Common for 2x upsampling
             heights=[16],
             widths=[16],
-            strides=[2],  # 2x upsampling
-            paddings=[1],
         )
 
         return BenchmarkJob(
@@ -248,14 +246,17 @@ class WideConvTranspose2d(nn.Module):
         )
 
     @staticmethod
-    def _bench_model(channels=64, kernel_sizes=4, strides=2, paddings=1, **kwargs):
-        """Create a single ConvTranspose2d module."""
+    def _bench_model(channels=64, kernel_sizes=4, **kwargs):
+        """
+        Create a single ConvTranspose2d module.
+        Uses fixed stride=2 and padding=1 for 2x upsampling.
+        """
         return nn.ConvTranspose2d(
             in_channels=channels,
             out_channels=channels,
             kernel_size=kernel_sizes,
-            stride=strides,
-            padding=paddings,
+            stride=2,  # 2x upsampling
+            padding=1,
         )
 
     @staticmethod

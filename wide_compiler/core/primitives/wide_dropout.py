@@ -134,12 +134,8 @@ class WideDropout(nn.Module):
         sweep = SweepParams(
             n_values=sweep_config['n_values'],
             batch_sizes=[16],
-            # Test on various tensor sizes
-            custom_params=[
-                {'shape': (128,)},        # 1D (after linear)
-                {'shape': (128, 256)},    # 2D (sequence)
-                {'shape': (64, 32, 32)},  # 3D (image)
-            ]
+            seq_lengths=[128, 256],
+            channels=[64],
         )
 
         return BenchmarkJob(
@@ -153,14 +149,14 @@ class WideDropout(nn.Module):
         )
 
     @staticmethod
-    def _bench_model(shape=(128,), p=0.5, **kwargs):
+    def _bench_model(p=0.5, **kwargs):
         """Create a single Dropout module."""
         return nn.Dropout(p=p)
 
     @staticmethod
-    def _bench_input(n: int, device: str, batch_sizes: int, shape=(128,), **kwargs):
-        """Create input: [B, ...] matching shape."""
-        return torch.randn(batch_sizes, *shape, device=device)
+    def _bench_input(n: int, device: str, batch_sizes: int, seq_lengths=128, channels=64, **kwargs):
+        """Create input: [B, T, C] for sequence case."""
+        return torch.randn(batch_sizes, seq_lengths, channels, device=device)
 
     @classmethod
     def _bench_wide(cls, modules: List[nn.Module], strategy: str):

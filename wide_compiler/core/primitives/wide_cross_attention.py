@@ -287,8 +287,7 @@ class WideMultiheadCrossAttention(nn.Module):
         sweep = SweepParams(
             n_values=sweep_config['n_values'],
             batch_sizes=[8],
-            seq_lengths_query=[64],    # Query length
-            seq_lengths_kv=[128],      # Key/Value length (often longer in cross-attn)
+            seq_lengths=[64],    # Use same length for simplicity (can vary in factory)
             d_model=[256],
             n_heads=[8],
         )
@@ -301,7 +300,6 @@ class WideMultiheadCrossAttention(nn.Module):
             model_factory=cls._bench_model,
             input_factory=cls._bench_input,
             wide_factory=cls._bench_wide,
-            pack_fn=cls._bench_pack,
         )
 
     @staticmethod
@@ -310,11 +308,15 @@ class WideMultiheadCrossAttention(nn.Module):
         return nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, batch_first=True)
 
     @staticmethod
-    def _bench_input(n: int, device: str, batch_sizes: int, seq_lengths_query=64, seq_lengths_kv=128, d_model=256, **kwargs):
-        """Create cross-attention inputs: query, key, value."""
-        query = torch.randn(batch_sizes, seq_lengths_query, d_model, device=device)
-        key = torch.randn(batch_sizes, seq_lengths_kv, d_model, device=device)
-        value = torch.randn(batch_sizes, seq_lengths_kv, d_model, device=device)
+    def _bench_input(n: int, device: str, batch_sizes: int, seq_lengths=64, d_model=256, **kwargs):
+        """
+        Create cross-attention inputs: query, key, value.
+        Query length = seq_lengths, KV length = 2*seq_lengths (typical cross-attn).
+        """
+        query = torch.randn(batch_sizes, seq_lengths, d_model, device=device)
+        kv_len = seq_lengths * 2  # Key/Value often longer in cross-attention
+        key = torch.randn(batch_sizes, kv_len, d_model, device=device)
+        value = torch.randn(batch_sizes, kv_len, d_model, device=device)
         return (query, key, value)
 
     @staticmethod

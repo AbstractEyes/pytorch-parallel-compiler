@@ -129,7 +129,6 @@ class WideAdaptiveAvgPool2d(nn.Module):
             channels=[64, 256],
             heights=[56, 32],
             widths=[56, 32],
-            output_sizes=[(1, 1), (7, 7)],  # Global pooling and spatial pooling
         )
 
         return BenchmarkJob(
@@ -143,9 +142,12 @@ class WideAdaptiveAvgPool2d(nn.Module):
         )
 
     @staticmethod
-    def _bench_model(output_sizes=(1, 1), **kwargs):
-        """Create a single AdaptiveAvgPool2d module."""
-        return nn.AdaptiveAvgPool2d(output_size=output_sizes)
+    def _bench_model(**kwargs):
+        """
+        Create a single AdaptiveAvgPool2d module.
+        Uses fixed output_size=(1, 1) for global pooling (most common use case).
+        """
+        return nn.AdaptiveAvgPool2d(output_size=(1, 1))
 
     @staticmethod
     def _bench_input(n: int, device: str, batch_sizes: int, channels=64, heights=56, widths=56, **kwargs):
