@@ -248,10 +248,14 @@ class WideRNN(nn.Module):
         wide = wide.to(device=t.weight_ih_l0.device, dtype=t.weight_ih_l0.dtype)
 
         # Copy weights
+        # PyTorch RNN weights are [hidden_size, input_size] and [hidden_size, hidden_size]
+        # For einsum 'nbti,nhi->nbth' we need weight[n, h, i] = [N, hidden, input]
+        # For F.linear we also need [out, in] = [hidden, input]
+        # So NO transpose needed!
         with torch.no_grad():
             for i, m in enumerate(modules):
-                wide.weight_ih[i] = m.weight_ih_l0.T
-                wide.weight_hh[i] = m.weight_hh_l0.T
+                wide.weight_ih[i] = m.weight_ih_l0  # Keep as [H, I]
+                wide.weight_hh[i] = m.weight_hh_l0  # Keep as [H, H]
                 if m.bias:
                     wide.bias_ih[i] = m.bias_ih_l0
                     wide.bias_hh[i] = m.bias_hh_l0
