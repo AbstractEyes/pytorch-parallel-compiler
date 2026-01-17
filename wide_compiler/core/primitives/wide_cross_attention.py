@@ -193,10 +193,10 @@ class WideMultiheadCrossAttention(nn.Module):
 
         outputs = []
         for i in range(N):
-            # Project
-            q_i = F.linear(query[i], self.q_weight[i], self.q_bias[i] if self.q_bias is not None else None)
-            k_i = F.linear(key[i], self.k_weight[i], self.k_bias[i] if self.k_bias is not None else None)
-            v_i = F.linear(value[i], self.v_weight[i], self.v_bias[i] if self.v_bias is not None else None)
+            # Project (weights are stored transposed for einsum, so transpose back for F.linear)
+            q_i = F.linear(query[i], self.q_weight[i].T, self.q_bias[i] if self.q_bias is not None else None)
+            k_i = F.linear(key[i], self.k_weight[i].T, self.k_bias[i] if self.k_bias is not None else None)
+            v_i = F.linear(value[i], self.v_weight[i].T, self.v_bias[i] if self.v_bias is not None else None)
 
             # Reshape for multi-head: [B, T, D] -> [B, H, T, D/H]
             q_i = q_i.view(B, Tq, self.n_heads, self.d_head).transpose(1, 2)
@@ -213,7 +213,7 @@ class WideMultiheadCrossAttention(nn.Module):
 
             # Reshape back and project
             attn_i = attn_i.transpose(1, 2).contiguous().view(B, Tq, D)
-            out_i = F.linear(attn_i, self.out_weight[i], self.out_bias[i] if self.out_bias is not None else None)
+            out_i = F.linear(attn_i, self.out_weight[i].T, self.out_bias[i] if self.out_bias is not None else None)
 
             outputs.append(out_i)
 
@@ -247,8 +247,10 @@ class WideMultiheadCrossAttention(nn.Module):
                 d = m.embed_dim
 
                 # Split in_proj_weight: [3D, D] -> Q, K, V each [D, D]
+                # PyTorch stores weights as [out_features, in_features]
+                # We transpose for einsum: 'nbtd,ndo->nbto' expects weight[n, in, out]
                 w_q, w_k, w_v = m.in_proj_weight.chunk(3, dim=0)
-                wide.q_weight[i] = w_q.T
+                wide.q_weight[i] = w_q.T  # [D, D] -> [D, D] transposed for einsum
                 wide.k_weight[i] = w_k.T
                 wide.v_weight[i] = w_v.T
 
@@ -258,7 +260,7 @@ class WideMultiheadCrossAttention(nn.Module):
                     wide.k_bias[i] = b_k
                     wide.v_bias[i] = b_v
 
-                wide.out_weight[i] = m.out_proj.weight.T
+                wide.out_weight[i] = m.out_proj.weight.T  # Transpose for einsum
                 if m.out_proj.bias is not None:
                     wide.out_bias[i] = m.out_proj.bias
 
