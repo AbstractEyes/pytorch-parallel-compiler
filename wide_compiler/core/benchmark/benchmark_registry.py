@@ -44,6 +44,14 @@ def _auto_register():
             WideAttention,
             WideGRU,
             WideLSTM,
+            WideRNN,
+            WideDropout,
+            WidePReLU,
+            WideBatchNorm3d,
+            WideConvTranspose1d,
+            WideConvTranspose2d,
+            WideAdaptiveAvgPool2d,
+            WideMultiheadCrossAttention,
         )
         primitives_module = True
     except ImportError as e1:
@@ -53,6 +61,8 @@ def _auto_register():
                 WideConv1d,
                 WideConv2d,
                 WideConv3d,
+                WideConvTranspose1d,
+                WideConvTranspose2d,
                 WideLinear,
                 WideBatchNorm1d,
                 WideBatchNorm2d,
@@ -64,6 +74,13 @@ def _auto_register():
                 WideAttention,
                 WideGRU,
                 WideLSTM,
+                WideRNN,
+                WideDropout,
+                WidePReLU,
+                WideBatchNorm3d,
+                WideAdaptiveAvgPool2d,
+                WideMultiheadCrossAttention,
+
             )
             primitives_module = True
         except ImportError as e2:
@@ -91,6 +108,14 @@ def _auto_register():
         'attention': WideAttention,
         'gru': WideGRU,
         'lstm': WideLSTM,
+        'rnn': WideRNN,
+        'dropout': WideDropout,
+        'prelu': WidePReLU,
+        'batchnorm3d': WideBatchNorm3d,
+        'convtranspose1d': WideConvTranspose1d,
+        'convtranspose2d': WideConvTranspose2d,
+        'adaptiveavgpool2d': WideAdaptiveAvgPool2d,
+        'multiheadcrossattention': WideMultiheadCrossAttention,
     }
 
     # Register those with benchmark interface
