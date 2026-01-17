@@ -193,6 +193,8 @@ class WideConvTranspose2d(nn.Module):
         wide = wide.to(device=t.weight.device, dtype=t.weight.dtype)
 
         # Copy weights from N modules
+        # ConvTranspose2d weight format: [in_channels, out_channels/groups, H, W]
+        # For grouped conv: [n*C_in, C_out, H, W]
         with torch.no_grad():
             for i, m in enumerate(modules):
                 start_in = i * t.in_channels
@@ -200,7 +202,8 @@ class WideConvTranspose2d(nn.Module):
                 start_out = i * t.out_channels
                 end_out = start_out + t.out_channels
 
-                wide.grouped_conv.weight[start_out:end_out, start_in:end_in] = m.weight
+                # Index by input channels (first dimension for ConvTranspose)
+                wide.grouped_conv.weight[start_in:end_in] = m.weight
                 if m.bias is not None:
                     wide.grouped_conv.bias[start_out:end_out] = m.bias
 
