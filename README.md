@@ -47,11 +47,11 @@ pip install -e .
 
 ## Quick Start
 
-### RNN Fusion (WideGRU / WideLSTM)
+### RNN Fusion (WideGRU / WideLSTM) - N-first format
 
 ```python
 import torch
-from wide_compiler import WideGRU
+from wide_compiler.core.primitives import WideGRU
 
 # Create 8 separate GRUs with different weights
 grus = [torch.nn.GRU(64, 128, batch_first=True).cuda() for _ in range(8)]
@@ -62,12 +62,14 @@ wide_gru = WideGRU.from_modules(grus)
 # Compile for best performance
 wide_gru = torch.compile(wide_gru, mode='reduce-overhead')
 
-# Input: concatenate along feature dim [B, T, N*input_size]
-x = torch.randn(4, 32, 8 * 64).cuda()  # [4, 32, 512]
+# Input: N-first format [N, B, T, input_size]
+x = torch.randn(8, 4, 32, 64).cuda()  # [N=8, B=4, T=32, D=64]
 
-# Output: [B, T, N*hidden_size] = [4, 32, 1024]
-out, h_n = wide_gru(x)
+# Output: N-first format [N, B, T, hidden_size], hidden state [N, B, hidden_size]
+out, h_n = wide_gru(x)  # out: [8, 4, 32, 128], h_n: [8, 4, 128]
 ```
+
+**Note:** Wide primitives use **N-first format** `[N, B, ...]`. For automatic packing/unpacking with channel-packed format, use `TracedWideModel` (see below).
 
 ### Full Model Fusion (TracedWideModel)
 
