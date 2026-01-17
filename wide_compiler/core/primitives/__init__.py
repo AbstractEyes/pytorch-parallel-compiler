@@ -33,6 +33,8 @@ from .wide_conv2d import (
     STRATEGY_THRESHOLDS as CONV_THRESHOLDS,
 )
 from .wide_conv3d import WideConv3d, Conv3dStrategy
+from .wide_convtranspose1d import WideConvTranspose1d
+from .wide_convtranspose2d import WideConvTranspose2d
 
 # Linear
 from .wide_linear import (
@@ -45,6 +47,7 @@ from .wide_linear import (
 # Normalization layers
 from .wide_batchnorm_1d import WideBatchNorm1d
 from .wide_batchnorm_2d import WideBatchNorm2d
+from .wide_batchnorm_3d import WideBatchNorm3d
 from .wide_layernorm import WideLayerNorm
 from .wide_groupnorm import WideGroupNorm, GroupNormStrategy
 from .wide_instancenorm import (
@@ -58,10 +61,21 @@ from .wide_embedding import WideEmbedding, EmbeddingStrategy
 
 # Attention
 from .wide_attention import WideAttention, AttentionStrategy
+from .wide_cross_attention import WideMultiheadCrossAttention
 
 # RNN layers
 from .wide_gru import WideGRU, GRUStrategy
 from .wide_lstm import WideLSTM, LSTMStrategy
+from .wide_rnn import WideRNN, RNNStrategy
+
+# Activations
+from .wide_prelu import WidePReLU
+
+# Regularization
+from .wide_dropout import WideDropout
+
+# Pooling
+from .wide_adaptive_avgpool2d import WideAdaptiveAvgPool2d
 
 
 __all__ = [
@@ -75,6 +89,8 @@ __all__ = [
     'CONV_THRESHOLDS',
     'WideConv3d',
     'Conv3dStrategy',
+    'WideConvTranspose1d',
+    'WideConvTranspose2d',
 
     # Linear
     'WideLinear',
@@ -85,6 +101,7 @@ __all__ = [
     # Normalization
     'WideBatchNorm1d',
     'WideBatchNorm2d',
+    'WideBatchNorm3d',
     'WideLayerNorm',
     'WideGroupNorm',
     'GroupNormStrategy',
@@ -99,10 +116,22 @@ __all__ = [
     # Attention
     'WideAttention',
     'AttentionStrategy',
+    'WideMultiheadCrossAttention',
 
     # RNN
     'WideGRU',
     'GRUStrategy',
     'WideLSTM',
     'LSTMStrategy',
+    'WideRNN',
+    'RNNStrategy',
+
+    # Activations
+    'WidePReLU',
+
+    # Regularization
+    'WideDropout',
+
+    # Pooling
+    'WideAdaptiveAvgPool2d',
 ]

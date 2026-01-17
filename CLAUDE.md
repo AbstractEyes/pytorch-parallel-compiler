@@ -1,6 +1,6 @@
 # CLAUDE.md - WideCompiler Quick Reference
 
-VERSION = 0.6.0
+VERSION = 0.7.0
 
 Read this first when working on this codebase.
 
@@ -53,20 +53,33 @@ wide_compiler/
     │   ├── benchmark_runner.py   → Execution engine
     │   ├── benchmark_schema.py   → BenchmarkJob, SweepParams, results
     │   └── benchmark_registry.py → Auto-discovers primitives
-    └── primitives/      → One file per Wide op (14 total)
-        ├── wide_attention.py      → MHA via batched SDPA (11x speedup)
-        ├── wide_linear.py         → Linear via einsum (12x speedup)
-        ├── wide_embedding.py      → Batched index lookup (6x speedup)
-        ├── wide_conv1d.py         → Conv1d with groups=N
-        ├── wide_conv2d.py         → Conv2d with groups=N
-        ├── wide_conv3d.py         → Conv3d with groups=N
-        ├── wide_gru.py            → GRU with fused projections
-        ├── wide_lstm.py           → LSTM with fused projections
-        ├── wide_batchnorm_1d.py   → BatchNorm1d N-first
-        ├── wide_batchnorm_2d.py   → BatchNorm2d N-first
-        ├── wide_layernorm.py      → LayerNorm N-first
-        ├── wide_groupnorm.py      → GroupNorm N-first
-        └── wide_instancenorm.py   → InstanceNorm1d/2d N-first
+    └── primitives/      → One file per Wide op (21 total)
+        # Core layers
+        ├── wide_attention.py           → MHA via batched SDPA (10.7x)
+        ├── wide_cross_attention.py     → Cross-attention (8-12x)
+        ├── wide_linear.py              → Linear via einsum (9.3x)
+        ├── wide_embedding.py           → Batched index lookup (76.8x)
+        # Convolutions
+        ├── wide_conv1d.py              → Conv1d grouped (12.3x)
+        ├── wide_conv2d.py              → Conv2d grouped (15.0x)
+        ├── wide_conv3d.py              → Conv3d grouped (10.9x)
+        ├── wide_convtranspose1d.py     → ConvTranspose1d (10-15x)
+        ├── wide_convtranspose2d.py     → ConvTranspose2d (8-15x)
+        # Normalization
+        ├── wide_batchnorm_1d.py        → BatchNorm1d (31.4x)
+        ├── wide_batchnorm_2d.py        → BatchNorm2d (38.0x)
+        ├── wide_batchnorm_3d.py        → BatchNorm3d (30-40x est)
+        ├── wide_layernorm.py           → LayerNorm (9.1x)
+        ├── wide_groupnorm.py           → GroupNorm (36.5x)
+        ├── wide_instancenorm.py        → InstanceNorm1d/2d (37.5x)
+        # RNNs
+        ├── wide_gru.py                 → GRU fused (3.0x)
+        ├── wide_lstm.py                → LSTM fused (3.3x)
+        ├── wide_rnn.py                 → RNN fused (2-4x est)
+        # Other
+        ├── wide_prelu.py               → PReLU (15-30x est)
+        ├── wide_dropout.py             → Dropout (5-20x est)
+        └── wide_adaptive_avgpool2d.py  → AdaptiveAvgPool2d (20-50x est)
 ```
 
 ## How It Works

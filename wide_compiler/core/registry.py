@@ -173,16 +173,24 @@ def auto_register_primitives() -> None:
                 WideConv1d,
                 WideConv2d,
                 WideConv3d,
+                WideConvTranspose1d,
+                WideConvTranspose2d,
                 WideBatchNorm1d,
                 WideBatchNorm2d,
+                WideBatchNorm3d,
                 WideLayerNorm,
                 WideGroupNorm,
                 WideInstanceNorm1d,
                 WideInstanceNorm2d,
                 WideEmbedding,
                 WideAttention,
+                WideMultiheadCrossAttention,
                 WideGRU,
                 WideLSTM,
+                WideRNN,
+                WidePReLU,
+                WideDropout,
+                WideAdaptiveAvgPool2d,
             )
         except ImportError:
             from wide_compiler.core.primitives import (
@@ -190,16 +198,24 @@ def auto_register_primitives() -> None:
                 WideConv1d,
                 WideConv2d,
                 WideConv3d,
+                WideConvTranspose1d,
+                WideConvTranspose2d,
                 WideBatchNorm1d,
                 WideBatchNorm2d,
+                WideBatchNorm3d,
                 WideLayerNorm,
                 WideGroupNorm,
                 WideInstanceNorm1d,
                 WideInstanceNorm2d,
                 WideEmbedding,
                 WideAttention,
+                WideMultiheadCrossAttention,
                 WideGRU,
                 WideLSTM,
+                WideRNN,
+                WidePReLU,
+                WideDropout,
+                WideAdaptiveAvgPool2d,
             )
 
         # Linear
@@ -208,9 +224,12 @@ def auto_register_primitives() -> None:
         _global_registry.register('Conv1d', WideConv1d)
         _global_registry.register('Conv2d', WideConv2d)
         _global_registry.register('Conv3d', WideConv3d)
+        _global_registry.register('ConvTranspose1d', WideConvTranspose1d)
+        _global_registry.register('ConvTranspose2d', WideConvTranspose2d)
         # Normalization
         _global_registry.register('BatchNorm1d', WideBatchNorm1d)
         _global_registry.register('BatchNorm2d', WideBatchNorm2d)
+        _global_registry.register('BatchNorm3d', WideBatchNorm3d)
         _global_registry.register('LayerNorm', WideLayerNorm)
         _global_registry.register('GroupNorm', WideGroupNorm)
         _global_registry.register('InstanceNorm1d', WideInstanceNorm1d)
@@ -219,9 +238,17 @@ def auto_register_primitives() -> None:
         _global_registry.register('Embedding', WideEmbedding)
         # Attention
         _global_registry.register('MultiheadAttention', WideAttention)
+        # Cross-attention is not auto-registered (requires explicit intent)
         # RNNs
         _global_registry.register('GRU', WideGRU)
         _global_registry.register('LSTM', WideLSTM)
+        _global_registry.register('RNN', WideRNN)
+        # Activations
+        _global_registry.register('PReLU', WidePReLU)
+        # Regularization
+        _global_registry.register('Dropout', WideDropout)
+        # Pooling
+        _global_registry.register('AdaptiveAvgPool2d', WideAdaptiveAvgPool2d)
 
     except ImportError:
         # Primitives not available - skip
