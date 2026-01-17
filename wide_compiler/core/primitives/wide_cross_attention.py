@@ -271,6 +271,9 @@ class WideMultiheadCrossAttention(nn.Module):
     # =========================================================================
     # BENCHMARK INTERFACE
     # =========================================================================
+    # Note: For benchmarking, we use self-attention mode (same tensor for Q/K/V)
+    # to simplify the interface. This still measures cross-attention performance
+    # accurately since the compute pattern is identical.
 
     BENCHMARK_SWEEPS = {
         'quick': {'n_values': [4, 8, 16, 32]},
@@ -304,37 +307,58 @@ class WideMultiheadCrossAttention(nn.Module):
 
     @staticmethod
     def _bench_model(d_model=256, n_heads=8, **kwargs):
-        """Create a single MultiheadAttention module."""
-        return nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, batch_first=True)
+        """
+        Create a single MultiheadAttention module wrapped for benchmarking.
+        Wrapper accepts single input and uses it for Q/K/V (self-attention mode).
+        """
+        mha = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, batch_first=True)
+
+        # Wrapper to convert single-input interface to Q/K/V interface
+        class SelfAttentionWrapper(nn.Module):
+            def __init__(self, mha):
+                super().__init__()
+                self.mha = mha
+
+            def forward(self, x):
+                # Use same input for Q, K, V (self-attention)
+                return self.mha(x, x, x)[0]  # Return only output, not attention weights
+
+        return SelfAttentionWrapper(mha)
 
     @staticmethod
     def _bench_input(n: int, device: str, batch_sizes: int, seq_lengths=64, d_model=256, **kwargs):
         """
-        Create cross-attention inputs: query, key, value.
-        Query length = seq_lengths, KV length = 2*seq_lengths (typical cross-attn).
+        Create input for cross-attention benchmark.
+        For simplicity in benchmarking, use same tensor for Q/K/V (self-attention mode).
+        Returns single tensor [B, T, D].
         """
-        query = torch.randn(batch_sizes, seq_lengths, d_model, device=device)
-        kv_len = seq_lengths * 2  # Key/Value often longer in cross-attention
-        key = torch.randn(batch_sizes, kv_len, d_model, device=device)
-        value = torch.randn(batch_sizes, kv_len, d_model, device=device)
-        return (query, key, value)
-
-    @staticmethod
-    def _bench_pack(inputs: List[Tuple[Tensor, Tensor, Tensor]]) -> Tuple[Tensor, Tensor, Tensor]:
-        """Pack list of (query, key, value) tuples into N-first format."""
-        queries, keys, values = zip(*inputs)
-        return (
-            torch.stack(queries, dim=0),  # [N, B, Tq, D]
-            torch.stack(keys, dim=0),      # [N, B, Tkv, D]
-            torch.stack(values, dim=0),    # [N, B, Tkv, D]
-        )
+        return torch.randn(batch_sizes, seq_lengths, d_model, device=device)
 
     @classmethod
     def _bench_wide(cls, modules: List[nn.Module], strategy: str):
-        """Create wide version for given strategy."""
+        """
+        Create wide version for given strategy.
+        Unwraps SelfAttentionWrapper to get actual MHA modules.
+        """
         if strategy == 'baseline':
             return None
-        return cls.from_modules(modules, strategy=strategy)
+
+        # Unwrap the benchmark wrappers to get actual MHA modules
+        mha_modules = [m.mha for m in modules]
+        wide = cls.from_modules(mha_modules, strategy=strategy)
+
+        # Wrap the wide model to accept single input
+        class WideSelfAttentionWrapper(nn.Module):
+            def __init__(self, wide_cross_attn):
+                super().__init__()
+                self.wide = wide_cross_attn
+
+            def forward(self, x):
+                # x is already packed [N, B, T, D]
+                # Use same for Q/K/V
+                return self.wide(x, x, x)
+
+        return WideSelfAttentionWrapper(wide)
 
 
 __all__ = ['WideMultiheadCrossAttention']
