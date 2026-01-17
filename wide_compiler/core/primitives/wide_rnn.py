@@ -232,12 +232,16 @@ class WideRNN(nn.Module):
         n = len(modules)
         t = modules[0]
 
+        # Map PyTorch's mode ('RNN_TANH', 'RNN_RELU') to our format ('tanh', 'relu')
+        mode_map = {'RNN_TANH': 'tanh', 'RNN_RELU': 'relu'}
+        nonlinearity = mode_map.get(t.mode, t.mode.lower().replace('rnn_', ''))
+
         wide = cls(
             n=n,
             input_size=t.input_size,
             hidden_size=t.hidden_size,
             num_layers=t.num_layers,
-            nonlinearity=t.mode,  # 'RNN_TANH' or 'RNN_RELU'
+            nonlinearity=nonlinearity,
             bias=t.bias,
             batch_first=t.batch_first,
             dropout=t.dropout,

@@ -141,12 +141,13 @@ class WideConvTranspose2d(nn.Module):
         outputs = []
         for i in range(self.n):
             # Get weight and bias for this model
+            # ConvTranspose2d weight format: [in_channels, out_channels/groups, H, W]
             start_in = i * C
             end_in = start_in + C
             start_out = i * C_out
             end_out = start_out + C_out
 
-            w = self.grouped_conv.weight[start_out:end_out, start_in:end_in]
+            w = self.grouped_conv.weight[start_in:end_in]  # Index by input channels only
             b = self.grouped_conv.bias[start_out:end_out] if self.has_bias else None
 
             # Run conv_transpose2d
