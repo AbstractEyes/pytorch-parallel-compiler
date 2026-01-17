@@ -302,6 +302,8 @@ class WideRNN(nn.Module):
             model_factory=cls._bench_model,
             input_factory=cls._bench_input,
             wide_factory=cls._bench_wide,
+            validate_fn=cls._bench_validate,  # Custom: handles tuple output
+            validate_rtol=1e-3,  # Relaxed for RNN accumulation
         )
 
     @staticmethod
@@ -321,5 +323,67 @@ class WideRNN(nn.Module):
             return None
         return cls.from_modules(modules, strategy=strategy)
 
+    @staticmethod
+    def _bench_validate(
+        wide_output: Tuple[Tensor, Tensor],
+        baseline_outputs: List[Tuple[Tensor, Tensor]],
+        rtol: float = 1e-3,
+        atol: float = 1e-3,
+    ) -> Tuple[bool, str]:
+        """
+        Validate wide output matches stacked baseline outputs.
 
-__all__ = ['WideRNN']
+        Note: RNNs accumulate numerical differences over timesteps,
+        so we use relaxed tolerances (1e-3 vs 1e-5 for feedforward).
+
+        Args:
+            wide_output: (output, h_n) tuple from WideRNN
+                output: [N, B, T, H]
+                h_n: [N, B, H]
+            baseline_outputs: List of N x (output, h_n) tuples from individual RNNs
+                each output: [B, T, H]
+                each h_n: [B, H]
+        """
+        # Extract outputs and hidden states
+        wide_out, wide_h = wide_output
+
+        # Baseline outputs are tuples (output, h_n)
+        baseline_outs = [out[0] for out in baseline_outputs]
+        baseline_hs = [out[1] for out in baseline_outputs]
+
+        n = len(baseline_outputs)
+
+        # Stack baseline outputs: N x [B, T, H] -> [N, B, T, H]
+        stacked_out = torch.stack(baseline_outs, dim=0)
+        # Stack baseline hidden states: N x [B, H] -> [N, B, H]
+        stacked_h = torch.stack(baseline_hs, dim=0)
+
+        # Validate shapes
+        if wide_out.shape != stacked_out.shape:
+            return False, f"Output shape mismatch: {wide_out.shape} vs {stacked_out.shape}"
+        if wide_h.shape != stacked_h.shape:
+            return False, f"Hidden state shape mismatch: {wide_h.shape} vs {stacked_h.shape}"
+
+        # Validate output values
+        out_diff = (wide_out - stacked_out).abs()
+        out_max_diff = out_diff.max().item()
+        out_mean_diff = out_diff.mean().item()
+
+        out_close = torch.allclose(wide_out, stacked_out, rtol=rtol, atol=atol)
+
+        # Validate hidden state values
+        h_diff = (wide_h - stacked_h).abs()
+        h_max_diff = h_diff.max().item()
+        h_mean_diff = h_diff.mean().item()
+
+        h_close = torch.allclose(wide_h, stacked_h, rtol=rtol, atol=atol)
+
+        if not out_close:
+            return False, f"Output mismatch: max={out_max_diff:.6f}, mean={out_mean_diff:.6f}"
+        if not h_close:
+            return False, f"Hidden state mismatch: max={h_max_diff:.6f}, mean={h_mean_diff:.6f}"
+
+        return True, "OK"
+
+
+__all__ = ['WideRNN', 'RNNStrategy']
