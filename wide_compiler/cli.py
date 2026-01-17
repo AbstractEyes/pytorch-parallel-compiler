@@ -213,6 +213,10 @@ def cmd_benchmark(args):
     primitive = args.primitive
     PRIMITIVES = list_primitives()  # Get list from registry
 
+    # Handle "benchmark all" command
+    if primitive == 'all':
+        return cmd_benchmark_all(args, device)
+
     # If primitive is a known primitive, use primitive benchmark mode
     if primitive in PRIMITIVES:
         return cmd_benchmark_primitive(args, device)
@@ -317,11 +321,149 @@ def cmd_benchmark_primitive(args, device: str):
     print(result.top_table(args.top))
 
     # Save if requested
-    if args.output:
-        result.save(args.output)
-        print(f"\nSaved to {args.output}")
+    if args.save or args.output:
+        if args.output:
+            output_path = args.output
+        else:
+            # Auto-save with timestamp
+            from datetime import datetime
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_path = f"{primitive}_{preset}_{timestamp}.json"
+
+        result.save(output_path)
+        print(f"\nSaved to {output_path}")
 
     return 0
+
+
+def cmd_benchmark_all(args, device: str):
+    """Benchmark all registered primitives."""
+    try:
+        from .core.benchmark import benchmark_all
+    except ImportError:
+        try:
+            from wide_compiler.core.benchmark import benchmark_all
+        except ImportError as e:
+            print(f"Benchmark framework not found. Install with benchmark support.")
+            print(f"Error: {e}")
+            return 1
+
+    from .core.benchmark.benchmark_schema import CompilationMode, compilation_available
+
+    preset = args.preset
+    PRIMITIVES = list_primitives()
+
+    # Map compile string to enum
+    compile_map = {
+        'default': CompilationMode.DEFAULT,
+        'eager': CompilationMode.EAGER,
+        'reduce-overhead': CompilationMode.REDUCE_OVERHEAD,
+        'max-autotune': CompilationMode.MAX_AUTOTUNE,
+    }
+    compilation = compile_map.get(args.compile, CompilationMode.EAGER)
+
+    # Print compilation info
+    compile_available = compilation_available()
+    if compilation == CompilationMode.EAGER:
+        actual_mode = "eager"
+    elif compile_available:
+        actual_mode = f"compiled ({compilation.value})"
+    else:
+        actual_mode = "eager (compile unavailable)"
+
+    print(f"Benchmarking ALL primitives ({len(PRIMITIVES)} total)")
+    print(f"Preset: {preset}")
+    print(f"Device: {device}")
+    print(f"Compilation: {actual_mode}")
+    print()
+
+    # Run all benchmarks
+    failed = []
+    results_dict = {}
+
+    for i, primitive in enumerate(sorted(PRIMITIVES), 1):
+        print(f"\n{'='*60}")
+        print(f"[{i}/{len(PRIMITIVES)}] Benchmarking: {primitive}")
+        print('='*60)
+
+        try:
+            # Create a copy of args for this primitive
+            from .core.benchmark.benchmark_registry import get_primitive
+            from .core.benchmark.benchmark_runner import run
+
+            primitive_class = get_primitive(primitive)
+            job = primitive_class.benchmark_job(preset)
+
+            result = run(
+                job,
+                device=device,
+                verbose=not args.quiet,
+                warmup=args.warmup,
+                iterations=args.iters,
+                validate=not args.no_validate,
+                compilation=compilation,
+            )
+
+            results_dict[primitive] = result
+
+            # Print summary
+            print(result.summary())
+            if not args.quiet:
+                print(result.top_table(min(5, args.top)))
+
+        except Exception as e:
+            print(f"FAILED: {primitive}")
+            print(f"  {type(e).__name__}: {e}")
+            failed.append(primitive)
+            if not args.quiet:
+                import traceback
+                traceback.print_exc()
+
+    # Final summary
+    print("\n" + "="*60)
+    print("BENCHMARK ALL - SUMMARY")
+    print("="*60)
+    print(f"Total primitives: {len(PRIMITIVES)}")
+    print(f"Successful: {len(results_dict)}")
+    print(f"Failed: {len(failed)}")
+
+    if failed:
+        print(f"\nFailed primitives: {', '.join(failed)}")
+
+    if results_dict:
+        print(f"\nBest speedups:")
+        for name in sorted(results_dict.keys()):
+            r = results_dict[name]
+            print(f"  {name:14s}: {r.best_speedup:>6.2f}x")
+
+    # Save if requested
+    if args.save or args.output:
+        if args.output:
+            output_path = args.output
+        else:
+            # Auto-save with timestamp
+            from datetime import datetime
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_path = f"benchmark_all_{preset}_{timestamp}.json"
+
+        # Save consolidated results
+        import json
+        consolidated = {
+            'preset': preset,
+            'device': device,
+            'compilation': actual_mode,
+            'total': len(PRIMITIVES),
+            'successful': len(results_dict),
+            'failed': failed,
+            'results': {name: r.to_dict() for name, r in results_dict.items()},
+        }
+
+        with open(output_path, 'w') as f:
+            json.dump(consolidated, f, indent=2)
+
+        print(f"\nSaved to {output_path}")
+
+    return 1 if failed else 0
 
 
 def cmd_benchmark_traced(args, model_name: str, device: str):
@@ -528,9 +670,10 @@ def main():
     bench_parser.add_argument('--batch', '-b', type=int, default=32, help='Batch size')
     bench_parser.add_argument('--iters', '-i', type=int, default=100, help='Iterations')
     bench_parser.add_argument('--warmup', '-w', type=int, default=3, help='Warmup iterations')
-    bench_parser.add_argument('--top', type=int, default=8, help='Show top N results')
+    bench_parser.add_argument('--top', '-t', type=int, default=8, help='Show top N results')
     bench_parser.add_argument('--no-validate', action='store_true', help='Skip validation')
     bench_parser.add_argument('-q', '--quiet', action='store_true', help='Quiet mode')
+    bench_parser.add_argument('-s', '--save', action='store_true', help='Auto-save with timestamp')
     bench_parser.add_argument('-o', '--output', help='Save results to JSON file')
     bench_parser.add_argument('--cpu', action='store_true', help='Force CPU')
 
