@@ -25,7 +25,9 @@ output = wide(packed_input)  # 1 kernel launch
 
 - **N-First Internal Format** - Wide primitives use `[N, B, ...]` format internally for optimal performance
 - **Zero Intermediate Pack/Unpack** - Only 2 reshapes per forward pass (at boundaries), zero conversions between stages
-- **14 Registered Primitives** - All primitives auto-discovered via registry, accessible via CLI
+- **13 Registered Primitives** - All primitives auto-discovered via registry, accessible via CLI
+- **`benchmark all` Command** - Benchmark all primitives in one command with consolidated results
+- **Auto-save with `-s` Flag** - Save benchmark results with auto-generated timestamps
 - **Fixed TracedWideModel** - Correctly handles spatial inputs (images `[B, N*C, H, W]`)
 - **Comprehensive Error Messages** - Full stack traces for easier debugging
 - **Unified Benchmark System** - All primitives use consistent N-first validation protocol
@@ -170,7 +172,7 @@ config = WideConfig(
 
 ## CLI
 
-### Benchmark Primitives (v0.6.0 - 14 primitives)
+### Benchmark Primitives (v0.6.0 - 13 primitives)
 
 ```bash
 # Benchmark specific primitive (auto-discovered from registry)
@@ -179,10 +181,9 @@ wide_compiler benchmark layernorm -p quick
 wide_compiler benchmark lstm -p quick
 wide_compiler benchmark conv2d -p quick
 
-# All 14 available primitives:
+# All 13 available primitives:
 # attention, batchnorm1d, batchnorm2d, conv1d, conv2d, conv3d,
-# embedding, gru, groupnorm, instancenorm1d, instancenorm2d,
-# layernorm, linear, lstm
+# embedding, gru, groupnorm, instancenorm2d, layernorm, linear, lstm
 
 # Benchmark all primitives
 wide_compiler benchmark all -p quick
@@ -224,80 +225,76 @@ wide_compiler trace -m resblock
 wide_compiler info
 ```
 
-## Supported Layers (v0.6.0 - 14 primitives)
+## Supported Layers (v0.6.0 - 13 primitives)
 
-| Layer | Wide Version | Format | Strategies | Best Speedup |
-|-------|--------------|--------|------------|--------------|
-| `nn.GRU` | `WideGRU` | N-first | fused (einsum) | **7.8x** |
-| `nn.LSTM` | `WideLSTM` | N-first | fused | **3.3x** (N=4) |
-| `nn.MultiheadAttention` | `WideAttention` | N-first | fused, sequential | **11.4x** |
-| `nn.Linear` | `WideLinear` | N-first | einsum, sequential | **12.8x** |
-| `nn.Embedding` | `WideEmbedding` | N-first | indexed, gather, sequential | **6.4x** |
-| `nn.Conv1d` | `WideConv1d` | N-first | grouped, sequential | **3.2x** |
-| `nn.Conv2d` | `WideConv2d` | N-first | grouped, channels_last, sequential | **2.5x** |
-| `nn.Conv3d` | `WideConv3d` | N-first | grouped, sequential | **~2x** |
-| `nn.GroupNorm` | `WideGroupNorm` | N-first | fused, sequential | **~2x** |
-| `nn.InstanceNorm1d/2d` | `WideInstanceNorm1d/2d` | N-first | fused, sequential | **~2x** |
-| `nn.LayerNorm` | `WideLayerNorm` | N-first | wide | **1.8x** |
-| `nn.BatchNorm1d` | `WideBatchNorm1d` | N-first | wide | **1.5x** |
-| `nn.BatchNorm2d` | `WideBatchNorm2d` | N-first | wide | **1.5x** |
+| Layer | Wide Version | Format | Strategies | Best Speedup (A100) |
+|-------|--------------|--------|------------|---------------------|
+| `nn.Embedding` | `WideEmbedding` | N-first | indexed, gather, sequential | **76.8x** @ N=32 |
+| `nn.BatchNorm2d` | `WideBatchNorm2d` | N-first | wide | **38.0x** @ N=32 |
+| `nn.InstanceNorm2d` | `WideInstanceNorm2d` | N-first | fused, sequential | **37.5x** @ N=32 |
+| `nn.GroupNorm` | `WideGroupNorm` | N-first | fused, sequential | **36.5x** @ N=32 |
+| `nn.BatchNorm1d` | `WideBatchNorm1d` | N-first | wide | **31.4x** @ N=32 |
+| `nn.Conv2d` | `WideConv2d` | N-first | grouped, channels_last, sequential | **15.0x** @ N=16 |
+| `nn.Conv1d` | `WideConv1d` | N-first | grouped, sequential | **12.3x** @ N=32 |
+| `nn.Conv3d` | `WideConv3d` | N-first | grouped, sequential | **10.9x** @ N=16 |
+| `nn.MultiheadAttention` | `WideAttention` | N-first | fused, sequential | **10.7x** @ N=32 |
+| `nn.Linear` | `WideLinear` | N-first | einsum, sequential | **9.3x** @ N=32 |
+| `nn.LayerNorm` | `WideLayerNorm` | N-first | wide | **9.1x** @ N=32 |
+| `nn.LSTM` | `WideLSTM` | N-first | fused | **3.3x** @ N=32 |
+| `nn.GRU` | `WideGRU` | N-first | fused (einsum) | **3.0x** @ N=32 |
 | `F.relu`, `F.gelu`, etc. | `FunctionalOp` | agnostic | — | — |
 | `+`, `-`, `*`, `/`, `@` | `BinaryOp` | agnostic | — | — |
 
 **All primitives operate on N-first format `[N, B, ...]` internally for optimal performance.**
 
-## Primitive Benchmarks (A100)
+*Benchmarks: A100 GPU, torch.compile (default mode), quick preset. See [benchmarks/](benchmarks/) for full results.*
 
-### GRU (NEW in 0.5.0)
+## Primitive Benchmarks (A100, compiled)
 
-| N | Fused | Baseline | Notes |
-|---|-------|----------|-------|
-| 8 | **5.0x** | 1.0x | Einsum fusion |
-| 16 | **6.2x** | 1.0x | |
-| 32 | **7.8x** | 1.0x | Scales well with N |
+All benchmarks: A100 GPU, `torch.compile(mode='default')`, quick preset (N=[4,8,16,32]).
 
-### LSTM (NEW in 0.5.0)
+### Top Performers
 
-| N | Fused | Baseline |
-|---|-------|----------|
-| 4 | **3.3x** | 1.0x |
-| 8 | 0.5x | 1.0x |
-| 16 | 1.0x | 1.0x |
-| 32 | 0.8x | 1.0x |
+| Primitive | N=4 | N=8 | N=16 | N=32 | Crossover | Best Strategy |
+|-----------|-----|-----|------|------|-----------|---------------|
+| **Embedding** | 4.0x | 8.5x | 15.4x | **76.8x** | N=4 | indexed |
+| **BatchNorm2d** | 4.6x | 9.3x | 14.7x | **38.0x** | N=4 | wide |
+| **InstanceNorm2d** | 4.6x | 9.1x | 18.4x | **37.5x** | N=4 | fused |
+| **GroupNorm** | 4.2x | 8.9x | 17.4x | **36.5x** | N=4 | fused |
+| **BatchNorm1d** | 4.0x | 7.9x | 15.6x | **31.4x** | N=4 | wide |
 
-> Use WideGRU for N > 4.
+### Conv Layers
 
-### Attention (NEW in 0.4.0)
+| Primitive | N=4 | N=8 | N=16 | N=32 | Crossover | Best Strategy |
+|-----------|-----|-----|------|------|-----------|---------------|
+| **Conv2d** | 3.8x | 7.4x | **15.0x** | 13.4x | N=4 | grouped |
+| **Conv1d** | 3.2x | 5.5x | 8.6x | **12.3x** | N=4 | grouped |
+| **Conv3d** | 3.8x | 7.6x | **10.9x** | — | N=4 | grouped |
 
-| N | Fused | Sequential | Baseline |
-|---|-------|------------|----------|
-| 4 | **3.91x** | 1.72x | 1.0x |
-| 8 | **8.33x** | 1.77x | 1.0x |
-| 16 | **11.23x** | 1.72x | 1.0x |
-| 32 | **11.40x** | 1.80x | 1.0x |
+### Attention & Linear
 
-### Embedding (Improved in 0.4.0)
+| Primitive | N=4 | N=8 | N=16 | N=32 | Crossover | Best Strategy |
+|-----------|-----|-----|------|------|-----------|---------------|
+| **Attention** | 4.4x | 6.4x | 8.2x | **10.7x** | N=4 | fused |
+| **Linear** | 1.1x | 2.4x | 4.4x | **9.3x** | N=4 | einsum |
+| **LayerNorm** | 1.3x | 2.5x | 5.0x | **9.1x** | N=4 | wide |
 
-| N | Indexed | Gather | Sequential |
-|---|---------|--------|------------|
-| 4 | **1.29x** | 1.09x | 0.85x |
-| 8 | **2.38x** | 2.30x | 0.87x |
-| 16 | 4.35x | **4.41x** | 0.88x |
-| 32 | **6.42x** | 5.93x | 0.92x |
+### RNN Layers
 
-### Linear
+| Primitive | N=8 | N=16 | N=32 | Crossover | Best Strategy | Notes |
+|-----------|-----|------|------|-----------|---------------|-------|
+| **LSTM** | 0.9x | 1.7x | **3.3x** | N=16 | fused | High overhead at low N |
+| **GRU** | 0.7x | 1.5x | **3.0x** | N=16 | fused | High overhead at low N |
 
-| N | Einsum | Sequential |
-|---|--------|------------|
-| 20 | **3.0x** | 1.0x |
-| 50 | **5.1x** | 1.0x |
-| 100 | **12.8x** | 1.0x |
+> **RNN Note:** Use `WideGRU`/`WideLSTM` only for N ≥ 16. At N < 16, sequential execution is faster due to kernel launch overhead.
 
-### Conv2d
+### Key Takeaways
 
-| N | Grouped | Channels Last | Sequential |
-|---|---------|---------------|------------|
-| 8+ | **2-2.5x** | ~2x | 1.0x |
+1. **Normalization layers** achieve 30-80x speedups (highest gains in WideCompiler)
+2. **Embedding** sees extreme speedups at high N due to batched indexing
+3. **Conv layers** scale well, best at N=16-32
+4. **Attention** provides consistent 4-11x speedup across all N
+5. **RNN layers** require N ≥ 16 to overcome overhead
 
 ## End-to-End Benchmarks
 
