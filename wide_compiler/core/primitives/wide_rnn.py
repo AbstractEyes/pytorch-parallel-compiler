@@ -355,8 +355,12 @@ class WideRNN(nn.Module):
 
         # Stack baseline outputs: N x [B, T, H] -> [N, B, T, H]
         stacked_out = torch.stack(baseline_outs, dim=0)
-        # Stack baseline hidden states: N x [B, H] -> [N, B, H]
+
+        # Stack baseline hidden states: N x [num_layers, B, H] -> [N, num_layers, B, H]
+        # For single-layer RNN (num_layers=1), squeeze to [N, B, H]
         stacked_h = torch.stack(baseline_hs, dim=0)
+        if stacked_h.shape[1] == 1:  # num_layers dimension
+            stacked_h = stacked_h.squeeze(1)  # [N, 1, B, H] -> [N, B, H]
 
         # Validate shapes
         if wide_out.shape != stacked_out.shape:
