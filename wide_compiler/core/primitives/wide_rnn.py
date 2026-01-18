@@ -1,6 +1,8 @@
 """
 WideRNN - N parallel vanilla RNN layers with fused input projections.
 
+Requires additional optimizations and a custom kernel fusion for multi-layer RNNs.
+
 Simpler than GRU/LSTM - single tanh activation, no gates.
 Expected speedup: 2-4x (similar to GRU/LSTM, crossover at N=16)
 
