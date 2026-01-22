@@ -337,77 +337,79 @@ rope = torch.randn(320, 128).cuda()       # [Ttxt+Timg, head_dim]
 txt_out, img_out = wide_block(txt, img, rope=rope)
 ```
 
-## Primitive Benchmarks (A100, eager mode)
+## Primitive Benchmarks (A100, compiled)
 
-All benchmarks: A100 GPU, eager mode, quick preset (N=[4,8,16,32]).
+All benchmarks: A100 GPU, torch.compile (default mode), quick preset (N=[4,8,16,32]).
 
 ### Top Performers
 
-| Primitive | N=4 | N=8 | N=16 | N=32 | Best Strategy |
-|-----------|-----|-----|------|------|---------------|
-| **Dropout** | 7.6x | 14.5x | 27.4x | **73.2x** | independent |
-| **RMSNorm** | 3.2x | 6.4x | 13.2x | **21.0x** | batched |
-| **MultiheadCrossAttention** | 2.9x | 6.3x | 13.7x | **15.7x** | fused |
-| **MLPEmbedder** | 2.6x | 4.0x | 7.3x | **14.8x** | fused |
-| **BatchNorm1d** | 1.5x | 2.9x | 5.8x | **11.5x** | wide |
+| Primitive | Best Speedup | Strategy |
+|-----------|--------------|----------|
+| **Dropout** | **173.7x** | shared |
+| **BatchNorm1d** | **36.7x** | wide |
+| **BatchNorm2d** | **35.8x** | wide |
+| **Embedding** | **27.1x** | indexed/gather |
+| **BatchNorm3d** | **23.5x** | wide |
+| **InstanceNorm2d** | **21.3x** | fused |
+| **RMSNorm** | **20.8x** | batched |
+| **MultiheadCrossAttention** | **17.8x** | fused |
+| **AdaptiveAvgPool2d** | **15.2x** | batched |
+| **AdaLayerNormZeroSingle** | **15.2x** | fused |
 
-### Conv Layers
+### Linear & Embedding
 
-| Primitive | N=4 | N=8 | N=16 | N=32 | Best Strategy |
-|-----------|-----|-----|------|------|---------------|
-| **ConvTranspose1d** | 1.7x | 2.6x | 4.2x | **5.4x** | grouped |
-| **Conv1d** | 1.7x | 2.7x | 4.1x | **5.3x** | grouped |
-| **ConvTranspose2d** | 1.6x | 2.6x | 3.6x | **3.8x** | grouped |
-| **Conv2d** | 1.7x | 2.3x | **2.9x** | 2.7x | grouped |
-| **Conv3d** | 1.7x | 1.8x | **1.9x** | — | grouped |
+| Primitive | Best Speedup | Strategy |
+|-----------|--------------|----------|
+| **MLPEmbedder** | **14.8x** | fused |
+| **Linear** | **8.8x** | einsum |
 
-### Attention & Linear
+### Convolution Layers
 
-| Primitive | N=4 | N=8 | N=16 | N=32 | Best Strategy |
-|-----------|-----|-----|------|------|---------------|
-| **Linear** | 1.3x | 1.5x | 4.9x | **9.7x** | einsum |
-| **Embedding** | 1.7x | 4.3x | 6.8x | **9.1x** | indexed |
-| **Attention** | 2.8x | **3.5x** | 1.8x | 1.3x | fused |
+| Primitive | Best Speedup | Strategy |
+|-----------|--------------|----------|
+| **Conv1d** | **12.1x** | grouped |
+| **PReLU** | **12.0x** | wide |
+| **Conv2d** | **6.2x** | grouped |
+| **ConvTranspose2d** | **5.7x** | grouped |
+| **ConvTranspose1d** | **5.3x** | grouped |
+| **Conv3d** | **4.4x** | grouped |
 
-### Normalization
+### Attention Layers
 
-| Primitive | N=4 | N=8 | N=16 | N=32 | Best Strategy |
-|-----------|-----|-----|------|------|---------------|
-| **AdaLayerNormZeroSingle** | 1.0x | 2.7x | 5.4x | **9.7x** | fused |
-| **InstanceNorm2d** | 2.3x | 4.9x | **7.7x** | 7.0x | fused |
-| **GroupNorm** | 1.6x | 3.2x | **4.9x** | 3.9x | fused |
-| **LayerNorm** | 0.8x | 1.5x | 2.8x | **4.7x** | wide |
-| **BatchNorm2d** | 1.5x | 3.4x | **3.4x** | 3.0x | wide |
-| **BatchNorm3d** | **0.9x** | 0.7x | 0.8x | 0.8x | wide (slower) |
+| Primitive | Best Speedup | Strategy |
+|-----------|--------------|----------|
+| **Attention** | **9.6x** | fused |
 
-### RNN Layers
+### Other Layers
 
-| Primitive | N=8 | N=16 | N=32 | Best Strategy | Notes |
-|-----------|-----|------|------|---------------|-------|
-| **RNN** | 0.3x | 0.5x | **1.0x** | fused | Break-even at N=32 |
-| **LSTM** | 0.2x | 0.4x | **0.7x** | fused | cuDNN faster |
-| **GRU** | 0.2x | 0.3x | **0.5x** | fused | cuDNN faster |
+| Primitive | Best Speedup | Strategy | Notes |
+|-----------|--------------|----------|-------|
+| **GroupNorm** | **12.9x** | fused | |
+| **LayerNorm** | **9.8x** | wide | |
+| **RNN** | **5.6x** | fused | Speedup improved with compilation |
+| **LSTM** | **3.3x** | fused | Speedup improved with compilation |
+| **GRU** | **2.9x** | fused | Speedup improved with compilation |
 
-> **RNN Note:** cuDNN's optimized implementations are faster than our batched versions. Use sequential execution for RNNs unless N is very large (>32) and you need the batching.
+### Key Takeaways (A100 Compiled)
 
-### Key Takeaways
+1. **Dropout** achieves extreme speedups (173.7x) with shared random state
+2. **BatchNorm layers** see massive gains with compilation (23-37x)
+3. **Embedding** scales exceptionally well (27.1x)
+4. **RMSNorm** provides 20.8x speedup, outperforms LayerNorm (9.8x) by 2.1x
+5. **CrossAttention** scales to 17.8x with compilation
+6. **RNN layers** benefit from compilation (GRU: 2.9x, LSTM: 3.3x, RNN: 5.6x)
+7. **Conv1d** reaches 12.1x with compilation vs 5.3x eager
+8. **Compilation is critical** - most primitives see 2-5x additional speedup
 
-1. **Dropout** achieves extreme speedups (73x) due to shared random state
-2. **RMSNorm** outperforms LayerNorm by ~4.5x (21x vs 4.7x)
-3. **CrossAttention** scales exceptionally well (15.7x @ N=32)
-4. **Normalization layers** generally provide 3-21x speedups
-5. **RNN layers** are slower than cuDNN (use sequential for RNNs)
-6. **BatchNorm3d** is always slower (no grouped implementation)
-
-## Block Benchmarks (A100, eager mode)
+## Block Benchmarks (A100, compiled)
 
 | Block | N=4 | N=8 | N=16 | N=32 | Components |
 |-------|-----|-----|------|------|------------|
-| **JointAttention** | 2.6x | 6.1x | 7.6x | **9.0x** | Dual-stream QKV + concat attn |
-| **AttentionBlock** | 2.4x | 4.1x | **7.9x** | 7.6x | QKV proj + SDPA + norm |
-| **DoubleStreamBlock** | 2.3x | **5.2x** | — | — | JointAttn + 2xMLP + norms |
-| **SingleStreamBlock** | 2.1x | **3.4x** | — | — | AdaLN + Attn + MLP |
-| **MLPBlock** | 1.9x | 2.5x | 2.9x | **2.9x** | 2x Linear + activation |
+| **AttentionBlock** | 3.7x | 6.1x | **10.7x** | 10.3x | QKV proj + SDPA + norm |
+| **DoubleStreamBlock** | 3.2x | **6.8x** | — | — | JointAttn + 2xMLP + norms |
+| **JointAttention** | 2.4x | 3.9x | 5.2x | **5.5x** | Dual-stream QKV + concat attn |
+| **MLPBlock** | 2.1x | 2.9x | 3.6x | **3.9x** | 2x Linear + activation |
+| **SingleStreamBlock** | 2.0x | **3.5x** | — | — | AdaLN + Attn + MLP |
 
 ## How it Works (v0.7.0)
 
