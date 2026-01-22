@@ -33,17 +33,28 @@ def _auto_register():
             WideConv1d,
             WideConv2d,
             WideConv3d,
+            WideConvTranspose1d,
+            WideConvTranspose2d,
             WideLinear,
             WideBatchNorm1d,
             WideBatchNorm2d,
+            WideBatchNorm3d,
             WideLayerNorm,
             WideGroupNorm,
             WideInstanceNorm1d,
             WideInstanceNorm2d,
+            WideRMSNorm,
+            WideAdaLayerNormZeroSingle,
             WideEmbedding,
+            WideMLPEmbedder,
             WideAttention,
+            WideMultiheadCrossAttention,
             WideGRU,
             WideLSTM,
+            WideRNN,
+            WideDropout,
+            WidePReLU,
+            WideAdaptiveAvgPool2d,
         )
         primitives_module = True
     except ImportError as e1:
@@ -53,17 +64,28 @@ def _auto_register():
                 WideConv1d,
                 WideConv2d,
                 WideConv3d,
+                WideConvTranspose1d,
+                WideConvTranspose2d,
                 WideLinear,
                 WideBatchNorm1d,
                 WideBatchNorm2d,
+                WideBatchNorm3d,
                 WideLayerNorm,
                 WideGroupNorm,
                 WideInstanceNorm1d,
                 WideInstanceNorm2d,
+                WideRMSNorm,
+                WideAdaLayerNormZeroSingle,
                 WideEmbedding,
+                WideMLPEmbedder,
                 WideAttention,
+                WideMultiheadCrossAttention,
                 WideGRU,
                 WideLSTM,
+                WideRNN,
+                WideDropout,
+                WidePReLU,
+                WideAdaptiveAvgPool2d,
             )
             primitives_module = True
         except ImportError as e2:
@@ -75,26 +97,81 @@ def _auto_register():
     if not primitives_module:
         return
 
-    # Map names to classes
+    # Map names to classes (primitives + blocks)
     primitives = {
+        # Convolutions
         'conv1d': WideConv1d,
         'conv2d': WideConv2d,
         'conv3d': WideConv3d,
+        'convtranspose1d': WideConvTranspose1d,
+        'convtranspose2d': WideConvTranspose2d,
+        # Linear
         'linear': WideLinear,
+        # Normalization
         'batchnorm1d': WideBatchNorm1d,
         'batchnorm2d': WideBatchNorm2d,
+        'batchnorm3d': WideBatchNorm3d,
         'layernorm': WideLayerNorm,
         'groupnorm': WideGroupNorm,
         'instancenorm1d': WideInstanceNorm1d,
         'instancenorm2d': WideInstanceNorm2d,
+        'rmsnorm': WideRMSNorm,
+        'ada_layer_norm_zero_single': WideAdaLayerNormZeroSingle,
+        # Embedding
         'embedding': WideEmbedding,
+        'mlp_embedder': WideMLPEmbedder,
+        # Attention
         'attention': WideAttention,
+        'multiheadcrossattention': WideMultiheadCrossAttention,
+        # RNN
         'gru': WideGRU,
         'lstm': WideLSTM,
+        'rnn': WideRNN,
+        # Activations & Regularization
+        'dropout': WideDropout,
+        'prelu': WidePReLU,
+        # Pooling
+        'adaptiveavgpool2d': WideAdaptiveAvgPool2d,
     }
 
+    # Try to import blocks (optional, may not always be needed)
+    blocks = {}
+    try:
+        try:
+            from ..blocks import WideMLP as BlockWideMLP
+            from ..blocks import WideAttention as BlockWideAttention
+            from ..blocks import WideJointAttention as BlockWideJointAttention
+            from ..blocks import WideDoubleStreamBlock
+            from ..blocks import WideSingleStreamBlock
+            blocks['mlp_block'] = BlockWideMLP
+            blocks['attention_block'] = BlockWideAttention
+            blocks['joint_attention'] = BlockWideJointAttention
+            # Always register stream blocks (they have benchmark_job)
+            blocks['double_stream_block'] = WideDoubleStreamBlock
+            blocks['single_stream_block'] = WideSingleStreamBlock
+        except ImportError:
+            try:
+                from wide_compiler.core.blocks import WideMLP as BlockWideMLP
+                from wide_compiler.core.blocks import WideAttention as BlockWideAttention
+                from wide_compiler.core.blocks import WideJointAttention as BlockWideJointAttention
+                from wide_compiler.core.blocks import WideDoubleStreamBlock
+                from wide_compiler.core.blocks import WideSingleStreamBlock
+                blocks['mlp_block'] = BlockWideMLP
+                blocks['attention_block'] = BlockWideAttention
+                blocks['joint_attention'] = BlockWideJointAttention
+                # Always register stream blocks (they have benchmark_job)
+                blocks['double_stream_block'] = WideDoubleStreamBlock
+                blocks['single_stream_block'] = WideSingleStreamBlock
+            except ImportError as e:
+                _IMPORT_ERRORS.append(f"Blocks import failed: {e}")
+    except Exception as e:
+        _IMPORT_ERRORS.append(f"Blocks exception: {e}")
+
+    # Combine primitives and blocks
+    all_benchmarkables = {**primitives, **blocks}
+
     # Register those with benchmark interface
-    for name, cls in primitives.items():
+    for name, cls in all_benchmarkables.items():
         if hasattr(cls, 'benchmark_job'):
             # Register immediately - sweeps will be lazily initialized when benchmark_job() is called
             _PRIMITIVE_REGISTRY[name] = cls

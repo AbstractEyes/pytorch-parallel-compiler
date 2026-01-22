@@ -75,17 +75,34 @@ def get_compile_fn(mode: CompilationMode) -> Optional[Callable]:
 # DEFAULT N-FIRST PACK/UNPACK/VALIDATE
 # =============================================================================
 
-def default_pack_fn(inputs: List[Tensor]) -> Tensor:
+def default_pack_fn(inputs: List[Union[Tensor, Tuple[Tensor, ...]]]) -> Union[Tensor, Tuple[Tensor, ...]]:
     """
     Default N-first packing: stack inputs along dim 0.
 
     Args:
-        inputs: List of N tensors, each [B, ...]
+        inputs: List of N tensors (each [B, ...]) or tuples of tensors
 
     Returns:
-        Stacked tensor [N, B, ...]
+        Stacked tensor [N, B, ...] or tuple of stacked tensors
     """
-    return torch.stack(inputs, dim=0)
+    if not inputs:
+        return torch.empty(0)
+
+    # Handle tuple inputs (e.g., (x, emb) for AdaLayerNorm)
+    if isinstance(inputs[0], tuple):
+        num_args = len(inputs[0])
+        packed_args = []
+        for i in range(num_args):
+            arg_list = [inp[i] for inp in inputs]
+            # Stack if tensor, keep None if None
+            if arg_list[0] is not None:
+                packed_args.append(torch.stack(arg_list, dim=0))
+            else:
+                packed_args.append(None)
+        return tuple(packed_args)
+    else:
+        # Single tensor - original behavior
+        return torch.stack(inputs, dim=0)
 
 
 def default_unpack_fn(output: Tensor, n: int) -> List[Tensor]:
@@ -385,7 +402,7 @@ class BenchmarkResult:
                 f"  Best config:",
                 f"    N={best.n}, strategy={best.strategy}",
                 f"    {params_str}",
-                f"    {best.baseline_ms:.3f}ms → {best.time_ms:.3f}ms ({best.speedup:.2f}x)",
+                f"    {best.baseline_ms:.3f}ms -> {best.time_ms:.3f}ms ({best.speedup:.2f}x)",
             ])
 
         return '\n'.join(lines)

@@ -110,16 +110,35 @@ def run_single(
 
     # Create N input tensors (each is [B, ...])
     sample = job.input_factory(n=n, device=device, **params)
-    inputs = [sample.clone() for _ in range(n)]
+
+    # Handle both single tensors and tuples of tensors
+    if isinstance(sample, tuple):
+        # Clone each element in the tuple (handle None values)
+        inputs = [
+            tuple(elem.clone() if isinstance(elem, Tensor) else elem for elem in sample)
+            for _ in range(n)
+        ]
+    else:
+        # Single tensor
+        inputs = [sample.clone() for _ in range(n)]
 
     # Baseline: get outputs for validation (use uncompiled)
     with torch.no_grad():
-        baseline_outputs = [m(inp) for m, inp in zip(models, inputs)]
+        if isinstance(inputs[0], tuple):
+            # Unpack tuple arguments
+            baseline_outputs = [m(*inp) for m, inp in zip(models, inputs)]
+        else:
+            baseline_outputs = [m(inp) for m, inp in zip(models, inputs)]
 
     # Baseline timing: run 1 compiled model N times (same as running N models)
-    def baseline_fn():
-        for i in range(n):
-            baseline_model_compiled(inputs[i])
+    if isinstance(inputs[0], tuple):
+        def baseline_fn():
+            for i in range(n):
+                baseline_model_compiled(*inputs[i])
+    else:
+        def baseline_fn():
+            for i in range(n):
+                baseline_model_compiled(inputs[i])
 
     baseline_ms = time_fn(
         baseline_fn,
@@ -154,7 +173,11 @@ def run_single(
 
     if validate:
         with torch.no_grad():
-            wide_output = wide_model(packed)
+            # Unpack if tuple
+            if isinstance(packed, tuple):
+                wide_output = wide_model(*packed)
+            else:
+                wide_output = wide_model(packed)
 
         is_valid, validation_msg = validate_fn(wide_output, baseline_outputs)
 
@@ -176,8 +199,13 @@ def run_single(
     if compiled:
         wide_model = compile_fn(wide_model)
 
-    def wide_fn():
-        wide_model(packed)
+    # Define timing function based on input type
+    if isinstance(packed, tuple):
+        def wide_fn():
+            wide_model(*packed)
+    else:
+        def wide_fn():
+            wide_model(packed)
 
     wide_ms = time_fn(
         wide_fn,
@@ -273,6 +301,8 @@ def run(
                     # Track validation failures
                     if not result.valid:
                         validation_failures.append((n, strategy, result.validation_msg))
+                        if verbose:
+                            print(f"[VALIDATION FAILED] {strategy}: {result.validation_msg}")
 
                 except Exception as e:
                     if verbose:
@@ -288,20 +318,20 @@ def run(
 
             if non_baseline:
                 best = max(non_baseline, key=lambda r: r.speedup)
-                status = f"→ {best.speedup:.2f}x ({best.strategy})"
+                status = f"-> {best.speedup:.2f}x ({best.strategy})"
                 if validate and not invalid:
-                    status += " ✓"  # Validation passed
+                    status += " [OK]"  # Validation passed
                 elif invalid:
                     status += f" [{len(invalid)} invalid]"
                 print(status)
             elif invalid:
-                print(f"→ ALL INVALID ({len(invalid)} failures)")
+                print(f"-> ALL INVALID ({len(invalid)} failures)")
             else:
                 print()
 
     # Print validation summary
     if verbose and validation_failures:
-        print(f"\n⚠ Validation failures ({len(validation_failures)}):")
+        print(f"\n[WARNING] Validation failures ({len(validation_failures)}):")
         for n, strategy, msg in validation_failures[:5]:  # Show first 5
             print(f"  N={n}, {strategy}: {msg}")
         if len(validation_failures) > 5:
