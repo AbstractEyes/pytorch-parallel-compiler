@@ -55,9 +55,17 @@ from .wide_instancenorm import (
     WideInstanceNorm2d,
     InstanceNormStrategy,
 )
+from .wide_rmsnorm import WideRMSNorm
+from .wide_ada_layer_norm_zero_single import WideAdaLayerNormZeroSingle
 
 # Embedding
 from .wide_embedding import WideEmbedding, EmbeddingStrategy
+from .wide_mlp_embedder import WideMLPEmbedder
+from .wide_rotary_embedding import (
+    WideRotaryEmbedding,
+    WideRotaryEmbeddingShared,
+    apply_rope,
+)
 
 # Attention
 from .wide_attention import WideAttention, AttentionStrategy
@@ -108,10 +116,16 @@ __all__ = [
     'WideInstanceNorm1d',
     'WideInstanceNorm2d',
     'InstanceNormStrategy',
+    'WideRMSNorm',
+    'WideAdaLayerNormZeroSingle',
 
     # Embedding
     'WideEmbedding',
     'EmbeddingStrategy',
+    'WideMLPEmbedder',
+    'WideRotaryEmbedding',
+    'WideRotaryEmbeddingShared',
+    'apply_rope',
 
     # Attention
     'WideAttention',

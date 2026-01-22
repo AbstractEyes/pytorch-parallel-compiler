@@ -182,7 +182,10 @@ def auto_register_primitives() -> None:
                 WideGroupNorm,
                 WideInstanceNorm1d,
                 WideInstanceNorm2d,
+                WideRMSNorm,
+                WideAdaLayerNormZeroSingle,
                 WideEmbedding,
+                WideMLPEmbedder,
                 WideAttention,
                 WideMultiheadCrossAttention,
                 WideGRU,
@@ -207,7 +210,10 @@ def auto_register_primitives() -> None:
                 WideGroupNorm,
                 WideInstanceNorm1d,
                 WideInstanceNorm2d,
+                WideRMSNorm,
+                WideAdaLayerNormZeroSingle,
                 WideEmbedding,
+                WideMLPEmbedder,
                 WideAttention,
                 WideMultiheadCrossAttention,
                 WideGRU,
@@ -234,8 +240,11 @@ def auto_register_primitives() -> None:
         _global_registry.register('GroupNorm', WideGroupNorm)
         _global_registry.register('InstanceNorm1d', WideInstanceNorm1d)
         _global_registry.register('InstanceNorm2d', WideInstanceNorm2d)
+        _global_registry.register('RMSNorm', WideRMSNorm)
+        _global_registry.register('AdaLayerNormZeroSingle', WideAdaLayerNormZeroSingle)
         # Embedding
         _global_registry.register('Embedding', WideEmbedding)
+        _global_registry.register('MLPEmbedder', WideMLPEmbedder)
         # Attention
         _global_registry.register('MultiheadAttention', WideAttention)
         # Cross-attention is not auto-registered (requires explicit intent)
@@ -249,6 +258,10 @@ def auto_register_primitives() -> None:
         _global_registry.register('Dropout', WideDropout)
         # Pooling
         _global_registry.register('AdaptiveAvgPool2d', WideAdaptiveAvgPool2d)
+
+        # Note: Blocks (WideAttention, WideJointAttention, WideMLP, WideDoubleStreamBlock,
+        # WideSingleStreamBlock) are composite structures not typically auto-registered.
+        # They can be manually registered if needed via registry.register().
 
     except ImportError:
         # Primitives not available - skip

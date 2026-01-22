@@ -53,12 +53,17 @@ wide_compiler/
     │   ├── benchmark_runner.py   → Execution engine
     │   ├── benchmark_schema.py   → BenchmarkJob, SweepParams, results
     │   └── benchmark_registry.py → Auto-discovers primitives
-    └── primitives/      → One file per Wide op (21 total)
+    ├── blocks/          → Composite architectural patterns (NEW in v0.7.0)
+    │   ├── wide_attention.py           → Flash Attention block with RoPE
+    │   ├── wide_joint_attention.py     → Joint attention (Flux MMDiT)
+    │   ├── wide_mlp.py                 → MLP with overridable activation
+    │   ├── wide_double_stream_block.py → Flux double-stream transformer
+    │   └── wide_single_stream_block.py → Flux single-stream transformer
+    └── primitives/      → One file per Wide op (25 total)
         # Core layers
         ├── wide_attention.py           → MHA via batched SDPA (10.7x)
         ├── wide_cross_attention.py     → Cross-attention (8-12x)
         ├── wide_linear.py              → Linear via einsum (9.3x)
-        ├── wide_embedding.py           → Batched index lookup (76.8x)
         # Convolutions
         ├── wide_conv1d.py              → Conv1d grouped (12.3x)
         ├── wide_conv2d.py              → Conv2d grouped (15.0x)
@@ -72,6 +77,12 @@ wide_compiler/
         ├── wide_layernorm.py           → LayerNorm (9.1x)
         ├── wide_groupnorm.py           → GroupNorm (36.5x)
         ├── wide_instancenorm.py        → InstanceNorm1d/2d (37.5x)
+        ├── wide_rmsnorm.py             → RMSNorm (NEW v0.7.0)
+        ├── wide_ada_layer_norm_zero_single.py  → Adaptive LayerNorm (NEW v0.7.0)
+        # Embedding
+        ├── wide_embedding.py           → Batched index lookup (76.8x)
+        ├── wide_mlp_embedder.py        → MLP projection (NEW v0.7.0)
+        ├── wide_rotary_embedding.py    → RoPE utilities (NEW v0.7.0)
         # RNNs
         ├── wide_gru.py                 → GRU fused (3.0x)
         ├── wide_lstm.py                → LSTM fused (3.3x)
@@ -216,19 +227,25 @@ wide_compiler benchmark all  # Run all primitives
 | **WideConv1d** | 3.2x | Grouped convolution |
 | **WideConv2d** | 2.5x | Grouped convolution |
 
-## CLI (v0.6.0 - All 14 primitives)
+## CLI (v0.7.0 - 25 primitives)
 
 ```bash
 # Benchmark primitives (auto-discovered from registry)
 wide_compiler benchmark attention -p quick      # Benchmark attention
 wide_compiler benchmark layernorm -p quick      # Benchmark layernorm
 wide_compiler benchmark lstm -p quick           # Benchmark LSTM
-wide_compiler benchmark all -p quick            # Benchmark all 14 primitives
+wide_compiler benchmark rmsnorm -p quick        # Benchmark RMSNorm (NEW)
+wide_compiler benchmark mlp_embedder -p quick   # Benchmark MLPEmbedder (NEW)
+wide_compiler benchmark all -p quick            # Benchmark all primitives
 
 # Available primitives (auto-registered):
-# attention, batchnorm1d, batchnorm2d, conv1d, conv2d, conv3d,
-# embedding, gru, groupnorm, instancenorm1d, instancenorm2d,
-# layernorm, linear, lstm
+# Core: linear, attention, multiheadcrossattention
+# Convolutions: conv1d, conv2d, conv3d, convtranspose1d, convtranspose2d
+# Normalization: batchnorm1d, batchnorm2d, batchnorm3d, layernorm, groupnorm,
+#                instancenorm1d, instancenorm2d, rmsnorm, ada_layer_norm_zero_single
+# Embedding: embedding, mlp_embedder
+# RNN: gru, lstm, rnn
+# Other: dropout, prelu, adaptiveavgpool2d
 
 # Benchmark full models (TracedWideModel)
 wide_compiler benchmark resblock --n 100        # Benchmark sample model
@@ -381,6 +398,42 @@ output = wide(packed)  # [4, N*output_dim]
 outputs = wide_compiler.unpack(output, n)  # List of [4, output_dim]
 ```
 
+## Blocks (v0.7.0 - Flux Architecture Support)
+
+WideCompiler now includes composite blocks for modern architectures like Flux:
+
+```python
+from wide_compiler.core.blocks import (
+    WideAttention,           # Flash Attention with optional RoPE
+    WideJointAttention,      # Joint attention for multi-modal (text+image)
+    WideMLP,                 # MLP with overridable activation
+    WideDoubleStreamBlock,   # Flux double-stream transformer block
+    WideSingleStreamBlock,   # Flux single-stream transformer block
+)
+
+# Example: Flux-style joint attention
+n = 8
+txt = torch.randn(n, 4, 64, 256)   # [N, B, L, hidden_size] text
+img = torch.randn(n, 4, 256, 256)  # [N, B, S, hidden_size] image
+vec = torch.randn(n, 4, 256)       # [N, B, emb_size] conditioning
+
+joint_attn = WideJointAttention(n=n, hidden_size=256, num_heads=8, head_dim=32)
+txt_out, img_out = joint_attn(txt, img, rope=None)
+
+# Example: Complete double-stream block
+block = WideDoubleStreamBlock(n=n, hidden_size=256, num_heads=8, head_dim=32)
+txt_out, img_out = block(txt, img, vec, rope=None)
+```
+
+**Block Features:**
+- **WideAttention**: Self-attention with Flash Attention (SDPA) and optional RoPE
+- **WideJointAttention**: Two-stream attention (text+image) for MMDiT architectures
+- **WideMLP**: Feed-forward network with configurable activation (GELU, SiLU, ReLU, etc.)
+- **WideDoubleStreamBlock**: Complete Flux double-stream transformer (adaptive norm + joint attn + MLPs)
+- **WideSingleStreamBlock**: Complete Flux single-stream transformer (adaptive norm + self-attn + gated MLP)
+
+All blocks use N-first format `[N, B, ...]` internally and support both 'fused' and 'sequential' strategies.
+
 ---
 
 **TL;DR:**
@@ -388,4 +441,6 @@ outputs = wide_compiler.unpack(output, n)  # List of [4, output_dim]
 - Wide primitives use **N-first** `[N, B, ...]` internally for maximum efficiency
 - TracedWideModel uses **channel-packed** `[B, N*C, ...]` at I/O boundaries
 - Zero intermediate pack/unpack between stages
-- 14 primitives with auto-discovered benchmarking via `wide_compiler benchmark <name>`
+- **v0.7.0**: 25 primitives + 5 composite blocks (Flux architecture support)
+- Auto-discovered benchmarking via `wide_compiler benchmark <name>`
+- New: RMSNorm, AdaLayerNorm, MLPEmbedder, RoPE, and complete Flux transformer blocks
