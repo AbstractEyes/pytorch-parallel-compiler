@@ -23,7 +23,7 @@ Copyright 2025 AbstractPhil
 Apache 2.0 License
 """
 
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import torch
 from torch import nn, Tensor
@@ -131,8 +131,8 @@ class WideAdaLayerNormZeroSingle(nn.Module):
             x_norm = (x_i - mean) / torch.sqrt(var + self.eps)
             x_norm = x_norm * self.norm_weight[i] + self.norm_bias[i]
 
-            # Gate from conditioning
-            gate = F.linear(vec_i, self.linear_weight[i].T, self.linear_bias[i])
+            # Gate from conditioning (linear_weight already in [out, in] format)
+            gate = F.linear(vec_i, self.linear_weight[i], self.linear_bias[i])
 
             x_norms.append(x_norm)
             gates.append(gate)
@@ -289,7 +289,7 @@ class WideAdaLayerNormZeroSingle(nn.Module):
         norm_match = torch.allclose(wide_norm, stacked_norm, rtol=rtol, atol=atol)
         if not norm_match:
             norm_diff = (wide_norm - stacked_norm).abs()
-            raise ValueError(
+            return False, (
                 f"Norm output mismatch: max_diff={norm_diff.max():.2e}, "
                 f"mean_diff={norm_diff.mean():.2e}"
             )
@@ -298,10 +298,12 @@ class WideAdaLayerNormZeroSingle(nn.Module):
         gate_match = torch.allclose(wide_gate, stacked_gate, rtol=rtol, atol=atol)
         if not gate_match:
             gate_diff = (wide_gate - stacked_gate).abs()
-            raise ValueError(
+            return False, (
                 f"Gate output mismatch: max_diff={gate_diff.max():.2e}, "
                 f"mean_diff={gate_diff.mean():.2e}"
             )
+
+        return True, "OK"
 
 
 __all__ = ['WideAdaLayerNormZeroSingle']

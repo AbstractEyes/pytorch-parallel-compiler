@@ -140,18 +140,32 @@ def _auto_register():
         try:
             from ..blocks import WideMLP as BlockWideMLP
             from ..blocks import WideAttention as BlockWideAttention
+            from ..blocks import WideJointAttention as BlockWideJointAttention
+            from ..blocks import WideDoubleStreamBlock
+            from ..blocks import WideSingleStreamBlock
             blocks['mlp_block'] = BlockWideMLP
             blocks['attention_block'] = BlockWideAttention
+            blocks['joint_attention'] = BlockWideJointAttention
+            # Always register stream blocks (they have benchmark_job)
+            blocks['double_stream_block'] = WideDoubleStreamBlock
+            blocks['single_stream_block'] = WideSingleStreamBlock
         except ImportError:
             try:
                 from wide_compiler.core.blocks import WideMLP as BlockWideMLP
                 from wide_compiler.core.blocks import WideAttention as BlockWideAttention
+                from wide_compiler.core.blocks import WideJointAttention as BlockWideJointAttention
+                from wide_compiler.core.blocks import WideDoubleStreamBlock
+                from wide_compiler.core.blocks import WideSingleStreamBlock
                 blocks['mlp_block'] = BlockWideMLP
                 blocks['attention_block'] = BlockWideAttention
-            except ImportError:
-                pass  # Blocks not available
-    except Exception:
-        pass  # Ignore block import errors
+                blocks['joint_attention'] = BlockWideJointAttention
+                # Always register stream blocks (they have benchmark_job)
+                blocks['double_stream_block'] = WideDoubleStreamBlock
+                blocks['single_stream_block'] = WideSingleStreamBlock
+            except ImportError as e:
+                _IMPORT_ERRORS.append(f"Blocks import failed: {e}")
+    except Exception as e:
+        _IMPORT_ERRORS.append(f"Blocks exception: {e}")
 
     # Combine primitives and blocks
     all_benchmarkables = {**primitives, **blocks}

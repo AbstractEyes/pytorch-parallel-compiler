@@ -56,9 +56,9 @@ class WideMLPEmbedder(nn.Module):
         self.fc1_weight = nn.Parameter(torch.empty(n, hidden_features, in_features))
         self.fc1_bias = nn.Parameter(torch.empty(n, hidden_features))
 
-        # Second projection: [N, hidden, hidden]
-        self.fc2_weight = nn.Parameter(torch.empty(n, hidden_features, hidden_features))
-        self.fc2_bias = nn.Parameter(torch.empty(n, hidden_features))
+        # Second projection: [N, in, hidden] - projects back to in_features
+        self.fc2_weight = nn.Parameter(torch.empty(n, in_features, hidden_features))
+        self.fc2_bias = nn.Parameter(torch.empty(n, in_features))
 
         self._reset_parameters()
 
@@ -111,12 +111,12 @@ class WideMLPEmbedder(nn.Module):
         for i in range(N):
             x_i = x[i]  # [B, D_in]
 
-            # First projection
-            h = F.linear(x_i, self.fc1_weight[i].T, self.fc1_bias[i])
+            # First projection (fc1_weight already in [out, in] format)
+            h = F.linear(x_i, self.fc1_weight[i], self.fc1_bias[i])
             h = self._activation(h)
 
-            # Second projection
-            out = F.linear(h, self.fc2_weight[i].T, self.fc2_bias[i])
+            # Second projection (fc2_weight already in [out, in] format)
+            out = F.linear(h, self.fc2_weight[i], self.fc2_bias[i])
 
             outputs.append(out)
 

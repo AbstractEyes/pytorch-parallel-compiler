@@ -142,17 +142,17 @@ class WideMultiheadCrossAttention(nn.Module):
         _, _, Tkv, _ = key.shape
 
         # Project Q from query: [N, B, Tq, D] -> [N, B, Tq, D]
-        q = torch.einsum('nbtd,ndo->nbto', query, self.q_weight)
+        q = torch.einsum('nbtd,nod->nbto', query, self.q_weight)
         if self.q_bias is not None:
             q = q + self.q_bias.view(N, 1, 1, D)
 
         # Project K from key: [N, B, Tkv, D] -> [N, B, Tkv, D]
-        k = torch.einsum('nbtd,ndo->nbto', key, self.k_weight)
+        k = torch.einsum('nbtd,nod->nbto', key, self.k_weight)
         if self.k_bias is not None:
             k = k + self.k_bias.view(N, 1, 1, D)
 
         # Project V from value: [N, B, Tkv, D] -> [N, B, Tkv, D]
-        v = torch.einsum('nbtd,ndo->nbto', value, self.v_weight)
+        v = torch.einsum('nbtd,nod->nbto', value, self.v_weight)
         if self.v_bias is not None:
             v = v + self.v_bias.view(N, 1, 1, D)
 
@@ -173,7 +173,7 @@ class WideMultiheadCrossAttention(nn.Module):
         attn_out = attn_out.transpose(1, 2).contiguous().view(N, B, Tq, D)
 
         # Output projection
-        out = torch.einsum('nbtd,ndo->nbto', attn_out, self.out_weight)
+        out = torch.einsum('nbtd,nod->nbto', attn_out, self.out_weight)
         if self.out_bias is not None:
             out = out + self.out_bias.view(N, 1, 1, D)
 
@@ -193,10 +193,10 @@ class WideMultiheadCrossAttention(nn.Module):
 
         outputs = []
         for i in range(N):
-            # Project (weights are stored transposed for einsum, so transpose back for F.linear)
-            q_i = F.linear(query[i], self.q_weight[i].T, self.q_bias[i] if self.q_bias is not None else None)
-            k_i = F.linear(key[i], self.k_weight[i].T, self.k_bias[i] if self.k_bias is not None else None)
-            v_i = F.linear(value[i], self.v_weight[i].T, self.v_bias[i] if self.v_bias is not None else None)
+            # Project
+            q_i = F.linear(query[i], self.q_weight[i], self.q_bias[i] if self.q_bias is not None else None)
+            k_i = F.linear(key[i], self.k_weight[i], self.k_bias[i] if self.k_bias is not None else None)
+            v_i = F.linear(value[i], self.v_weight[i], self.v_bias[i] if self.v_bias is not None else None)
 
             # Reshape for multi-head: [B, T, D] -> [B, H, T, D/H]
             q_i = q_i.view(B, Tq, self.n_heads, self.d_head).transpose(1, 2)
@@ -213,7 +213,7 @@ class WideMultiheadCrossAttention(nn.Module):
 
             # Reshape back and project
             attn_i = attn_i.transpose(1, 2).contiguous().view(B, Tq, D)
-            out_i = F.linear(attn_i, self.out_weight[i].T, self.out_bias[i] if self.out_bias is not None else None)
+            out_i = F.linear(attn_i, self.out_weight[i], self.out_bias[i] if self.out_bias is not None else None)
 
             outputs.append(out_i)
 
@@ -248,11 +248,11 @@ class WideMultiheadCrossAttention(nn.Module):
 
                 # Split in_proj_weight: [3D, D] -> Q, K, V each [D, D]
                 # PyTorch stores weights as [out_features, in_features]
-                # We transpose for einsum: 'nbtd,ndo->nbto' expects weight[n, in, out]
+                # Keep in PyTorch format for einsum: 'nbtd,nod->nbto' expects weight[n, out, in]
                 w_q, w_k, w_v = m.in_proj_weight.chunk(3, dim=0)
-                wide.q_weight[i] = w_q.T  # [D, D] -> [D, D] transposed for einsum
-                wide.k_weight[i] = w_k.T
-                wide.v_weight[i] = w_v.T
+                wide.q_weight[i] = w_q  # [D, D] in [out, in] format
+                wide.k_weight[i] = w_k
+                wide.v_weight[i] = w_v
 
                 if m.in_proj_bias is not None:
                     b_q, b_k, b_v = m.in_proj_bias.chunk(3, dim=0)
@@ -260,7 +260,7 @@ class WideMultiheadCrossAttention(nn.Module):
                     wide.k_bias[i] = b_k
                     wide.v_bias[i] = b_v
 
-                wide.out_weight[i] = m.out_proj.weight.T  # Transpose for einsum
+                wide.out_weight[i] = m.out_proj.weight  # Keep in [out, in] format
                 if m.out_proj.bias is not None:
                     wide.out_bias[i] = m.out_proj.bias
 

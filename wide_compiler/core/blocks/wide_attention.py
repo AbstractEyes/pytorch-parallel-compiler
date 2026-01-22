@@ -135,7 +135,7 @@ class WideAttention(nn.Module):
         qkv = qkv.reshape(N, B, S, 3, self.num_heads, self.head_dim)
 
         # Split Q, K, V: each [N, B, num_heads, S, head_dim]
-        q, k, v = qkv.permute(3, 0, 1, 4, 2, 5)
+        q, k, v = qkv.permute(3, 0, 1, 4, 2, 5).unbind(0)
 
         # Apply RoPE if provided
         if rope is not None:
@@ -157,7 +157,7 @@ class WideAttention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale)
 
         # Reshape: [N*B, num_heads, S, head_dim] -> [N, B, S, num_heads*head_dim]
-        out = out.reshape(N, B, S, self.num_heads * self.head_dim)
+        out = out.reshape(N, B, self.num_heads, S, self.head_dim).transpose(2, 3).reshape(N, B, S, -1)
 
         # Output projection: [N, B, S, num_heads*head_dim] @ [N, hidden, num_heads*head_dim].T
         out = torch.einsum('nbsd,nhd->nbsh', out, self.out_weight)
@@ -184,7 +184,7 @@ class WideAttention(nn.Module):
             x_i = x[i]  # [B, S, H]
 
             # QKV projection
-            qkv = F.linear(x_i, self.qkv_weight[i].T, self.qkv_bias[i] if self.qkv_bias is not None else None)
+            qkv = F.linear(x_i, self.qkv_weight[i], self.qkv_bias[i] if self.qkv_bias is not None else None)
             qkv = qkv.reshape(B, S, 3, self.num_heads, self.head_dim)
             q, k, v = qkv.permute(2, 0, 3, 1, 4)  # 3 x [B, num_heads, S, head_dim]
 
@@ -204,7 +204,7 @@ class WideAttention(nn.Module):
             out_i = out_i.transpose(1, 2).reshape(B, S, -1)
 
             # Output projection
-            out_i = F.linear(out_i, self.out_weight[i].T, self.out_bias[i] if self.out_bias is not None else None)
+            out_i = F.linear(out_i, self.out_weight[i], self.out_bias[i] if self.out_bias is not None else None)
 
             outputs.append(out_i)
 
@@ -329,6 +329,7 @@ class WideAttention(nn.Module):
                 self.hidden_size = hidden_size
                 self.num_heads = num_heads
                 self.head_dim = head_dim
+                self.scale = head_dim ** -0.5
                 self.qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
                 self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
@@ -337,7 +338,7 @@ class WideAttention(nn.Module):
                 B, S, D = x.shape
                 qkv = self.qkv(x).reshape(B, S, 3, self.num_heads, self.head_dim)
                 q, k, v = qkv.permute(2, 0, 3, 1, 4)
-                out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale)
                 out = out.transpose(1, 2).reshape(B, S, -1)
                 return self.out_proj(out)
 

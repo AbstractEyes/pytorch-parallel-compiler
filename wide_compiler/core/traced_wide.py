@@ -69,50 +69,11 @@ import torch.fx as fx
 import operator
 
 try:
-    from .primitives import (
-        WideLinear, WideConv1d, WideConv2d, WideConv3d,
-        WideBatchNorm1d, WideBatchNorm2d, WideLayerNorm,
-        WideGroupNorm, WideInstanceNorm1d, WideInstanceNorm2d,
-        WideEmbedding, WideAttention, WideGRU, WideLSTM
-    )
-
     from .ensemble_util import pack_inputs, unpack_outputs
+    from .registry import get_registry
 except ImportError:
-    from wide_compiler.core.primitives import (
-        WideLinear, WideConv1d, WideConv2d, WideConv3d,
-        WideBatchNorm1d, WideBatchNorm2d, WideLayerNorm,
-        WideGroupNorm, WideInstanceNorm1d, WideInstanceNorm2d,
-        WideEmbedding, WideAttention, WideGRU, WideLSTM
-    )
     from wide_compiler.core.ensemble_util import pack_inputs, unpack_outputs
-
-
-# =============================================================================
-# WIDE BUILDERS
-# =============================================================================
-
-WIDE_BUILDERS = {
-    # Linear
-    'Linear': WideLinear.from_modules,
-    # Convolutions
-    'Conv1d': WideConv1d.from_modules,
-    'Conv2d': WideConv2d.from_modules,
-    'Conv3d': WideConv3d.from_modules,
-    # Normalization
-    'BatchNorm1d': WideBatchNorm1d.from_modules,
-    'BatchNorm2d': WideBatchNorm2d.from_modules,
-    'LayerNorm': WideLayerNorm.from_modules,
-    'GroupNorm': WideGroupNorm.from_modules,
-    'InstanceNorm1d': WideInstanceNorm1d.from_modules,
-    'InstanceNorm2d': WideInstanceNorm2d.from_modules,
-    # Embedding
-    'Embedding': WideEmbedding.from_modules,
-    # Attention
-    'MultiheadAttention': WideAttention.from_modules,
-    # RNNs
-    'GRU': WideGRU.from_modules,
-    'LSTM': WideLSTM.from_modules,
-}
+    from wide_compiler.core.registry import get_registry
 
 
 # =============================================================================
@@ -381,8 +342,11 @@ class TracedWideModel(nn.Module):
                 modules = [m.get_submodule(target_path) for m in models]
                 module_type = type(modules[0]).__name__
 
-                if module_type in WIDE_BUILDERS:
-                    wide_op = WIDE_BUILDERS[module_type](modules)
+                # Use registry to get builder
+                registry = get_registry()
+                builder = registry.get_builder(module_type)
+                if builder is not None:
+                    wide_op = builder(modules)
                 else:
                     wide_op = FunctionalOp(lambda x, m=modules[0]: m(x), f"Passthrough({module_type})")
 

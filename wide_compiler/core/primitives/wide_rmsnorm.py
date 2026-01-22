@@ -42,7 +42,7 @@ class WideRMSNorm(nn.Module):
         self,
         n: int,
         normalized_shape: int,
-        eps: float = 1e-6,
+        eps: Optional[float] = None,
         elementwise_affine: bool = True,
         strategy: str = 'batched',
     ):
@@ -78,7 +78,8 @@ class WideRMSNorm(nn.Module):
         """Batched RMSNorm across N models."""
         # x: [N, B, ..., D]
         # Compute RMS over last dimension for each [N, B, ...] position
-        rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
+        eps = self.eps if self.eps is not None else 0.0
+        rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
         x_norm = x / rms
 
         if self.elementwise_affine:
@@ -94,9 +95,10 @@ class WideRMSNorm(nn.Module):
         N = x.shape[0]
         outputs = []
 
+        eps = self.eps if self.eps is not None else 0.0
         for i in range(N):
             x_i = x[i]  # [B, ..., D]
-            rms = torch.sqrt(torch.mean(x_i * x_i, dim=-1, keepdim=True) + self.eps)
+            rms = torch.sqrt(torch.mean(x_i * x_i, dim=-1, keepdim=True) + eps)
             x_norm = x_i / rms
 
             if self.elementwise_affine:
@@ -125,7 +127,7 @@ class WideRMSNorm(nn.Module):
         wide = cls(
             n=n,
             normalized_shape=normalized_shape,
-            eps=getattr(t, 'eps', 1e-6),
+            eps=getattr(t, 'eps', None),  # PyTorch RMSNorm has eps=None by default
             elementwise_affine=(t.weight is not None),
             strategy=strategy,
         )

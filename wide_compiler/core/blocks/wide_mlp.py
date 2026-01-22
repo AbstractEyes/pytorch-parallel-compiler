@@ -137,14 +137,14 @@ class WideMLP(nn.Module):
         for i in range(N):
             x_i = x[i]  # [B, S, H]
 
-            # First linear
-            h_i = F.linear(x_i, self.fc1_weight[i].T, self.fc1_bias[i] if self.fc1_bias is not None else None)
+            # First linear (weights already in [out, in] format)
+            h_i = F.linear(x_i, self.fc1_weight[i], self.fc1_bias[i] if self.fc1_bias is not None else None)
 
             # Activation
             h_i = self._activation(h_i)
 
-            # Second linear
-            out_i = F.linear(h_i, self.fc2_weight[i].T, self.fc2_bias[i] if self.fc2_bias is not None else None)
+            # Second linear (weights already in [out, in] format)
+            out_i = F.linear(h_i, self.fc2_weight[i], self.fc2_bias[i] if self.fc2_bias is not None else None)
 
             outputs.append(out_i)
 
@@ -222,8 +222,8 @@ class WideMLP(nn.Module):
                     m_fc1 = m[0]
                     m_fc2 = m[-1]
                 else:
-                    m_fc1 = getattr(m, 'fc1', getattr(m, 'linear1'))
-                    m_fc2 = getattr(m, 'fc2', getattr(m, 'linear2'))
+                    m_fc1 = getattr(m, 'fc1', getattr(m, 'linear1', None))
+                    m_fc2 = getattr(m, 'fc2', getattr(m, 'linear2', None))
 
                 wide.fc1_weight[i] = m_fc1.weight
                 wide.fc2_weight[i] = m_fc2.weight
