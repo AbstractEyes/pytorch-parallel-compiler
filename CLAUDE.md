@@ -43,54 +43,55 @@ wide_compiler/
 ├── api.py               → compile(), WideBuilder, pack(), unpack()
 ├── cli.py               → CLI commands (test, benchmark, trace, info)
 ├── __main__.py          → Delegates to cli.main()
+├── test_cases.py        → Reusable test suite for all 29 components
 └── core/
     ├── config.py        → WideConfig dataclass
-    ├── registry.py      → Maps 'Linear' → WideLinear.from_modules
+    ├── registry.py      → Maps 'Linear' → WideLinear.from_modules (24 primitives)
     ├── traced_wide.py   → FX tracing, graph execution (THE CORE)
-    ├── benchmark/       → Primitive benchmarking system (NEW)
+    ├── ensemble_util.py → pack_inputs(), unpack_outputs()
+    ├── benchmark/       → Primitive benchmarking system
     │   ├── __init__.py
     │   ├── benchmark_api.py      → run_benchmark(), list_primitives()
     │   ├── benchmark_runner.py   → Execution engine
     │   ├── benchmark_schema.py   → BenchmarkJob, SweepParams, results
     │   └── benchmark_registry.py → Auto-discovers primitives
-    ├── blocks/          → Composite architectural patterns (NEW in v0.7.0)
-    │   ├── wide_attention.py           → Flash Attention block with RoPE
-    │   ├── wide_joint_attention.py     → Joint attention (Flux MMDiT)
-    │   ├── wide_mlp.py                 → MLP with overridable activation
-    │   ├── wide_double_stream_block.py → Flux double-stream transformer
-    │   └── wide_single_stream_block.py → Flux single-stream transformer
-    └── primitives/      → One file per Wide op (25 total)
+    ├── blocks/          → Flux-style composite blocks (5 total)
+    │   ├── wide_mlp.py                 → MLP block (2.9x @ N=32)
+    │   ├── wide_attention.py           → Attention block (7.9x @ N=16)
+    │   ├── wide_joint_attention.py     → Dual-stream attention (9.0x @ N=32)
+    │   ├── wide_double_stream_block.py → Flux double-stream (5.2x @ N=8)
+    │   └── wide_single_stream_block.py → Flux single-stream (3.4x @ N=8)
+    └── primitives/      → One file per Wide op (24 total)
         # Core layers
-        ├── wide_attention.py           → MHA via batched SDPA (10.7x)
-        ├── wide_cross_attention.py     → Cross-attention (8-12x)
-        ├── wide_linear.py              → Linear via einsum (9.3x)
+        ├── wide_linear.py              → Linear via einsum (9.7x)
+        ├── wide_embedding.py           → Batched index lookup (9.1x)
+        ├── wide_mlp_embedder.py        → MLP with timestep embedding (14.8x)
+        # Attention
+        ├── wide_attention.py           → MHA via batched SDPA (3.5x)
+        ├── wide_cross_attention.py     → Cross-attention (15.7x)
         # Convolutions
-        ├── wide_conv1d.py              → Conv1d grouped (12.3x)
-        ├── wide_conv2d.py              → Conv2d grouped (15.0x)
-        ├── wide_conv3d.py              → Conv3d grouped (10.9x)
-        ├── wide_convtranspose1d.py     → ConvTranspose1d (10-15x)
-        ├── wide_convtranspose2d.py     → ConvTranspose2d (8-15x)
+        ├── wide_conv1d.py              → Conv1d grouped (5.3x)
+        ├── wide_conv2d.py              → Conv2d grouped (2.9x)
+        ├── wide_conv3d.py              → Conv3d grouped (1.9x)
+        ├── wide_convtranspose1d.py     → ConvTranspose1d (5.4x)
+        ├── wide_convtranspose2d.py     → ConvTranspose2d (3.8x)
         # Normalization
-        ├── wide_batchnorm_1d.py        → BatchNorm1d (31.4x)
-        ├── wide_batchnorm_2d.py        → BatchNorm2d (38.0x)
-        ├── wide_batchnorm_3d.py        → BatchNorm3d (30-40x est)
-        ├── wide_layernorm.py           → LayerNorm (9.1x)
-        ├── wide_groupnorm.py           → GroupNorm (36.5x)
-        ├── wide_instancenorm.py        → InstanceNorm1d/2d (37.5x)
-        ├── wide_rmsnorm.py             → RMSNorm (NEW v0.7.0)
-        ├── wide_ada_layer_norm_zero_single.py  → Adaptive LayerNorm (NEW v0.7.0)
-        # Embedding
-        ├── wide_embedding.py           → Batched index lookup (76.8x)
-        ├── wide_mlp_embedder.py        → MLP projection (NEW v0.7.0)
-        ├── wide_rotary_embedding.py    → RoPE utilities (NEW v0.7.0)
+        ├── wide_rmsnorm.py             → RMSNorm (21.0x) ⭐ NEW
+        ├── wide_batchnorm_1d.py        → BatchNorm1d (11.5x)
+        ├── wide_ada_layer_norm_zero_single.py → AdaLayerNormZero (9.7x)
+        ├── wide_instancenorm.py        → InstanceNorm1d/2d (7.7x)
+        ├── wide_groupnorm.py           → GroupNorm (4.9x)
+        ├── wide_layernorm.py           → LayerNorm (4.7x)
+        ├── wide_batchnorm_2d.py        → BatchNorm2d (3.4x)
+        ├── wide_batchnorm_3d.py        → BatchNorm3d (0.9x slower)
         # RNNs
-        ├── wide_gru.py                 → GRU fused (3.0x)
-        ├── wide_lstm.py                → LSTM fused (3.3x)
-        ├── wide_rnn.py                 → RNN fused (2-4x est)
+        ├── wide_rnn.py                 → RNN fused (1.0x break-even)
+        ├── wide_lstm.py                → LSTM fused (0.7x slower)
+        ├── wide_gru.py                 → GRU fused (0.5x slower)
         # Other
-        ├── wide_prelu.py               → PReLU (15-30x est)
-        ├── wide_dropout.py             → Dropout (5-20x est)
-        └── wide_adaptive_avgpool2d.py  → AdaptiveAvgPool2d (20-50x est)
+        ├── wide_dropout.py             → Dropout (73.2x) ⭐ EXTREME
+        ├── wide_adaptive_avgpool2d.py  → AdaptiveAvgPool2d (2.2x)
+        └── wide_prelu.py               → PReLU (1.0x break-even)
 ```
 
 ## How It Works
@@ -101,12 +102,18 @@ traced = fx.symbolic_trace(template_model)
 # Captures: call_module, call_function, call_method
 ```
 
-### 2. Build Wide Ops
+### 2. Build Wide Ops (v0.7.0 - Registry-based)
 ```python
 for node in traced.graph.nodes:
     if node.op == 'call_module':
         modules = [m.get_submodule(path) for m in models]
-        wide_op = WIDE_BUILDERS[module_type](modules)
+        module_type = type(modules[0]).__name__
+
+        # Dynamic lookup via registry (24 primitives)
+        registry = get_registry()
+        builder = registry.get_builder(module_type)
+        if builder:
+            wide_op = builder(modules)
 ```
 
 ### 3. Graph Execution (v0.6.0 - N-first internal format)
@@ -217,44 +224,52 @@ wide_compiler benchmark lstm -p quick
 wide_compiler benchmark all  # Run all primitives
 ```
 
-## Key Speedups
+## Key Speedups (v0.7.0 - Top 10)
 
 | Primitive | Best Speedup | Why |
 |-----------|--------------|-----|
-| **WideAttention** | 11.4x | Batched Flash Attention |
-| **WideLinear** | 12.8x | Fused einsum |
-| **WideEmbedding** | 6.4x | Batched index lookup |
-| **WideConv1d** | 3.2x | Grouped convolution |
-| **WideConv2d** | 2.5x | Grouped convolution |
+| **WideDropout** | 73.2x | Shared random state across N models |
+| **WideRMSNorm** | 21.0x | Batched normalization |
+| **WideMultiheadCrossAttention** | 15.7x | Dual-stream batched attention |
+| **WideMLPEmbedder** | 14.8x | Fused Linear + timestep projection |
+| **WideBatchNorm1d** | 11.5x | Batched batch normalization |
+| **WideAdaLayerNormZeroSingle** | 9.7x | Fused adaptive normalization |
+| **WideLinear** | 9.7x | Batched einsum |
+| **WideEmbedding** | 9.1x | Batched index lookup |
+| **WideJointAttention** | 9.0x | Dual-stream attention block |
+| **WideAttentionBlock** | 7.9x | QKV + SDPA + out proj |
 
-## CLI (v0.7.0 - 25 primitives)
+## CLI (v0.7.0 - All 29 primitives + blocks)
 
 ```bash
 # Benchmark primitives (auto-discovered from registry)
-wide_compiler benchmark attention -p quick      # Benchmark attention
-wide_compiler benchmark layernorm -p quick      # Benchmark layernorm
-wide_compiler benchmark lstm -p quick           # Benchmark LSTM
-wide_compiler benchmark rmsnorm -p quick        # Benchmark RMSNorm (NEW)
-wide_compiler benchmark mlp_embedder -p quick   # Benchmark MLPEmbedder (NEW)
-wide_compiler benchmark all -p quick            # Benchmark all primitives
+wide_compiler benchmark rmsnorm -p quick       # RMSNorm (21x)
+wide_compiler benchmark dropout -p quick       # Dropout (73x)
+wide_compiler benchmark multiheadcrossattention -p quick  # Cross-attn (15.7x)
 
-# Available primitives (auto-registered):
-# Core: linear, attention, multiheadcrossattention
-# Convolutions: conv1d, conv2d, conv3d, convtranspose1d, convtranspose2d
-# Normalization: batchnorm1d, batchnorm2d, batchnorm3d, layernorm, groupnorm,
-#                instancenorm1d, instancenorm2d, rmsnorm, ada_layer_norm_zero_single
-# Embedding: embedding, mlp_embedder
-# RNN: gru, lstm, rnn
-# Other: dropout, prelu, adaptiveavgpool2d
+# Benchmark blocks
+wide_compiler benchmark mlp_block -p quick
+wide_compiler benchmark attention_block -p quick
+wide_compiler benchmark joint_attention -p quick
+wide_compiler benchmark double_stream_block -p quick
+wide_compiler benchmark single_stream_block -p quick
 
-# Benchmark full models (TracedWideModel)
-wide_compiler benchmark resblock --n 100        # Benchmark sample model
-wide_compiler benchmark mlp --n 50              # Benchmark MLP
+# Available primitives (24 total):
+# linear, conv1d, conv2d, conv3d, convtranspose1d, convtranspose2d,
+# batchnorm1d, batchnorm2d, batchnorm3d, layernorm, groupnorm,
+# instancenorm2d, rmsnorm, ada_layer_norm_zero_single,
+# embedding, mlp_embedder, attention, multiheadcrossattention,
+# gru, lstm, rnn, prelu, dropout, adaptiveavgpool2d
 
 # Other commands
 wide_compiler test                   # Correctness tests
-wide_compiler trace -m resblock      # Show FX graph
+wide_compiler trace -m mlp           # Show FX graph
 wide_compiler info                   # Library info
+
+# Test suite
+python test_cases.py                 # All 29 components
+python test_cases.py --primitives    # 24 primitives
+python test_cases.py --blocks        # 5 blocks
 ```
 
 ## Pack / Unpack
@@ -282,17 +297,46 @@ WideConfig.fast()   # Compiled, no validation
 WideConfig.debug()  # Verbose, strict
 ```
 
+## I/O Formats (v0.7.0)
+
+### Primitives (N-first)
+| Primitive | Input | Output |
+|-----------|-------|--------|
+| WideLinear | `[N, B, ..., Din]` | `[N, B, ..., Dout]` |
+| WideConv2d | `[N, B, C, H, W]` | `[N, B, Cout, Hout, Wout]` |
+| WideAttention | `[N, B, T, D]` | `[N, B, T, D]` |
+| WideRMSNorm | `[N, B, ..., D]` | `[N, B, ..., D]` |
+| WideEmbedding | `[N, B, T]` (indices) | `[N, B, T, D]` |
+| WideGRU | `[N, B, T, Din]` | `[N, B, T, H], [N, B, H]` |
+| WideDropout | `[N, B, ...]` | `[N, B, ...]` |
+
+### Blocks (N-first)
+| Block | Input | Output |
+|-------|-------|--------|
+| WideMLP | `[N, B, T, D]` | `[N, B, T, D]` |
+| WideAttention (block) | `[N, B, T, D]` + optional rope | `[N, B, T, D]` |
+| WideJointAttention | `[N,B,Ttxt,D], [N,B,Timg,D]` | `[N,B,Ttxt,D], [N,B,Timg,D]` |
+| WideDoubleStreamBlock | `[N,B,Ttxt,D], [N,B,Timg,D]` + rope | `[N,B,Ttxt,D], [N,B,Timg,D]` |
+| WideSingleStreamBlock | `[N,B,T,D], [N,B,Demb]` + rope | `[N,B,T,D]` |
+
+### TracedWideModel (Channel-packed I/O)
+- **Input**: `[B, N*C, ...]` (channel-packed)
+- **Output**: `[B, N*C, ...]` (channel-packed)
+- **Internal**: All stages use N-first `[N, B, C, ...]`
+
 ## Key Classes
 
 | Class | File | Purpose |
 |-------|------|---------|
 | `TracedWideModel` | traced_wide.py | Main output - the fused model |
 | `WideConfig` | config.py | Configuration dataclass |
-| `WideRegistry` | registry.py | Maps module types to builders |
+| `WideRegistry` | registry.py | Maps module types to builders (24 primitives) |
 | `BenchmarkJob` | benchmark_schema.py | Defines a benchmark sweep |
-| `WideAttention` | wide_attention.py | N parallel MHA (11x speedup) |
+| `WideRMSNorm` | wide_rmsnorm.py | N parallel RMSNorm (21x speedup) ⭐ |
+| `WideDropout` | wide_dropout.py | N parallel Dropout (73x speedup) ⭐ |
+| `WideDoubleStreamBlock` | wide_double_stream_block.py | Flux double-stream transformer block |
 
-## Adding a New Primitive (v0.6.0 checklist)
+## Adding a New Primitive (v0.7.0 checklist)
 
 1. Create `primitives/wide_foo.py`:
 ```python
@@ -341,9 +385,38 @@ class WideFoo(nn.Module):
 
 2. Add to `primitives/__init__.py` (import and `__all__`)
 3. Add to `benchmark_registry.py` imports (will auto-register if has `benchmark_job()`)
-4. Add to `registry.py` WIDE_BUILDERS dict (for TracedWideModel support)
+4. Add to `registry.py` auto_register_primitives() function
+5. Add to `core/__init__.py` exports
 
-## Debugging (v0.6.0)
+## Adding a New Block (v0.7.0 checklist)
+
+1. Create `blocks/wide_foo_block.py`:
+```python
+class WideFooBlock(nn.Module):
+    """N parallel Foo blocks fused."""
+
+    BENCHMARK_STRATEGIES = ['baseline', 'fused', 'sequential']
+
+    def __init__(self, n, ...): ...
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Input/Output: [N, B, ...] N-first format"""
+        if self._strategy == 'fused':
+            return self._forward_fused(x)
+        return self._forward_sequential(x)
+
+    @classmethod
+    def from_modules(cls, modules: List[nn.Module]): ...
+
+    @classmethod
+    def benchmark_job(cls, preset='full'): ...
+```
+
+2. Add to `blocks/__init__.py` (import and `__all__`)
+3. Add to `benchmark_registry.py` imports
+4. Blocks are NOT auto-registered in registry.py (composite structures)
+
+## Debugging (v0.7.0)
 
 1. **Benchmark errors?** CLI shows full stack trace automatically
 2. **Validation failures?** Check shapes:
@@ -358,21 +431,41 @@ class WideFoo(nn.Module):
 5. **Strategy selection?** Print `wide.strategy` to see which was chosen
 6. **Slow first run?** Warmup iterations. Benchmark after 5+ runs.
 7. **Missing primitive in CLI?** Check `benchmark_registry.py` imports
+8. **Registry not finding primitive?** Check `registry.py` auto_register_primitives()
 
-## Quick Test (v0.6.0 - N-first format)
+## Known Issues (v0.7.0)
+
+1. **RNN Slowdowns** - cuDNN implementations are faster than batched versions
+   - GRU: 0.5x @ N=32 (slower)
+   - LSTM: 0.7x @ N=32 (slower)
+   - RNN: 1.0x @ N=32 (break-even)
+   - **Solution**: Use sequential execution for RNNs
+
+2. **BatchNorm3d Slowdown** - No grouped implementation available
+   - Always slower (0.7-0.9x)
+   - **Solution**: Avoid if possible or use LayerNorm
+
+3. **PReLU Break-even** - Kernel launch overhead at low N
+   - 1.0x @ N=4
+   - **Solution**: Only use at N>8
+
+4. **Attention Degradation** - Performance drops at very high N
+   - Best @ N=8 (3.5x), drops to 1.3x @ N=32
+   - **Solution**: Keep N<=16 for attention-heavy models
+
+## Quick Test (v0.7.0 - RMSNorm example)
 
 ```python
 import torch
-from wide_compiler.core.primitives import WideAttention
+from wide_compiler.core.primitives import WideRMSNorm
 
-# Create N attention modules
-n, d_model, n_heads = 8, 256, 8
-modules = [torch.nn.MultiheadAttention(d_model, n_heads, batch_first=True).cuda()
-           for _ in range(n)]
+# Create N RMSNorm modules
+n, d_model = 8, 256
+modules = [torch.nn.RMSNorm(d_model).cuda() for _ in range(n)]
 
 # Fuse them
-wide = WideAttention.from_modules(modules, strategy='fused')
-print(wide)  # WideAttention(8x[d=256, h=8], strategy=fused)
+wide = WideRMSNorm.from_modules(modules, strategy='batched')
+print(wide)  # WideRMSNorm(8x[d=256], strategy=batched)
 
 # Test with N-first format
 x = torch.randn(n, 4, 128, d_model).cuda()  # [N, B, T, D] N-first!
@@ -434,13 +527,31 @@ txt_out, img_out = block(txt, img, vec, rope=None)
 
 All blocks use N-first format `[N, B, ...]` internally and support both 'fused' and 'sequential' strategies.
 
+## Version History
+
+### v0.7.0 (Current)
+- 24 primitives (11 new)
+- 5 Flux-style blocks
+- Registry-based TracedWideModel
+- Comprehensive I/O documentation
+- Test suite (test_cases.py)
+
+### v0.6.0
+- N-first internal format
+- 13 primitives
+- Benchmark system
+
+### v0.5.0
+- WideGRU, WideLSTM
+- Initial RNN support
+
 ---
 
 **TL;DR:**
-- `wide_compiler.compile(models, sample)` → FX traces → builds Wide ops → returns `TracedWideModel`
+- `wide_compiler.compile(models, sample)` → FX traces → builds Wide ops via registry → returns `TracedWideModel`
 - Wide primitives use **N-first** `[N, B, ...]` internally for maximum efficiency
 - TracedWideModel uses **channel-packed** `[B, N*C, ...]` at I/O boundaries
 - Zero intermediate pack/unpack between stages
-- **v0.7.0**: 25 primitives + 5 composite blocks (Flux architecture support)
-- Auto-discovered benchmarking via `wide_compiler benchmark <name>`
-- New: RMSNorm, AdaLayerNorm, MLPEmbedder, RoPE, and complete Flux transformer blocks
+- 24 primitives + 5 blocks with auto-discovered benchmarking
+- RMSNorm (21x), Dropout (73x), CrossAttention (15.7x) are top new additions
+- Test suite: `python test_cases.py`

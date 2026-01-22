@@ -1,6 +1,6 @@
 # WideCompiler
 
-### Version 0.6.0
+### Version 0.7.0
 
 Compile-friendly batched model execution. Fuse N identical models into a single Wide model for massive speedups.
 
@@ -19,25 +19,16 @@ wide = wide_compiler.compile(models, sample_input)
 output = wide(packed_input)  # 1 kernel launch
 ```
 
-**Speedups:** 2-40x depending on model type, N, and compilation mode.
+**Speedups:** 2-73x depending on model type, N, and compilation mode.
 
-## What's New in 0.6.0
+## What's New in 0.7.0
 
-- **N-First Internal Format** - Wide primitives use `[N, B, ...]` format internally for optimal performance
-- **Zero Intermediate Pack/Unpack** - Only 2 reshapes per forward pass (at boundaries), zero conversions between stages
-- **13 Registered Primitives** - All primitives auto-discovered via registry, accessible via CLI
-- **`benchmark all` Command** - Benchmark all primitives in one command with consolidated results
-- **Auto-save with `-s` Flag** - Save benchmark results with auto-generated timestamps
-- **Fixed TracedWideModel** - Correctly handles spatial inputs (images `[B, N*C, H, W]`)
-- **Comprehensive Error Messages** - Full stack traces for easier debugging
-- **Unified Benchmark System** - All primitives use consistent N-first validation protocol
-
-## What's New in 0.5.0
-
-- **WideGRU** - N parallel GRUs via einsum fusion (**8x speedup** at N=32)
-- **WideLSTM** - N parallel LSTMs via fused projections (**3.3x speedup** at N=4)
-- **Primitive Benchmarks with Compilation** - `benchmark gru -p quick -c` for torch.compile testing
-- **Validation Checkmarks** - Benchmark output shows ✓ when correctness verified
+- **24 Primitives** - Added 11 new primitives: RMSNorm (21x), AdaLayerNormZero (9.7x), MLPEmbedder (14.8x), CrossAttention (15.7x), ConvTranspose1d/2d, BatchNorm3d, RNN, PReLU, Dropout (73x), AdaptiveAvgPool2d
+- **5 Flux-Style Blocks** - WideMLP, WideAttention, WideJointAttention, WideDoubleStreamBlock, WideSingleStreamBlock for transformer architectures
+- **Registry-Based TracedWideModel** - Fully dynamic primitive lookup, no more hardcoded WIDE_BUILDERS dict
+- **RMSNorm Support** - Native PyTorch RMSNorm with 21x speedup at N=32
+- **Comprehensive Benchmarks** - All 29 components (24 primitives + 5 blocks) tested and validated
+- **I/O Shape Documentation** - Clear input/output formats for every primitive and block
 
 ## Installation
 
@@ -48,30 +39,6 @@ pip install -e .
 ```
 
 ## Quick Start
-
-### RNN Fusion (WideGRU / WideLSTM) - N-first format
-
-```python
-import torch
-from wide_compiler.core.primitives import WideGRU
-
-# Create 8 separate GRUs with different weights
-grus = [torch.nn.GRU(64, 128, batch_first=True).cuda() for _ in range(8)]
-
-# Fuse into single WideGRU (copies weights)
-wide_gru = WideGRU.from_modules(grus)
-
-# Compile for best performance
-wide_gru = torch.compile(wide_gru, mode='reduce-overhead')
-
-# Input: N-first format [N, B, T, input_size]
-x = torch.randn(8, 4, 32, 64).cuda()  # [N=8, B=4, T=32, D=64]
-
-# Output: N-first format [N, B, T, hidden_size], hidden state [N, B, hidden_size]
-out, h_n = wide_gru(x)  # out: [8, 4, 32, 128], h_n: [8, 4, 128]
-```
-
-**Note:** Wide primitives use **N-first format** `[N, B, ...]`. For automatic packing/unpacking with channel-packed format, use `TracedWideModel` (see below).
 
 ### Full Model Fusion (TracedWideModel)
 
@@ -85,7 +52,7 @@ class MLP(torch.nn.Module):
         super().__init__()
         self.fc1 = torch.nn.Linear(64, 128)
         self.fc2 = torch.nn.Linear(128, 64)
-    
+
     def forward(self, x):
         return self.fc2(torch.nn.functional.relu(self.fc1(x)))
 
@@ -104,6 +71,46 @@ output = wide(packed)
 # Unpack outputs
 outputs = wide_compiler.unpack(output, n=100)
 ```
+
+### Using Wide Blocks (Flux-style)
+
+```python
+import torch
+from wide_compiler.core.blocks import WideMLP, WideAttention
+
+# Create N separate MLP blocks
+mlps = [...]  # Your N MLP modules
+wide_mlp = WideMLP.from_modules(mlps, strategy='fused')
+
+# Input: N-first format [N, B, T, D]
+x = torch.randn(8, 4, 128, 256).cuda()
+out = wide_mlp(x)  # [8, 4, 128, 256]
+
+# Create N attention blocks
+attns = [...]  # Your N attention modules
+wide_attn = WideAttention.from_modules(attns, strategy='fused')
+
+# With RoPE embeddings
+rope = torch.randn(128, 64).cuda()  # Positional embeddings
+out = wide_attn(x, rope=rope)  # [8, 4, 128, 256]
+```
+
+### Using Wide Primitives Directly (N-first format)
+
+```python
+import torch
+from wide_compiler.core.primitives import WideRMSNorm, WideLinear
+
+# Create N separate RMSNorm layers
+norms = [torch.nn.RMSNorm(256).cuda() for _ in range(8)]
+wide_norm = WideRMSNorm.from_modules(norms, strategy='batched')
+
+# Input: N-first format [N, B, T, D]
+x = torch.randn(8, 4, 128, 256).cuda()
+out = wide_norm(x)  # [8, 4, 128, 256]
+```
+
+**Note:** Wide primitives use **N-first format** `[N, B, ...]`. For automatic packing/unpacking with channel-packed format, use `TracedWideModel` (see above).
 
 ## API
 
@@ -172,43 +179,56 @@ config = WideConfig(
 
 ## CLI
 
-### Benchmark Primitives (v0.6.0 - 13 primitives)
+### Benchmark Primitives (v0.7.0 - 24 primitives)
 
 ```bash
-# Benchmark specific primitive (auto-discovered from registry)
-wide_compiler benchmark attention -p quick
-wide_compiler benchmark layernorm -p quick
-wide_compiler benchmark lstm -p quick
-wide_compiler benchmark conv2d -p quick
+# Benchmark specific primitive
+wide_compiler benchmark rmsnorm -p quick
+wide_compiler benchmark dropout -p quick
+wide_compiler benchmark multiheadcrossattention -p quick
 
-# All 13 available primitives:
-# attention, batchnorm1d, batchnorm2d, conv1d, conv2d, conv3d,
-# embedding, gru, groupnorm, instancenorm2d, layernorm, linear, lstm
+# All 24 primitives:
+# linear, conv1d, conv2d, conv3d, convtranspose1d, convtranspose2d,
+# batchnorm1d, batchnorm2d, batchnorm3d, layernorm, groupnorm,
+# instancenorm2d, rmsnorm, ada_layer_norm_zero_single,
+# embedding, mlp_embedder, attention, multiheadcrossattention,
+# gru, lstm, rnn, prelu, dropout, adaptiveavgpool2d
 
-# Benchmark all primitives
-wide_compiler benchmark all -p quick
+# Benchmark blocks (5 total)
+wide_compiler benchmark mlp_block -p quick
+wide_compiler benchmark attention_block -p quick
+wide_compiler benchmark joint_attention -p quick
+wide_compiler benchmark double_stream_block -p quick
+wide_compiler benchmark single_stream_block -p quick
 
 # With presets
-wide_compiler benchmark gru -p quick     # Quick (fewer configs)
-wide_compiler benchmark gru -p full      # Full sweep (default)
-wide_compiler benchmark gru -p ci        # CI preset (minimal)
+wide_compiler benchmark rmsnorm -p quick     # Quick (fewer configs)
+wide_compiler benchmark rmsnorm -p full      # Full sweep (default)
+wide_compiler benchmark rmsnorm -p ci        # CI preset (minimal)
 
-# With torch.compile (recommended for accurate timing)
-wide_compiler benchmark gru -p quick -c                  # Default: reduce-overhead
-wide_compiler benchmark gru -p quick -c max-autotune    # Max performance
-
-# Benchmark full models (TracedWideModel)
-wide_compiler benchmark resblock --n 100     # Benchmark sample model
-wide_compiler benchmark mlp --n 50           # Benchmark MLP
+# With torch.compile
+wide_compiler benchmark rmsnorm -p quick -c
 
 # Other options
-wide_compiler benchmark conv1d -t 20          # Show top 20 results
-wide_compiler benchmark conv1d -q             # Quiet mode (no progress)
-wide_compiler benchmark conv1d -s             # Auto-save with timestamp
-wide_compiler benchmark conv1d -o results.json  # Save to specific file
-wide_compiler benchmark gru --no-validate     # Skip validation (faster)
+wide_compiler benchmark rmsnorm -t 20          # Show top 20 results
+wide_compiler benchmark rmsnorm -s             # Auto-save with timestamp
+wide_compiler benchmark rmsnorm -o results.json  # Save to specific file
+```
 
-wide_compiler benchmark all -q -s -c          # All primitives, quiet, auto-save, compiled
+### Run Test Suite
+
+```bash
+# Run all 29 components (24 primitives + 5 blocks)
+python test_cases.py
+
+# Primitives only
+python test_cases.py --primitives
+
+# Blocks only
+python test_cases.py --blocks
+
+# With different presets
+python test_cases.py --preset full
 ```
 
 ### Other Commands
@@ -225,102 +245,183 @@ wide_compiler trace -m resblock
 wide_compiler info
 ```
 
-## Supported Layers (v0.6.0 - 13 primitives)
+## Supported Layers (v0.7.0 - 24 primitives)
 
-| Layer | Wide Version | Format | Strategies | Best Speedup (A100) |
-|-------|--------------|--------|------------|---------------------|
-| `nn.Embedding` | `WideEmbedding` | N-first | indexed, gather, sequential | **76.8x** @ N=32 |
-| `nn.BatchNorm2d` | `WideBatchNorm2d` | N-first | wide | **38.0x** @ N=32 |
-| `nn.InstanceNorm2d` | `WideInstanceNorm2d` | N-first | fused, sequential | **37.5x** @ N=32 |
-| `nn.GroupNorm` | `WideGroupNorm` | N-first | fused, sequential | **36.5x** @ N=32 |
-| `nn.BatchNorm1d` | `WideBatchNorm1d` | N-first | wide | **31.4x** @ N=32 |
-| `nn.Conv2d` | `WideConv2d` | N-first | grouped, channels_last, sequential | **15.0x** @ N=16 |
-| `nn.Conv1d` | `WideConv1d` | N-first | grouped, sequential | **12.3x** @ N=32 |
-| `nn.Conv3d` | `WideConv3d` | N-first | grouped, sequential | **10.9x** @ N=16 |
-| `nn.MultiheadAttention` | `WideAttention` | N-first | fused, sequential | **10.7x** @ N=32 |
-| `nn.Linear` | `WideLinear` | N-first | einsum, sequential | **9.3x** @ N=32 |
-| `nn.LayerNorm` | `WideLayerNorm` | N-first | wide | **9.1x** @ N=32 |
-| `nn.LSTM` | `WideLSTM` | N-first | fused | **3.3x** @ N=32 |
-| `nn.GRU` | `WideGRU` | N-first | fused (einsum) | **3.0x** @ N=32 |
-| `F.relu`, `F.gelu`, etc. | `FunctionalOp` | agnostic | — | — |
-| `+`, `-`, `*`, `/`, `@` | `BinaryOp` | agnostic | — | — |
+### Linear & Embedding
 
-**All primitives operate on N-first format `[N, B, ...]` internally for optimal performance.**
+| Layer | Wide Version | I/O Format | Strategies | Best Speedup |
+|-------|--------------|------------|------------|--------------|
+| `nn.Embedding` | `WideEmbedding` | `[N,B,T]→[N,B,T,D]` | indexed, gather, sequential | **9.1x** @ N=32 |
+| `nn.Linear` | `WideLinear` | `[N,B,...,Din]→[N,B,...,Dout]` | einsum, sequential | **9.7x** @ N=32 |
+| `MLPEmbedder` | `WideMLPEmbedder` | `[N,B,D]→[N,B,Dout]` | fused, sequential | **14.8x** @ N=32 |
 
-*Benchmarks: A100 GPU, torch.compile (default mode), quick preset. See [benchmarks/](benchmarks/) for full results.*
+### Convolution Layers
 
-## Primitive Benchmarks (A100, compiled)
+| Layer | Wide Version | I/O Format | Strategies | Best Speedup |
+|-------|--------------|------------|------------|--------------|
+| `nn.Conv1d` | `WideConv1d` | `[N,B,C,L]→[N,B,Cout,Lout]` | grouped, sequential | **5.3x** @ N=32 |
+| `nn.Conv2d` | `WideConv2d` | `[N,B,C,H,W]→[N,B,Cout,Hout,Wout]` | grouped, channels_last, sequential | **2.9x** @ N=16 |
+| `nn.Conv3d` | `WideConv3d` | `[N,B,C,D,H,W]→[N,B,Cout,Dout,Hout,Wout]` | grouped, sequential | **1.9x** @ N=16 |
+| `nn.ConvTranspose1d` | `WideConvTranspose1d` | `[N,B,C,L]→[N,B,Cout,Lout]` | grouped, sequential | **5.4x** @ N=32 |
+| `nn.ConvTranspose2d` | `WideConvTranspose2d` | `[N,B,C,H,W]→[N,B,Cout,Hout,Wout]` | grouped, channels_last, sequential | **3.8x** @ N=32 |
 
-All benchmarks: A100 GPU, `torch.compile(mode='default')`, quick preset (N=[4,8,16,32]).
+### Normalization Layers
 
-### Top Performers
+| Layer | Wide Version | I/O Format | Strategies | Best Speedup |
+|-------|--------------|------------|------------|--------------|
+| `nn.RMSNorm` | `WideRMSNorm` | `[N,B,...,D]→[N,B,...,D]` | batched, sequential | **21.0x** @ N=32 |
+| `nn.BatchNorm1d` | `WideBatchNorm1d` | `[N,B,C]→[N,B,C]` | wide | **11.5x** @ N=32 |
+| `AdaLayerNormZeroSingle` | `WideAdaLayerNormZeroSingle` | `[N,B,D],[N,B,Demb]→[N,B,D],gate` | fused, sequential | **9.7x** @ N=32 |
+| `nn.InstanceNorm2d` | `WideInstanceNorm2d` | `[N,B,C,H,W]→[N,B,C,H,W]` | fused, sequential | **7.7x** @ N=16 |
+| `nn.GroupNorm` | `WideGroupNorm` | `[N,B,C,...]→[N,B,C,...]` | fused, sequential | **4.9x** @ N=16 |
+| `nn.LayerNorm` | `WideLayerNorm` | `[N,B,...,D]→[N,B,...,D]` | wide | **4.7x** @ N=32 |
+| `nn.BatchNorm2d` | `WideBatchNorm2d` | `[N,B,C,H,W]→[N,B,C,H,W]` | wide | **3.4x** @ N=16 |
+| `nn.BatchNorm3d` | `WideBatchNorm3d` | `[N,B,C,D,H,W]→[N,B,C,D,H,W]` | wide | 0.9x @ N=4 (slower) |
 
-| Primitive | N=4 | N=8 | N=16 | N=32 | Crossover | Best Strategy |
-|-----------|-----|-----|------|------|-----------|---------------|
-| **Embedding** | 4.0x | 8.5x | 15.4x | **76.8x** | N=4 | indexed |
-| **BatchNorm2d** | 4.6x | 9.3x | 14.7x | **38.0x** | N=4 | wide |
-| **InstanceNorm2d** | 4.6x | 9.1x | 18.4x | **37.5x** | N=4 | fused |
-| **GroupNorm** | 4.2x | 8.9x | 17.4x | **36.5x** | N=4 | fused |
-| **BatchNorm1d** | 4.0x | 7.9x | 15.6x | **31.4x** | N=4 | wide |
+### Attention Layers
 
-### Conv Layers
-
-| Primitive | N=4 | N=8 | N=16 | N=32 | Crossover | Best Strategy |
-|-----------|-----|-----|------|------|-----------|---------------|
-| **Conv2d** | 3.8x | 7.4x | **15.0x** | 13.4x | N=4 | grouped |
-| **Conv1d** | 3.2x | 5.5x | 8.6x | **12.3x** | N=4 | grouped |
-| **Conv3d** | 3.8x | 7.6x | **10.9x** | — | N=4 | grouped |
-
-### Attention & Linear
-
-| Primitive | N=4 | N=8 | N=16 | N=32 | Crossover | Best Strategy |
-|-----------|-----|-----|------|------|-----------|---------------|
-| **Attention** | 4.4x | 6.4x | 8.2x | **10.7x** | N=4 | fused |
-| **Linear** | 1.1x | 2.4x | 4.4x | **9.3x** | N=4 | einsum |
-| **LayerNorm** | 1.3x | 2.5x | 5.0x | **9.1x** | N=4 | wide |
+| Layer | Wide Version | I/O Format | Strategies | Best Speedup |
+|-------|--------------|------------|------------|--------------|
+| `MultiheadCrossAttention` | `WideMultiheadCrossAttention` | `[N,B,Tq,D],[N,B,Tkv,D]→[N,B,Tq,D]` | fused, sequential | **15.7x** @ N=32 |
+| `nn.MultiheadAttention` | `WideAttention` | `[N,B,T,D]→[N,B,T,D]` | fused, sequential | **3.5x** @ N=8 |
 
 ### RNN Layers
 
-| Primitive | N=8 | N=16 | N=32 | Crossover | Best Strategy | Notes |
-|-----------|-----|------|------|-----------|---------------|-------|
-| **LSTM** | 0.9x | 1.7x | **3.3x** | N=16 | fused | High overhead at low N |
-| **GRU** | 0.7x | 1.5x | **3.0x** | N=16 | fused | High overhead at low N |
+| Layer | Wide Version | I/O Format | Strategies | Best Speedup | Notes |
+|-------|--------------|------------|------------|--------------|-------|
+| `nn.RNN` | `WideRNN` | `[N,B,T,Din]→[N,B,T,H],[N,B,H]` | fused, sequential | 1.0x @ N=32 | Break-even |
+| `nn.LSTM` | `WideLSTM` | `[N,B,T,Din]→[N,B,T,H],[N,B,H],[N,B,H]` | fused, sequential | 0.7x @ N=32 | Slower (cuDNN) |
+| `nn.GRU` | `WideGRU` | `[N,B,T,Din]→[N,B,T,H],[N,B,H]` | fused, sequential | 0.5x @ N=32 | Slower (cuDNN) |
 
-> **RNN Note:** Use `WideGRU`/`WideLSTM` only for N ≥ 16. At N < 16, sequential execution is faster due to kernel launch overhead.
+### Other Layers
+
+| Layer | Wide Version | I/O Format | Strategies | Best Speedup | Notes |
+|-------|--------------|------------|------------|--------------|-------|
+| `nn.Dropout` | `WideDropout` | `[N,B,...]→[N,B,...]` | independent, shared, sequential | **73.2x** @ N=32 | Extreme speedup |
+| `nn.AdaptiveAvgPool2d` | `WideAdaptiveAvgPool2d` | `[N,B,C,Hin,Win]→[N,B,C,Hout,Wout]` | batched, sequential | **2.2x** @ N=8 |
+| `nn.PReLU` | `WidePReLU` | `[N,B,C,...]→[N,B,C,...]` | wide, sequential | 1.0x @ N=4 | Break-even |
+| `F.relu`, `F.gelu`, etc. | `FunctionalOp` | agnostic | — | — | Passthrough |
+| `+`, `-`, `*`, `/`, `@` | `BinaryOp` | agnostic | — | — | Element-wise |
+
+**All primitives operate on N-first format `[N, B, ...]` internally for optimal performance.**
+
+*Benchmarks: A100 GPU, eager mode (no compile), quick preset. See test_cases.py for full results.*
+
+## Flux-Style Blocks (v0.7.0 - 5 blocks)
+
+Higher-level composite blocks for transformer architectures.
+
+| Block | I/O Format | Components | Best Speedup |
+|-------|------------|------------|--------------|
+| `WideMLP` | `[N,B,T,D]→[N,B,T,D]` | 2x Linear + activation | **2.9x** @ N=32 |
+| `WideAttention` | `[N,B,T,D]→[N,B,T,D]` | QKV proj + SDPA + out proj | **7.9x** @ N=16 |
+| `WideJointAttention` | `[N,B,Ttxt,D],[N,B,Timg,D]→[N,B,Ttxt,D],[N,B,Timg,D]` | Dual-stream attention | **9.0x** @ N=32 |
+| `WideDoubleStreamBlock` | `[N,B,Ttxt,D],[N,B,Timg,D]→[N,B,Ttxt,D],[N,B,Timg,D]` | JointAttn + 2x MLP + norms | **5.2x** @ N=8 |
+| `WideSingleStreamBlock` | `[N,B,T,D],[N,B,Demb]→[N,B,T,D]` | AdaLN + Attn + MLP | **3.4x** @ N=8 |
+
+### Block Usage
+
+```python
+from wide_compiler.core.blocks import WideDoubleStreamBlock
+
+# Create N double-stream blocks
+blocks = [...]  # Your N DoubleStreamBlock modules
+wide_block = WideDoubleStreamBlock.from_modules(blocks, strategy='fused')
+
+# Input: Two streams (text and image)
+txt = torch.randn(8, 4, 64, 256).cuda()   # [N, B, Ttxt, D]
+img = torch.randn(8, 4, 256, 256).cuda()  # [N, B, Timg, D]
+rope = torch.randn(320, 128).cuda()       # [Ttxt+Timg, head_dim]
+
+# Forward through block
+txt_out, img_out = wide_block(txt, img, rope=rope)
+```
+
+## Primitive Benchmarks (A100, eager mode)
+
+All benchmarks: A100 GPU, eager mode, quick preset (N=[4,8,16,32]).
+
+### Top Performers
+
+| Primitive | N=4 | N=8 | N=16 | N=32 | Best Strategy |
+|-----------|-----|-----|------|------|---------------|
+| **Dropout** | 7.6x | 14.5x | 27.4x | **73.2x** | independent |
+| **RMSNorm** | 3.2x | 6.4x | 13.2x | **21.0x** | batched |
+| **MultiheadCrossAttention** | 2.9x | 6.3x | 13.7x | **15.7x** | fused |
+| **MLPEmbedder** | 2.6x | 4.0x | 7.3x | **14.8x** | fused |
+| **BatchNorm1d** | 1.5x | 2.9x | 5.8x | **11.5x** | wide |
+
+### Conv Layers
+
+| Primitive | N=4 | N=8 | N=16 | N=32 | Best Strategy |
+|-----------|-----|-----|------|------|---------------|
+| **ConvTranspose1d** | 1.7x | 2.6x | 4.2x | **5.4x** | grouped |
+| **Conv1d** | 1.7x | 2.7x | 4.1x | **5.3x** | grouped |
+| **ConvTranspose2d** | 1.6x | 2.6x | 3.6x | **3.8x** | grouped |
+| **Conv2d** | 1.7x | 2.3x | **2.9x** | 2.7x | grouped |
+| **Conv3d** | 1.7x | 1.8x | **1.9x** | — | grouped |
+
+### Attention & Linear
+
+| Primitive | N=4 | N=8 | N=16 | N=32 | Best Strategy |
+|-----------|-----|-----|------|------|---------------|
+| **Linear** | 1.3x | 1.5x | 4.9x | **9.7x** | einsum |
+| **Embedding** | 1.7x | 4.3x | 6.8x | **9.1x** | indexed |
+| **Attention** | 2.8x | **3.5x** | 1.8x | 1.3x | fused |
+
+### Normalization
+
+| Primitive | N=4 | N=8 | N=16 | N=32 | Best Strategy |
+|-----------|-----|-----|------|------|---------------|
+| **AdaLayerNormZeroSingle** | 1.0x | 2.7x | 5.4x | **9.7x** | fused |
+| **InstanceNorm2d** | 2.3x | 4.9x | **7.7x** | 7.0x | fused |
+| **GroupNorm** | 1.6x | 3.2x | **4.9x** | 3.9x | fused |
+| **LayerNorm** | 0.8x | 1.5x | 2.8x | **4.7x** | wide |
+| **BatchNorm2d** | 1.5x | 3.4x | **3.4x** | 3.0x | wide |
+| **BatchNorm3d** | **0.9x** | 0.7x | 0.8x | 0.8x | wide (slower) |
+
+### RNN Layers
+
+| Primitive | N=8 | N=16 | N=32 | Best Strategy | Notes |
+|-----------|-----|------|------|---------------|-------|
+| **RNN** | 0.3x | 0.5x | **1.0x** | fused | Break-even at N=32 |
+| **LSTM** | 0.2x | 0.4x | **0.7x** | fused | cuDNN faster |
+| **GRU** | 0.2x | 0.3x | **0.5x** | fused | cuDNN faster |
+
+> **RNN Note:** cuDNN's optimized implementations are faster than our batched versions. Use sequential execution for RNNs unless N is very large (>32) and you need the batching.
 
 ### Key Takeaways
 
-1. **Normalization layers** achieve 30-80x speedups (highest gains in WideCompiler)
-2. **Embedding** sees extreme speedups at high N due to batched indexing
-3. **Conv layers** scale well, best at N=16-32
-4. **Attention** provides consistent 4-11x speedup across all N
-5. **RNN layers** require N ≥ 16 to overcome overhead
+1. **Dropout** achieves extreme speedups (73x) due to shared random state
+2. **RMSNorm** outperforms LayerNorm by ~4.5x (21x vs 4.7x)
+3. **CrossAttention** scales exceptionally well (15.7x @ N=32)
+4. **Normalization layers** generally provide 3-21x speedups
+5. **RNN layers** are slower than cuDNN (use sequential for RNNs)
+6. **BatchNorm3d** is always slower (no grouped implementation)
 
-## End-to-End Benchmarks
+## Block Benchmarks (A100, eager mode)
 
-| Model | N | Batch | Mode | Speedup |
-|-------|---|-------|------|---------|
-| **MLP** (2 linear) | 100 | 32 | eager | **40x** |
-| **MLP** (2 linear) | 20 | 32 | compile | **3.2x** |
-| **Deep MLP** (8 linear) | 20 | 32 | eager | **6.2x** |
-| **ResBlock** | 20 | 8 | eager | **4.9x** |
-| **ResBlock** | 20 | 8 | compile | **2.9x** |
-| **ResNet18** | 10 | 8 | eager | **2.3x** |
-| **ResNet18** | 10 | 8 | compile | **1.9x** |
+| Block | N=4 | N=8 | N=16 | N=32 | Components |
+|-------|-----|-----|------|------|------------|
+| **JointAttention** | 2.6x | 6.1x | 7.6x | **9.0x** | Dual-stream QKV + concat attn |
+| **AttentionBlock** | 2.4x | 4.1x | **7.9x** | 7.6x | QKV proj + SDPA + norm |
+| **DoubleStreamBlock** | 2.3x | **5.2x** | — | — | JointAttn + 2xMLP + norms |
+| **SingleStreamBlock** | 2.1x | **3.4x** | — | — | AdaLN + Attn + MLP |
+| **MLPBlock** | 1.9x | 2.5x | 2.9x | **2.9x** | 2x Linear + activation |
 
-## How it Works (v0.6.0)
+## How it Works (v0.7.0)
 
 1. **FX Tracing** - `torch.fx.symbolic_trace` captures the computation graph
-2. **Wide Primitives** - Each layer replaced with N-first fused equivalent:
-   - `GRU` → Einsum fusion for input projections `[N, B, T, I] @ [N, I, 3H]`
-   - `LSTM` → Fused projections `[N, B, T, I] @ [N, I, 4H]`
-   - `Linear` → Batched einsum `[N, B, I] @ [N, I, O]`
-   - `Conv2d` → Grouped convolution on `[N, B, C, H, W]`
+2. **Registry Lookup** - Each layer dynamically resolved via global registry (24 primitives registered)
+3. **Wide Primitives** - Each layer replaced with N-first fused equivalent:
+   - `Linear` → Batched einsum `[N, B, I] @ [N, O, I]` (transposed weight)
+   - `Conv2d` → Grouped convolution on `[N*B, C, H, W]` with `groups=N`
    - `Attention` → Reshape N→batch, single Flash Attention call
-   - All normalization layers operate on N-first `[N, B, C, ...]`
-3. **Strategy Selection** - Each primitive auto-selects optimal strategy based on N
-4. **Compile-Friendly** - 0 graph breaks, all native PyTorch ops
-5. **Optimal Data Flow** - Only 2 reshapes per forward pass:
+   - `RMSNorm` → Batched normalization `[N, B, D]`
+   - All primitives operate on N-first `[N, B, ...]`
+4. **Strategy Selection** - Each primitive auto-selects optimal strategy based on N
+5. **Compile-Friendly** - 0 graph breaks, all native PyTorch ops
+6. **Optimal Data Flow** - Only 2 reshapes per forward pass:
    ```
    Input [B, N*C, ...] → Unpack → [N, B, C, ...]
      ↓ All stages operate on N-first (zero intermediate conversions)
@@ -335,47 +436,49 @@ All benchmarks: A100 GPU, `torch.compile(mode='default')`, quick preset (N=[4,8,
 # Result: Maximum kernel fusion, minimum overhead
 ```
 
-**Why WideAttention is so fast:**
-```python
-# Input: [N, B, T, D] (N-first)
-# Reshape: [N, B, H, T, Dh] → [N*B, H, T, Dh]
-# Run single F.scaled_dot_product_attention (Flash Attention)
-# All N models processed in ONE kernel call
-# Output: [N, B, T, D] (stays N-first for next stage)
-```
-
 ## Project Structure
 
 ```
 wide_compiler/
 ├── __init__.py
 ├── __main__.py
-├── api.py                    # compile(), WideBuilder
+├── api.py                    # compile(), WideBuilder, pack(), unpack()
 ├── cli.py                    # CLI commands
+├── test_cases.py             # Reusable test suite (NEW)
 └── core/
     ├── config.py             # WideConfig
-    ├── registry.py           # Primitive registration
+    ├── registry.py           # Dynamic primitive registration (24 primitives)
     ├── traced_wide.py        # FX tracing + TracedWideModel
+    ├── ensemble_util.py      # pack_inputs(), unpack_outputs()
     ├── benchmark/            # Benchmark system
-    │   ├── __init__.py
-    │   ├── benchmark_api.py
-    │   ├── benchmark_runner.py
-    │   ├── benchmark_schema.py
-    │   └── benchmark_registry.py
-    └── primitives/
-        ├── wide_gru.py         # 8x speedup (einsum fusion)
-        ├── wide_lstm.py        # 3x speedup (block-diagonal)
-        ├── wide_attention.py   # 11x speedup
+    │   ├── benchmark_api.py      # High-level API
+    │   ├── benchmark_runner.py   # Execution engine
+    │   ├── benchmark_schema.py   # BenchmarkJob, results
+    │   └── benchmark_registry.py # Auto-discovery
+    ├── blocks/               # Flux-style composite blocks (NEW)
+    │   ├── wide_mlp.py
+    │   ├── wide_attention.py
+    │   ├── wide_joint_attention.py
+    │   ├── wide_double_stream_block.py
+    │   └── wide_single_stream_block.py
+    └── primitives/           # 24 wide primitives
         ├── wide_linear.py
-        ├── wide_conv1d.py
-        ├── wide_conv2d.py
-        ├── wide_conv3d.py
-        ├── wide_batchnorm_1d.py
-        ├── wide_batchnorm_2d.py
+        ├── wide_conv1d.py, wide_conv2d.py, wide_conv3d.py
+        ├── wide_convtranspose1d.py, wide_convtranspose2d.py (NEW)
+        ├── wide_batchnorm_1d.py, wide_batchnorm_2d.py, wide_batchnorm_3d.py (NEW)
+        ├── wide_layernorm.py
         ├── wide_groupnorm.py
         ├── wide_instancenorm.py
-        ├── wide_layernorm.py
-        └── wide_embedding.py
+        ├── wide_rmsnorm.py (NEW)
+        ├── wide_ada_layer_norm_zero_single.py (NEW)
+        ├── wide_embedding.py
+        ├── wide_mlp_embedder.py (NEW)
+        ├── wide_attention.py
+        ├── wide_cross_attention.py (NEW)
+        ├── wide_gru.py, wide_lstm.py, wide_rnn.py (NEW)
+        ├── wide_prelu.py (NEW)
+        ├── wide_dropout.py (NEW)
+        └── wide_adaptive_avgpool2d.py (NEW)
 ```
 
 ## Limitations
@@ -385,23 +488,26 @@ wide_compiler/
 - **Static shapes** - FX tracing requires fixed tensor shapes
 - **No dynamic control flow** - `if`/`for` based on tensor values won't trace
 
-### RNN Primitives (WideGRU, WideLSTM)
+### Known Slowdowns
+- **RNN layers** - cuDNN optimizations make sequential execution faster
+- **BatchNorm3d** - No grouped implementation, always slower
+- **PReLU** - High kernel launch overhead at low N
+- **Attention** - Performance degrades at N>16 (memory bandwidth)
+
+### RNN Primitives (WideGRU, WideLSTM, WideRNN)
 - **Single layer only** - `num_layers=1` currently required
 - **Unidirectional only** - `bidirectional=False` required
 - **batch_first only** - `batch_first=True` required
-
-### WideLSTM Performance
-- **N=4:** 3.3x speedup
-- **N>4:** Use WideGRU instead
+- **Slower than cuDNN** - Not recommended unless N>32
 
 ## Use Cases
 
 - **Ensemble models** - Run N ensemble members in parallel
-- **Hyperparameter search** - Evaluate N configurations simultaneously  
+- **Hyperparameter search** - Evaluate N configurations simultaneously
 - **Population-based training** - Evolve N agents together
 - **Monte Carlo dropout** - N stochastic forward passes
 - **Transformer ensembles** - N attention heads across models
-- **RNN ensembles** - N sequence models in parallel (NEW)
+- **Flux-style diffusion** - Parallel text/image streams with WideDoubleStreamBlock
 
 ## License
 
