@@ -35,63 +35,144 @@ wide = wide_compiler.compile(models, sample_input)
 
 All roads lead to `TracedWideModel.from_models()` in `core/traced_wide.py`.
 
-## File Map
+## Project Structure
 
 ```
-wide_compiler/
-├── __init__.py          → Package exports
-├── api.py               → compile(), WideBuilder, pack(), unpack()
-├── cli.py               → CLI commands (test, benchmark, trace, info)
-├── __main__.py          → Delegates to cli.main()
-├── test_cases.py        → Reusable test suite for all 29 components
-└── core/
-    ├── config.py        → WideConfig dataclass
-    ├── registry.py      → Maps 'Linear' → WideLinear.from_modules (24 primitives)
-    ├── traced_wide.py   → FX tracing, graph execution (THE CORE)
-    ├── ensemble_util.py → pack_inputs(), unpack_outputs()
-    ├── benchmark/       → Primitive benchmarking system
-    │   ├── __init__.py
-    │   ├── benchmark_api.py      → run_benchmark(), list_primitives()
-    │   ├── benchmark_runner.py   → Execution engine
-    │   ├── benchmark_schema.py   → BenchmarkJob, SweepParams, results
-    │   └── benchmark_registry.py → Auto-discovers primitives
-    ├── blocks/          → Flux-style composite blocks (5 total)
-    │   ├── wide_mlp.py                 → MLP block (2.9x @ N=32)
-    │   ├── wide_attention.py           → Attention block (7.9x @ N=16)
-    │   ├── wide_joint_attention.py     → Dual-stream attention (9.0x @ N=32)
-    │   ├── wide_double_stream_block.py → Flux double-stream (5.2x @ N=8)
-    │   └── wide_single_stream_block.py → Flux single-stream (3.4x @ N=8)
-    └── primitives/      → One file per Wide op (24 total)
-        # Core layers
-        ├── wide_linear.py              → Linear via einsum (9.7x)
-        ├── wide_embedding.py           → Batched index lookup (9.1x)
-        ├── wide_mlp_embedder.py        → MLP with timestep embedding (14.8x)
-        # Attention
-        ├── wide_attention.py           → MHA via batched SDPA (3.5x)
-        ├── wide_cross_attention.py     → Cross-attention (15.7x)
-        # Convolutions
-        ├── wide_conv1d.py              → Conv1d grouped (5.3x)
-        ├── wide_conv2d.py              → Conv2d grouped (2.9x)
-        ├── wide_conv3d.py              → Conv3d grouped (1.9x)
-        ├── wide_convtranspose1d.py     → ConvTranspose1d (5.4x)
-        ├── wide_convtranspose2d.py     → ConvTranspose2d (3.8x)
-        # Normalization
-        ├── wide_rmsnorm.py             → RMSNorm (21.0x) ⭐ NEW
-        ├── wide_batchnorm_1d.py        → BatchNorm1d (11.5x)
-        ├── wide_ada_layer_norm_zero_single.py → AdaLayerNormZero (9.7x)
-        ├── wide_instancenorm.py        → InstanceNorm1d/2d (7.7x)
-        ├── wide_groupnorm.py           → GroupNorm (4.9x)
-        ├── wide_layernorm.py           → LayerNorm (4.7x)
-        ├── wide_batchnorm_2d.py        → BatchNorm2d (3.4x)
-        ├── wide_batchnorm_3d.py        → BatchNorm3d (0.9x slower)
-        # RNNs
-        ├── wide_rnn.py                 → RNN fused (1.0x break-even)
-        ├── wide_lstm.py                → LSTM fused (0.7x slower)
-        ├── wide_gru.py                 → GRU fused (0.5x slower)
-        # Other
-        ├── wide_dropout.py             → Dropout (73.2x) ⭐ EXTREME
-        ├── wide_adaptive_avgpool2d.py  → AdaptiveAvgPool2d (2.2x)
-        └── wide_prelu.py               → PReLU (1.0x break-even)
+pytorch-parallel-compiler/
+├── CLAUDE.md              → This file - quick reference
+├── README.md              → Project overview & examples
+├── LICENSE                → Apache 2.0
+├── pyproject.toml         → Package config (version 0.7.0)
+├── requirements.txt       → Dependencies
+├── test_cases.py          → Test suite runner (29 components)
+├── benchmarks/            → Benchmark output JSON files
+└── wide_compiler/         → Main package
+    ├── __init__.py        → Package exports
+    ├── api.py             → compile(), WideBuilder, pack(), unpack()
+    ├── cli.py             → CLI commands (test, benchmark, trace, info)
+    ├── __main__.py        → Delegates to cli.main()
+    └── core/
+        ├── __init__.py        → Core exports
+        ├── config.py          → WideConfig dataclass
+        ├── registry.py        → Maps 'Linear' → WideLinear.from_modules (24 primitives)
+        ├── traced_wide.py     → FX tracing, graph execution (THE CORE)
+        ├── ensemble_util.py   → pack_inputs(), unpack_outputs()
+        ├── autotune/          → Performance tuning utilities
+        │   ├── run.py                     → Auto-tuning runner
+        │   ├── linear_difference_check.py → Linear accuracy tests
+        │   ├── conv2d_difference_check.py → Conv2d accuracy tests
+        │   ├── conv2d_grouped_vs_sequential.py
+        │   └── einsum_conv2d_speed_test.py
+        ├── strategy/          → Strategy selection utilities
+        │   └── inductor.py    → torch.compile integration
+        ├── benchmark/         → Primitive benchmarking system
+        │   ├── benchmark_api.py      → run_benchmark(), list_primitives()
+        │   ├── benchmark_runner.py   → Execution engine
+        │   ├── benchmark_schema.py   → BenchmarkJob, SweepParams, results
+        │   ├── benchmark_registry.py → Auto-discovers primitives
+        │   ├── traced_wide_benchmark.py → Full model benchmarking
+        │   └── SCHEMA.md             → Benchmark schema documentation
+        ├── blocks/            → Flux-style composite blocks (5 total)
+        │   ├── wide_mlp.py                 → MLP block (2.9x @ N=32)
+        │   ├── wide_attention.py           → Attention block (7.9x @ N=16)
+        │   ├── wide_joint_attention.py     → Dual-stream attention (9.0x @ N=32)
+        │   ├── wide_double_stream_block.py → Flux double-stream (5.2x @ N=8)
+        │   └── wide_single_stream_block.py → Flux single-stream (3.4x @ N=8)
+        └── primitives/        → One file per Wide op (25 files, 24 auto-registered)
+            # Core layers
+            ├── wide_linear.py              → Linear via einsum (9.7x)
+            ├── wide_embedding.py           → Batched index lookup (9.1x)
+            ├── wide_mlp_embedder.py        → MLP with timestep embedding (14.8x)
+            ├── wide_rotary_embedding.py    → RoPE support (helper, not auto-registered)
+            # Attention
+            ├── wide_attention.py           → MHA via batched SDPA (3.5x)
+            ├── wide_cross_attention.py     → Cross-attention (15.7x)
+            # Convolutions
+            ├── wide_conv1d.py              → Conv1d grouped (5.3x)
+            ├── wide_conv2d.py              → Conv2d grouped (2.9x)
+            ├── wide_conv3d.py              → Conv3d grouped (1.9x)
+            ├── wide_convtranspose1d.py     → ConvTranspose1d (5.4x)
+            ├── wide_convtranspose2d.py     → ConvTranspose2d (3.8x)
+            # Normalization
+            ├── wide_rmsnorm.py             → RMSNorm (21.0x)
+            ├── wide_batchnorm_1d.py        → BatchNorm1d (11.5x)
+            ├── wide_batchnorm_2d.py        → BatchNorm2d (3.4x)
+            ├── wide_batchnorm_3d.py        → BatchNorm3d (0.9x slower)
+            ├── wide_layernorm.py           → LayerNorm (4.7x)
+            ├── wide_groupnorm.py           → GroupNorm (4.9x)
+            ├── wide_instancenorm.py        → InstanceNorm1d/2d (7.7x)
+            ├── wide_ada_layer_norm_zero_single.py → AdaLayerNormZero (9.7x)
+            # RNNs
+            ├── wide_rnn.py                 → RNN fused (1.0x break-even)
+            ├── wide_lstm.py                → LSTM fused (0.7x slower)
+            ├── wide_gru.py                 → GRU fused (0.5x slower)
+            # Other
+            ├── wide_dropout.py             → Dropout (73.2x)
+            ├── wide_adaptive_avgpool2d.py  → AdaptiveAvgPool2d (2.2x)
+            └── wide_prelu.py               → PReLU (1.0x break-even)
+```
+
+## Dependencies
+
+**Core (pyproject.toml):**
+- Python >= 3.9
+- torch >= 2.1
+- numpy >= 1.23
+
+**Dev/Optional (requirements.txt):**
+- pytest >= 7.0
+- tabulate >= 0.9 (CLI tabular output)
+- huggingface_hub, datasets, safetensors (optional integrations)
+- PyYAML >= 6.0
+
+## Development Workflow
+
+### Installation
+
+```bash
+# From source
+pip install -e .
+
+# With dev dependencies
+pip install -e ".[dev]"
+```
+
+### Running Tests
+
+```bash
+# Full test suite (29 components)
+python test_cases.py
+
+# Primitives only (24)
+python test_cases.py --primitives
+
+# Blocks only (5)
+python test_cases.py --blocks
+
+# With specific preset
+python test_cases.py --preset quick
+```
+
+### Running Benchmarks
+
+```bash
+# Single primitive
+wide_compiler benchmark linear -p quick
+
+# All primitives
+wide_compiler benchmark all
+
+# Save results
+wide_compiler benchmark all -o results.json
+```
+
+### CLI Commands
+
+```bash
+wide_compiler test      # Correctness tests
+wide_compiler benchmark # Performance benchmarks
+wide_compiler trace     # Show FX graph
+wide_compiler info      # Library info
 ```
 
 ## How It Works
@@ -102,7 +183,7 @@ traced = fx.symbolic_trace(template_model)
 # Captures: call_module, call_function, call_method
 ```
 
-### 2. Build Wide Ops (v0.7.0 - Registry-based)
+### 2. Build Wide Ops (Registry-based)
 ```python
 for node in traced.graph.nodes:
     if node.op == 'call_module':
@@ -116,7 +197,7 @@ for node in traced.graph.nodes:
             wide_op = builder(modules)
 ```
 
-### 3. Graph Execution (v0.6.0 - N-first internal format)
+### 3. Graph Execution (N-first internal format)
 ```python
 def forward(self, x):
     # Unpack ONCE: [B, N*C, ...] → [N, B, C, ...]
@@ -138,7 +219,7 @@ def forward(self, x):
 
 **Key optimization:** Only 2 reshapes per forward pass (unpack + pack), zero intermediate conversions.
 
-## Wide Primitives Pattern (v0.6.0 - N-first format)
+## Wide Primitives Pattern
 
 Every primitive follows this pattern:
 
@@ -165,7 +246,23 @@ class WideLinear(nn.Module):
 - All primitives use **N-first format** `[N, B, ...]` internally
 - Each primitive has multiple strategies. AUTO selects the fastest.
 
-## Strategy Pattern (NEW in 0.4.0)
+## Numerical Accuracy Notes
+
+PyTorch batched operations are NOT guaranteed to match sequential operations bitwise.
+
+**Expected tolerances:**
+- NCHW grouped vs sequential: ~1e-6 relative error (IEEE fp32)
+- NHWC grouped vs sequential: 0.0 error (most accurate)
+- With TF32: ~1e-4 relative error
+- Einsum vs sequential linear: ~1e-6 relative error (fp32)
+
+**To disable TF32 for stricter accuracy:**
+```python
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = False
+```
+
+## Strategy Pattern
 
 Each primitive defines strategies with different performance tradeoffs:
 
@@ -182,7 +279,51 @@ Each primitive defines strategies with different performance tradeoffs:
 wide = WideLinear.from_modules(modules, strategy='einsum')
 ```
 
-## Benchmark System (v0.6.0 - N-first validation)
+## Registry System
+
+The registry maps PyTorch module types to Wide primitives:
+
+```python
+from wide_compiler.core.registry import get_registry, register
+
+# Check what's registered
+registry = get_registry()
+print(registry.list_registered())
+
+# Register custom primitive
+@register('MyModule')
+class WideMyModule(nn.Module):
+    @classmethod
+    def from_modules(cls, modules): ...
+
+# Build Wide version from modules
+wide = registry.build(modules)
+```
+
+**24 Auto-registered primitives:**
+- Linear → WideLinear
+- Conv1d/2d/3d → WideConv1d/2d/3d
+- ConvTranspose1d/2d → WideConvTranspose1d/2d
+- BatchNorm1d/2d/3d → WideBatchNorm1d/2d/3d
+- LayerNorm → WideLayerNorm
+- GroupNorm → WideGroupNorm
+- InstanceNorm1d/2d → WideInstanceNorm1d/2d
+- RMSNorm → WideRMSNorm
+- AdaLayerNormZeroSingle → WideAdaLayerNormZeroSingle
+- Embedding → WideEmbedding
+- MLPEmbedder → WideMLPEmbedder
+- MultiheadAttention → WideAttention
+- GRU/LSTM/RNN → WideGRU/WideLSTM/WideRNN
+- PReLU → WidePReLU
+- Dropout → WideDropout
+- AdaptiveAvgPool2d → WideAdaptiveAvgPool2d
+
+**Not auto-registered:**
+- WideMultiheadCrossAttention (requires explicit intent)
+- WideRotaryEmbedding (helper, used internally)
+- All blocks (composite structures)
+
+## Benchmark System
 
 Each primitive defines its own benchmark interface:
 
@@ -204,27 +345,17 @@ class WideAttention(nn.Module):
             model_factory=cls._bench_model,
             input_factory=cls._bench_input,
             wide_factory=cls._bench_wide,
-            # pack_fn/unpack_fn: use default N-first [N, B, ...]
-            # validate_fn: optional custom validation
         )
-
-    @staticmethod
-    def _bench_model(**params): ...  # Returns nn.Module
-    @staticmethod
-    def _bench_input(**params): ...  # Returns [B, ...] single input
-    @classmethod
-    def _bench_wide(cls, modules, strategy): ...  # Returns WideModule
 ```
 
-Run via CLI (14 primitives available):
+Run via CLI:
 ```bash
 wide_compiler benchmark attention -p quick
-wide_compiler benchmark layernorm -p quick
-wide_compiler benchmark lstm -p quick
-wide_compiler benchmark all  # Run all primitives
+wide_compiler benchmark layernorm -p full
+wide_compiler benchmark all
 ```
 
-## Key Speedups (v0.7.0 - Top 10)
+## Key Speedups (Top 10)
 
 | Primitive | Best Speedup | Why |
 |-----------|--------------|-----|
@@ -238,39 +369,6 @@ wide_compiler benchmark all  # Run all primitives
 | **WideEmbedding** | 9.1x | Batched index lookup |
 | **WideJointAttention** | 9.0x | Dual-stream attention block |
 | **WideAttentionBlock** | 7.9x | QKV + SDPA + out proj |
-
-## CLI (v0.7.0 - All 29 primitives + blocks)
-
-```bash
-# Benchmark primitives (auto-discovered from registry)
-wide_compiler benchmark rmsnorm -p quick       # RMSNorm (21x)
-wide_compiler benchmark dropout -p quick       # Dropout (73x)
-wide_compiler benchmark multiheadcrossattention -p quick  # Cross-attn (15.7x)
-
-# Benchmark blocks
-wide_compiler benchmark mlp_block -p quick
-wide_compiler benchmark attention_block -p quick
-wide_compiler benchmark joint_attention -p quick
-wide_compiler benchmark double_stream_block -p quick
-wide_compiler benchmark single_stream_block -p quick
-
-# Available primitives (24 total):
-# linear, conv1d, conv2d, conv3d, convtranspose1d, convtranspose2d,
-# batchnorm1d, batchnorm2d, batchnorm3d, layernorm, groupnorm,
-# instancenorm2d, rmsnorm, ada_layer_norm_zero_single,
-# embedding, mlp_embedder, attention, multiheadcrossattention,
-# gru, lstm, rnn, prelu, dropout, adaptiveavgpool2d
-
-# Other commands
-wide_compiler test                   # Correctness tests
-wide_compiler trace -m mlp           # Show FX graph
-wide_compiler info                   # Library info
-
-# Test suite
-python test_cases.py                 # All 29 components
-python test_cases.py --primitives    # 24 primitives
-python test_cases.py --blocks        # 5 blocks
-```
 
 ## Pack / Unpack
 
@@ -297,7 +395,7 @@ WideConfig.fast()   # Compiled, no validation
 WideConfig.debug()  # Verbose, strict
 ```
 
-## I/O Formats (v0.7.0)
+## I/O Formats
 
 ### Primitives (N-first)
 | Primitive | Input | Output |
@@ -332,11 +430,11 @@ WideConfig.debug()  # Verbose, strict
 | `WideConfig` | config.py | Configuration dataclass |
 | `WideRegistry` | registry.py | Maps module types to builders (24 primitives) |
 | `BenchmarkJob` | benchmark_schema.py | Defines a benchmark sweep |
-| `WideRMSNorm` | wide_rmsnorm.py | N parallel RMSNorm (21x speedup) ⭐ |
-| `WideDropout` | wide_dropout.py | N parallel Dropout (73x speedup) ⭐ |
+| `WideRMSNorm` | wide_rmsnorm.py | N parallel RMSNorm (21x speedup) |
+| `WideDropout` | wide_dropout.py | N parallel Dropout (73x speedup) |
 | `WideDoubleStreamBlock` | wide_double_stream_block.py | Flux double-stream transformer block |
 
-## Adding a New Primitive (v0.7.0 checklist)
+## Adding a New Primitive (Checklist)
 
 1. Create `primitives/wide_foo.py`:
 ```python
@@ -385,10 +483,10 @@ class WideFoo(nn.Module):
 
 2. Add to `primitives/__init__.py` (import and `__all__`)
 3. Add to `benchmark_registry.py` imports (will auto-register if has `benchmark_job()`)
-4. Add to `registry.py` auto_register_primitives() function
+4. Add to `registry.py` `auto_register_primitives()` function
 5. Add to `core/__init__.py` exports
 
-## Adding a New Block (v0.7.0 checklist)
+## Adding a New Block (Checklist)
 
 1. Create `blocks/wide_foo_block.py`:
 ```python
@@ -416,7 +514,7 @@ class WideFooBlock(nn.Module):
 3. Add to `benchmark_registry.py` imports
 4. Blocks are NOT auto-registered in registry.py (composite structures)
 
-## Debugging (v0.7.0)
+## Debugging
 
 1. **Benchmark errors?** CLI shows full stack trace automatically
 2. **Validation failures?** Check shapes:
@@ -431,9 +529,9 @@ class WideFooBlock(nn.Module):
 5. **Strategy selection?** Print `wide.strategy` to see which was chosen
 6. **Slow first run?** Warmup iterations. Benchmark after 5+ runs.
 7. **Missing primitive in CLI?** Check `benchmark_registry.py` imports
-8. **Registry not finding primitive?** Check `registry.py` auto_register_primitives()
+8. **Registry not finding primitive?** Check `registry.py` `auto_register_primitives()`
 
-## Known Issues (v0.7.0)
+## Known Issues
 
 1. **RNN Slowdowns** - cuDNN implementations are faster than batched versions
    - GRU: 0.5x @ N=32 (slower)
@@ -453,7 +551,7 @@ class WideFooBlock(nn.Module):
    - Best @ N=8 (3.5x), drops to 1.3x @ N=32
    - **Solution**: Keep N<=16 for attention-heavy models
 
-## Quick Test (v0.7.0 - RMSNorm example)
+## Quick Test
 
 ```python
 import torch
@@ -491,9 +589,9 @@ output = wide(packed)  # [4, N*output_dim]
 outputs = wide_compiler.unpack(output, n)  # List of [4, output_dim]
 ```
 
-## Blocks (v0.7.0 - Flux Architecture Support)
+## Blocks (Flux Architecture Support)
 
-WideCompiler now includes composite blocks for modern architectures like Flux:
+WideCompiler includes composite blocks for modern architectures like Flux:
 
 ```python
 from wide_compiler.core.blocks import (
@@ -529,8 +627,8 @@ All blocks use N-first format `[N, B, ...]` internally and support both 'fused' 
 
 ## Version History
 
-### v0.7.0 (Current)
-- 24 primitives (11 new)
+### v0.7.0 (Current - January 2025)
+- 24 auto-registered primitives (11 new)
 - 5 Flux-style blocks
 - Registry-based TracedWideModel
 - Comprehensive I/O documentation
@@ -553,5 +651,5 @@ All blocks use N-first format `[N, B, ...]` internally and support both 'fused' 
 - TracedWideModel uses **channel-packed** `[B, N*C, ...]` at I/O boundaries
 - Zero intermediate pack/unpack between stages
 - 24 primitives + 5 blocks with auto-discovered benchmarking
-- RMSNorm (21x), Dropout (73x), CrossAttention (15.7x) are top new additions
+- RMSNorm (21x), Dropout (73x), CrossAttention (15.7x) are top speedups
 - Test suite: `python test_cases.py`
