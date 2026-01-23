@@ -85,6 +85,14 @@ from .primitives import (
     WideAdaptiveAvgPool2d,
 )
 
+from .blocks import (
+    WideDoubleStreamBlock,
+    WideSingleStreamBlock,
+    WideAttention,
+    WideMLP,
+    WideJointAttention,
+)
+
 __all__ = [
     # Traced model
     'TracedWideModel',
@@ -149,4 +157,11 @@ __all__ = [
     'WidePReLU',
     'WideDropout',
     'WideAdaptiveAvgPool2d',
+
+    # Blocks
+    'WideDoubleStreamBlock',
+    'WideSingleStreamBlock',
+    'WideAttention',
+    'WideMLP',
+    'WideJointAttention',
 ]

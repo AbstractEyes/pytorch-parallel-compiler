@@ -182,6 +182,23 @@ except ImportError:
     BenchmarkResult = None
     SweepParams = None
 
+try:
+    from .core.blocks import (
+        WideDoubleStreamBlock,
+        WideSingleStreamBlock,
+        WideAttention,
+        WideMLP,
+        WideJointAttention,
+    )
+except ImportError:
+    from wide_compiler.core.blocks import (
+        WideDoubleStreamBlock,
+        WideSingleStreamBlock,
+        WideAttention,
+        WideMLP,
+        WideJointAttention,
+    )
+
 __all__ = [
     # Main API
     'compile',
@@ -223,6 +240,13 @@ __all__ = [
     'WideAttention',
     'WideGRU',
     'WideLSTM',
+
+    # Blocks
+    'WideDoubleStreamBlock',
+    'WideSingleStreamBlock',
+    'WideAttention',
+    'WideMLP',
+    'WideJointAttention',
 
     # Benchmark (if available)
     'benchmark_primitive',
