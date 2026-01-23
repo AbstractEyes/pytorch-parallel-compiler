@@ -25,32 +25,26 @@ LIMITATIONS:
 
     For models with reshapes, use manual Wide construction with einsum (see demos).
 
-ATTENTION HANDLING:
-    WideAttention auto-detects input format and handles both conventions:
-    - Direct call: [B, T, N*D] channel-packed → returns Tensor
-    - MHA trace: [B, N*T, D] sequence-packed → auto-repacks, returns Tuple
+CONTROL FLOW HANDLING:
+    FX supports static control flow (branches that don't depend on tensor values).
+    Use concrete_args to specialize on specific argument values:
 
-    No wrapper needed - WideAttention handles repacking internally.
+        wide = TracedWideModel.from_models(
+            models, sample,
+            concrete_args={'output_attentions': False}
+        )
 
-FUTURE OPTIMIZATION:
-    Yield-tree execution (pre-compiled index-based plan with generator traversal)
-    showed ~7% eager speedup in prototyping. The pattern:
+    Use trace_config to auto-set common HuggingFace flags before tracing:
 
-        def _yield_exec(self, x):
-            v = [None] * self._n_values
-            v[0] = x
-            for oi, arg_indices, const_args, out in self._plan:
-                args = [v[i] if i >= 0 else const_args[j] for j, i in enumerate(arg_indices)]
-                v[out] = self._ops[oi](*args)
-                yield v[out]
+        wide = TracedWideModel.from_models(
+            models, sample,
+            trace_config={'use_cache': False, 'return_dict': False}
+        )
 
-        def forward(self, x):
-            for out in self._yield_exec(x): pass
-            return out
-
-    Requires careful handling of constant args (e.g. flatten(1)) and method calls.
-    Current dict-based approach is stable and compiles identically, so yield is
-    deferred until stability across model zoo is achieved.
+PASSTHROUGH MODULES:
+    Modules without registered Wide primitives fall back to SequentialPassthrough,
+    which correctly handles N-first format but provides no fusion speedup.
+    Enable verbose=True in from_models() to see warnings about these.
 
 Copyright 2025 AbstractPhil
 Apache 2.0 License
@@ -60,6 +54,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple, Optional, Callable, Any, Union
 from dataclasses import dataclass, field
+import warnings
 
 import torch
 import torch.nn as nn
@@ -69,11 +64,103 @@ import torch.fx as fx
 import operator
 
 try:
-    from .ensemble_util import pack_inputs, unpack_outputs
+    from .ensemble_util import pack_inputs, unpack_outputs, iter_n_first, stack_n_first
     from .registry import get_registry
 except ImportError:
-    from wide_compiler.core.ensemble_util import pack_inputs, unpack_outputs
-    from wide_compiler.core.registry import get_registry
+    try:
+        from wide_compiler.core.ensemble_util import pack_inputs, unpack_outputs, iter_n_first, stack_n_first
+        from wide_compiler.core.registry import get_registry
+    except ImportError:
+        # Standalone mode - define minimal helpers
+        def pack_inputs(inputs):
+            stacked = torch.stack(inputs, dim=1)
+            B, N = stacked.shape[:2]
+            rest = stacked.shape[2:]
+            if len(rest) == 0:
+                return stacked.view(B, N)
+            C = rest[0]
+            spatial = rest[1:]
+            return stacked.view(B, N * C, *spatial)
+
+        def unpack_outputs(output, n):
+            B = output.shape[0]
+            NC = output.shape[1]
+            spatial = output.shape[2:]
+            C = NC // n
+            reshaped = output.view(B, n, C, *spatial)
+            return [reshaped[:, i] for i in range(n)]
+
+        def iter_n_first(x):
+            for i in range(x.shape[0]):
+                yield x[i]
+
+        def stack_n_first(tensors):
+            return torch.stack(tensors, dim=0)
+
+        def get_registry():
+            return _MinimalRegistry()
+
+        class _MinimalRegistry:
+            def get_builder(self, name):
+                return None
+
+
+# =============================================================================
+# DEFAULT TRACE CONFIG
+# =============================================================================
+
+# Common HuggingFace config flags that create static branches
+# Setting these before tracing allows FX to trace through cleanly
+DEFAULT_TRACE_CONFIG = {
+    'output_attentions': False,
+    'output_hidden_states': False,
+    'use_cache': False,
+    'return_dict': False,
+    'torchscript': True,  # Some models have torchscript-friendly paths
+}
+
+
+def _prepare_for_trace(
+    model: nn.Module,
+    trace_config: Optional[Dict[str, Any]] = None,
+    use_defaults: bool = True,
+) -> None:
+    """
+    Prepare model for FX tracing by setting config flags.
+
+    This mutates the model in-place to disable dynamic branches
+    that would otherwise prevent tracing.
+
+    Args:
+        model: The model to prepare
+        trace_config: Custom config overrides
+        use_defaults: Whether to apply DEFAULT_TRACE_CONFIG first
+    """
+    # Build final config
+    if use_defaults:
+        cfg = {**DEFAULT_TRACE_CONFIG, **(trace_config or {})}
+    else:
+        cfg = trace_config or {}
+
+    if not cfg:
+        return
+
+    # Try model.config (HuggingFace pattern)
+    if hasattr(model, 'config'):
+        for k, v in cfg.items():
+            if hasattr(model.config, k):
+                setattr(model.config, k, v)
+
+    # Try direct attributes on model
+    for k, v in cfg.items():
+        if hasattr(model, k) and not callable(getattr(model, k)):
+            try:
+                setattr(model, k, v)
+            except AttributeError:
+                pass  # Some attributes are read-only
+
+    # Force eval mode for consistent tracing
+    model.eval()
 
 
 # =============================================================================
@@ -180,11 +267,92 @@ class GetAttrOp(nn.Module):
         self.attr_name = name
 
     def forward(self, value: Tensor) -> Tensor:
-        # Value is passed in during forward
         return value
 
     def __repr__(self):
         return f"GetAttrOp({self.attr_name})"
+
+
+class SequentialPassthrough(nn.Module):
+    """
+    Fallback for unregistered modules - correct but unfused.
+
+    When a module type has no registered Wide primitive, we fall back to
+    sequential execution. This is slower than fused ops but maintains
+    correctness with N-first format.
+
+    Input:  [N, B, C, ...] N-first format
+    Output: [N, B, C', ...] N-first format
+    """
+
+    def __init__(self, modules: List[nn.Module], name: str = ""):
+        super().__init__()
+        self.mods = nn.ModuleList(modules)
+        self.n = len(modules)
+        self.name = name
+        self._module_type = type(modules[0]).__name__ if modules else "Unknown"
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Execute N modules sequentially on N-first input."""
+        outputs = [self.mods[i](xi) for i, xi in enumerate(iter_n_first(x))]
+        return stack_n_first(outputs)
+
+    def __repr__(self):
+        return f"SequentialPassthrough({self._module_type}, n={self.n})"
+
+
+# =============================================================================
+# TRACE REPORT
+# =============================================================================
+
+@dataclass
+class TraceReport:
+    """Summary of tracing results."""
+    n_models: int
+    total_stages: int
+    fused_stages: int
+    passthrough_stages: int
+    passthrough_modules: List[Tuple[str, str]]  # (node_name, module_type)
+    attr_count: int
+    concrete_args_used: Optional[Dict[str, Any]] = None
+    trace_config_used: Optional[Dict[str, Any]] = None
+
+    def has_passthroughs(self) -> bool:
+        return self.passthrough_stages > 0
+
+    def summary(self) -> str:
+        lines = [
+            f"TraceReport: {self.n_models} models",
+            f"  Stages: {self.total_stages} ({self.fused_stages} fused, {self.passthrough_stages} passthrough)",
+            f"  Attrs: {self.attr_count}",
+        ]
+        if self.concrete_args_used:
+            lines.append(f"  concrete_args: {self.concrete_args_used}")
+        if self.trace_config_used:
+            lines.append(f"  trace_config: {self.trace_config_used}")
+        if self.passthrough_modules:
+            lines.append(f"  Passthroughs (no fusion):")
+            for name, mtype in self.passthrough_modules:
+                lines.append(f"    - {name}: {mtype}")
+        return "\n".join(lines)
+
+    def warnings(self) -> List[str]:
+        """Generate warning messages for passthroughs."""
+        if not self.passthrough_modules:
+            return []
+
+        msgs = []
+        by_type: Dict[str, List[str]] = {}
+        for name, mtype in self.passthrough_modules:
+            by_type.setdefault(mtype, []).append(name)
+
+        for mtype, names in by_type.items():
+            if len(names) == 1:
+                msgs.append(f"No Wide primitive for '{mtype}' at '{names[0]}' - using sequential fallback")
+            else:
+                msgs.append(f"No Wide primitive for '{mtype}' ({len(names)} instances) - using sequential fallback")
+
+        return msgs
 
 
 # =============================================================================
@@ -200,7 +368,8 @@ class WideStage:
     target: str
     wide_op: nn.Module
     n: int
-    num_inputs: int = 1  # How many tensor inputs this op takes
+    num_inputs: int = 1
+    is_passthrough: bool = False
 
 
 def _get_nested_attr(obj: Any, attr_path: str) -> Any:
@@ -217,13 +386,10 @@ def _infer_concat_dim(tensors: List[Tensor]) -> int:
         return 0
     shape = tensors[0].shape
     if len(shape) == 0:
-        # Scalar - stack to create dim
         return 0
     elif len(shape) == 1:
-        # 1D tensor (e.g., running_mean [C]) - concat on dim 0
         return 0
     elif len(shape) >= 2:
-        # Higher dims - concat on channel dim (typically 0 for params/buffers)
         return 0
     return 0
 
@@ -234,6 +400,10 @@ class TracedWideModel(nn.Module):
 
     Uses torch.fx to trace the model, then builds Wide ops
     for each node. Forward executes the graph respecting dataflow.
+
+    Supports:
+        - concrete_args: Specialize on specific argument values for static control flow
+        - trace_config: Auto-set model config flags (HuggingFace patterns)
     """
 
     def __init__(self, n: int):
@@ -243,39 +413,120 @@ class TracedWideModel(nn.Module):
         self.stage_info: Dict[str, WideStage] = {}
         self._graph: Optional[fx.Graph] = None
         self._execution_order: List[str] = []
-        self._node_args: Dict[str, Tuple] = {}  # node_name -> arg node names
-        self._node_kwargs: Dict[str, Dict] = {}  # node_name -> kwargs with node refs
+        self._node_args: Dict[str, Tuple] = {}
+        self._node_kwargs: Dict[str, Dict] = {}
         self._input_name: str = 'x'
         self._output_name: str = ''
-        self._attr_names: List[str] = []  # Track get_attr nodes
+        self._attr_names: List[str] = []
+        self._trace_report: Optional[TraceReport] = None
+
+    @property
+    def trace_report(self) -> Optional[TraceReport]:
+        """Get trace report (available after from_models)."""
+        return self._trace_report
 
     @classmethod
-    def from_models(cls, models: List[nn.Module], sample_input: Tensor) -> 'TracedWideModel':
+    def from_models(
+        cls,
+        models: List[nn.Module],
+        sample_input: Tensor,
+        verbose: bool = False,
+        warn_passthroughs: bool = True,
+        concrete_args: Optional[Dict[str, Any]] = None,
+        trace_config: Optional[Dict[str, Any]] = None,
+        use_default_trace_config: bool = True,
+    ) -> 'TracedWideModel':
         """
         Build TracedWideModel from N models using fx tracing.
 
         Args:
             models: List of N identical models
             sample_input: Sample input for tracing (single model input shape)
+            verbose: Print detailed trace info
+            warn_passthroughs: Emit warnings for modules without Wide primitives
+            concrete_args: Dict of argument names to concrete values for specializing
+                          static control flow. Passed directly to fx.symbolic_trace().
+                          Example: {'output_attentions': False, 'mask': None}
+            trace_config: Dict of config attributes to set on model before tracing.
+                         Useful for HuggingFace models with config-based branches.
+                         Example: {'use_cache': False, 'return_dict': False}
+            use_default_trace_config: Whether to apply DEFAULT_TRACE_CONFIG before
+                                     trace_config. Set False to skip defaults.
+
+        Returns:
+            TracedWideModel with fused operations where possible
+
+        Raises:
+            RuntimeError: If FX tracing fails (usually due to dynamic control flow)
+
+        Example:
+            # Basic usage
+            wide = TracedWideModel.from_models(models, sample)
+
+            # With HuggingFace model
+            wide = TracedWideModel.from_models(
+                models, sample,
+                trace_config={'use_cache': False, 'output_attentions': False},
+                concrete_args={'attention_mask': None},
+            )
         """
         n = len(models)
         wide_model = cls(n)
 
-        # Trace template
         template = models[0]
+
+        # Prepare model for tracing (set config flags)
+        effective_trace_config = {}
+        if use_default_trace_config:
+            effective_trace_config.update(DEFAULT_TRACE_CONFIG)
+        if trace_config:
+            effective_trace_config.update(trace_config)
+
+        if effective_trace_config:
+            _prepare_for_trace(template, effective_trace_config, use_defaults=False)
+            # Also prepare other models for consistency
+            for m in models[1:]:
+                _prepare_for_trace(m, effective_trace_config, use_defaults=False)
+
+        if verbose:
+            if effective_trace_config:
+                print(f"Applied trace_config: {effective_trace_config}")
+            if concrete_args:
+                print(f"Using concrete_args: {concrete_args}")
+
+        # Trace with optional concrete_args
         try:
-            traced = fx.symbolic_trace(template)
+            traced = fx.symbolic_trace(template, concrete_args=concrete_args)
         except Exception as e:
-            raise RuntimeError(f"FX tracing failed: {e}. Model may have dynamic control flow.")
+            error_msg = str(e)
+            hint = ""
+            if "control flow" in error_msg.lower():
+                hint = (
+                    "\n\nHint: This model has data-dependent control flow. Try:\n"
+                    "  1. Set trace_config to disable dynamic features:\n"
+                    "     trace_config={'use_cache': False, 'output_attentions': False}\n"
+                    "  2. Use concrete_args to specialize on specific values:\n"
+                    "     concrete_args={'attention_mask': None}\n"
+                    "  3. For HuggingFace models, check model.config for relevant flags."
+                )
+            raise RuntimeError(f"FX tracing failed: {e}{hint}")
 
         wide_model._graph = traced.graph
+
+        if verbose:
+            print(print_trace(traced))
+            print()
+
+        # Track passthroughs for reporting
+        passthrough_modules: List[Tuple[str, str]] = []
+        fused_count = 0
+        passthrough_count = 0
 
         # First pass: collect get_attr nodes and register as buffers
         for node in traced.graph.nodes:
             if node.op == 'get_attr':
                 attr_path = node.target
 
-                # Get attribute from all N models
                 attrs = []
                 for m in models:
                     try:
@@ -285,7 +536,6 @@ class TracedWideModel(nn.Module):
                         elif isinstance(attr, nn.Parameter):
                             attrs.append(attr.data)
                         else:
-                            # Non-tensor attribute - store from template
                             attrs = None
                             break
                     except AttributeError:
@@ -293,20 +543,16 @@ class TracedWideModel(nn.Module):
                         break
 
                 if attrs is not None and len(attrs) == n:
-                    # Concatenate for wide model
                     concat_dim = _infer_concat_dim(attrs)
                     if attrs[0].dim() == 0:
-                        # Scalars - stack them
                         wide_attr = torch.stack(attrs)
                     else:
                         wide_attr = torch.cat(attrs, dim=concat_dim)
 
-                    # Register as buffer (non-trainable by default)
                     safe_name = node.name.replace('.', '_')
                     wide_model.register_buffer(f'_attr_{safe_name}', wide_attr)
                     wide_model._attr_names.append(node.name)
                 else:
-                    # Non-tensor or couldn't get from all models - use template
                     try:
                         attr = _get_nested_attr(template, attr_path)
                         if isinstance(attr, Tensor):
@@ -314,41 +560,49 @@ class TracedWideModel(nn.Module):
                             wide_model.register_buffer(f'_attr_{safe_name}', attr.clone())
                             wide_model._attr_names.append(node.name)
                     except:
-                        pass  # Skip non-tensor attrs
+                        pass
 
         # Second pass: build stages
         for node in traced.graph.nodes:
             wide_op = None
+            is_passthrough = False
 
             if node.op == 'placeholder':
                 wide_model._input_name = node.name
                 continue
 
             elif node.op == 'output':
-                # Output args tell us which node is the final output
                 if node.args:
                     wide_model._output_name = node.args[0].name if hasattr(node.args[0], 'name') else str(node.args[0])
                 continue
 
             elif node.op == 'get_attr':
-                # Already handled - just mark in execution order
                 wide_model._execution_order.append(node.name)
-                wide_model._node_args[node.name] = ()  # No inputs
+                wide_model._node_args[node.name] = ()
                 wide_model._node_kwargs[node.name] = {}
                 continue
 
             elif node.op == 'call_module':
                 target_path = node.target
-                modules = [m.get_submodule(target_path) for m in models]
-                module_type = type(modules[0]).__name__
+                modules_list = [m.get_submodule(target_path) for m in models]
+                module_type = type(modules_list[0]).__name__
 
                 # Use registry to get builder
                 registry = get_registry()
                 builder = registry.get_builder(module_type)
                 if builder is not None:
-                    wide_op = builder(modules)
+                    wide_op = builder(modules_list)
+                    fused_count += 1
+                    if verbose:
+                        print(f"  ✓ Fused: {node.name} ({module_type}) → {type(wide_op).__name__}")
                 else:
-                    wide_op = FunctionalOp(lambda x, m=modules[0]: m(x), f"Passthrough({module_type})")
+                    # Fallback to sequential passthrough
+                    wide_op = SequentialPassthrough(modules_list, module_type)
+                    is_passthrough = True
+                    passthrough_count += 1
+                    passthrough_modules.append((node.name, module_type))
+                    if verbose:
+                        print(f"  ⚠ Passthrough: {node.name} ({module_type})")
 
             elif node.op == 'call_function':
                 fn = node.target
@@ -376,15 +630,13 @@ class TracedWideModel(nn.Module):
                 wide_op = FunctionalOp(make_method_caller(method_name), f".{method_name}()")
 
             if wide_op is not None:
-                # Store arg names for graph execution
                 arg_names = []
                 for arg in node.args:
                     if hasattr(arg, 'name'):
                         arg_names.append(arg.name)
                     else:
-                        arg_names.append(arg)  # Constant
+                        arg_names.append(arg)
 
-                # Store kwargs with node references resolved
                 kwarg_refs = {}
                 for k, v in node.kwargs.items():
                     if hasattr(v, 'name'):
@@ -400,6 +652,7 @@ class TracedWideModel(nn.Module):
                     wide_op=wide_op,
                     n=n,
                     num_inputs=len(arg_names),
+                    is_passthrough=is_passthrough,
                 )
 
                 safe_name = node.name.replace('.', '_')
@@ -408,6 +661,27 @@ class TracedWideModel(nn.Module):
                 wide_model._execution_order.append(node.name)
                 wide_model._node_args[node.name] = tuple(arg_names)
                 wide_model._node_kwargs[node.name] = kwarg_refs
+
+        # Build trace report
+        wide_model._trace_report = TraceReport(
+            n_models=n,
+            total_stages=fused_count + passthrough_count,
+            fused_stages=fused_count,
+            passthrough_stages=passthrough_count,
+            passthrough_modules=passthrough_modules,
+            attr_count=len(wide_model._attr_names),
+            concrete_args_used=concrete_args,
+            trace_config_used=effective_trace_config if effective_trace_config else None,
+        )
+
+        # Emit warnings
+        if warn_passthroughs and passthrough_modules:
+            for msg in wide_model._trace_report.warnings():
+                warnings.warn(msg, stacklevel=2)
+
+        if verbose:
+            print()
+            print(wide_model._trace_report.summary())
 
         return wide_model
 
@@ -419,18 +693,13 @@ class TracedWideModel(nn.Module):
         Internal: [N, B, C, ...] N-first format
         Output: [B, N*C, ...] channel-packed
         """
-        # Unpack: [B, N*C, ...] -> [N, B, C, ...]
-        # For images: [B, N*C, H, W] -> [N, B, C, H, W]
-        # For sequences: [B, N*D, T] -> [N, B, D, T]
-        # For 1D: [B, N*D] -> [N, B, D]
-
         B = x.shape[0]
         nc = x.shape[1]
-        spatial = x.shape[2:]  # Could be (H, W), (T,), or ()
+        spatial = x.shape[2:]
 
         c = nc // self.n
-        x = x.view(B, self.n, c, *spatial)  # [B, N, C, ...]
-        x = x.movedim(1, 0)                  # [N, B, C, ...]
+        x = x.view(B, self.n, c, *spatial)
+        x = x.movedim(1, 0)
 
         values: Dict[str, Tensor] = {self._input_name: x}
 
@@ -442,7 +711,6 @@ class TracedWideModel(nn.Module):
                 values[attr_name] = getattr(self, buffer_name)
 
         for node_name in self._execution_order:
-            # Skip get_attr nodes - already in values
             if node_name in self._attr_names:
                 continue
 
@@ -453,15 +721,13 @@ class TracedWideModel(nn.Module):
             safe_name = node_name.replace('.', '_')
             op = self.stages[safe_name]
 
-            # Gather positional args
             args = []
             for arg_name in self._node_args[node_name]:
                 if isinstance(arg_name, str) and arg_name in values:
                     args.append(values[arg_name])
                 else:
-                    args.append(arg_name)  # Constant
+                    args.append(arg_name)
 
-            # Gather kwargs
             kwargs = {}
             for k, v in self._node_kwargs.get(node_name, {}).items():
                 if isinstance(v, str) and v in values:
@@ -469,7 +735,6 @@ class TracedWideModel(nn.Module):
                 else:
                     kwargs[k] = v
 
-            # Execute
             if kwargs:
                 values[node_name] = op(*args, **kwargs)
             elif len(args) == 1:
@@ -479,21 +744,16 @@ class TracedWideModel(nn.Module):
 
         out = values[self._output_name]
 
-        # Pack: [N, B, C, ...] -> [B, N*C, ...]
-        # For images: [N, B, C, H, W] -> [B, N*C, H, W]
-        # For sequences: [N, B, D, T] -> [B, N*D, T]
-        # For 1D: [N, B, D] -> [B, N*D]
-
-        # Handle tuple outputs (e.g., from attention)
+        # Handle tuple outputs
         if isinstance(out, tuple):
             out = out[0]
 
         N, B = out.shape[0], out.shape[1]
         C = out.shape[2]
-        spatial = out.shape[3:]  # Could be (H, W), (T,), or ()
+        spatial = out.shape[3:]
 
-        out = out.movedim(0, 1)                    # [B, N, C, ...]
-        out = out.reshape(B, N * C, *spatial)      # [B, N*C, ...]
+        out = out.movedim(0, 1)
+        out = out.reshape(B, N * C, *spatial)
 
         return out
 
@@ -502,10 +762,21 @@ class TracedWideModel(nn.Module):
         lines = [
             f"TracedWideModel: {self.n} models",
             "=" * 60,
-            f"Stages: {len(self.stages)}",
-            f"Attrs: {len(self._attr_names)}",
-            "",
         ]
+
+        if self._trace_report:
+            lines.append(f"Stages: {self._trace_report.total_stages} "
+                        f"({self._trace_report.fused_stages} fused, "
+                        f"{self._trace_report.passthrough_stages} passthrough)")
+            if self._trace_report.concrete_args_used:
+                lines.append(f"concrete_args: {self._trace_report.concrete_args_used}")
+            if self._trace_report.trace_config_used:
+                lines.append(f"trace_config: {self._trace_report.trace_config_used}")
+        else:
+            lines.append(f"Stages: {len(self.stages)}")
+
+        lines.append(f"Attrs: {len(self._attr_names)}")
+        lines.append("")
 
         total_params = 0
         for node_name in self._execution_order:
@@ -527,12 +798,20 @@ class TracedWideModel(nn.Module):
             total_params += params
 
             args_str = ", ".join(str(a) for a in self._node_args[node_name])
+
+            marker = "⚠" if stage.is_passthrough else "✓"
             lines.append(
-                f"  [{stage.order}] {node_name}({args_str}): {type(op).__name__} ({params:,} params)"
+                f"  [{stage.order}] {marker} {node_name}({args_str}): {type(op).__name__} ({params:,} params)"
             )
 
         lines.append("")
         lines.append(f"Total: {total_params:,} params ({total_params // self.n:,} per model)")
+
+        if self._trace_report and self._trace_report.has_passthroughs():
+            lines.append("")
+            lines.append("⚠ Passthrough modules (no fusion):")
+            for name, mtype in self._trace_report.passthrough_modules:
+                lines.append(f"    {name}: {mtype}")
 
         return "\n".join(lines)
 
@@ -542,16 +821,23 @@ class TracedWideModel(nn.Module):
 # =============================================================================
 
 __all__ = [
+    # Trace utilities
     'TraceNode',
     'analyze_trace',
     'print_trace',
+    # Config
+    'DEFAULT_TRACE_CONFIG',
+    # Op wrappers
     'FunctionalOp',
     'BinaryOp',
     'GetAttrOp',
+    'SequentialPassthrough',
+    # Reporting
+    'TraceReport',
     'WideStage',
+    # Main class
     'TracedWideModel',
 ]
-
 
 
 # =============================================================================
@@ -559,14 +845,6 @@ __all__ = [
 # =============================================================================
 
 if __name__ == '__main__':
-    """
-    Minimal smoke test. For full benchmarking, use:
-        python -m wide_compiler.core.traced_benchmark --model resnet18 --n 10
-    
-    Or programmatically:
-        from wide_compiler.core import benchmark_model
-        result = benchmark_model(MyModel, sample_input, n=10)
-    """
     import torch.nn.functional as F
 
     torch.manual_seed(42)
@@ -589,10 +867,9 @@ if __name__ == '__main__':
     mlps = [MLP(D).to(device).eval() for _ in range(N)]
     sample = torch.randn(B, D, device=device)
 
-    # Build
+    # Build with verbose output
     print(f"\nBuilding Wide model: N={N}")
-    wide = TracedWideModel.from_models(mlps, sample).to(device).eval()
-    print(f"✓ {len(wide.stages)} stages")
+    wide = TracedWideModel.from_models(mlps, sample, verbose=True).to(device).eval()
 
     # Verify
     inputs = [torch.randn(B, D, device=device) for _ in range(N)]
@@ -603,7 +880,7 @@ if __name__ == '__main__':
         out = unpack_outputs(wide(packed), N)
 
     diff = max((ref[i] - out[i]).abs().max().item() for i in range(N))
-    print(f"✓ Correctness: {diff:.2e}")
+    print(f"\n✓ Correctness: {diff:.2e}")
 
     # Quick timing
     import time
@@ -631,6 +908,36 @@ if __name__ == '__main__':
         t_base = (time.perf_counter() - t0) / 50
 
     print(f"✓ Speedup: {t_base/t_wide:.1f}x ({t_base*1000:.2f} vs {t_wide*1000:.2f} ms)")
+
+    print("\n" + wide.summary())
+
+    # Test with static control flow
+    print("\n" + "=" * 50)
+    print("Testing static control flow with concrete_args...")
+
+    class ConditionalMLP(nn.Module):
+        def __init__(self, d=128):
+            super().__init__()
+            self.fc1 = nn.Linear(d, d*2)
+            self.fc2 = nn.Linear(d*2, d)
+            self.use_relu = True
+
+        def forward(self, x, use_activation=True):
+            x = self.fc1(x)
+            if use_activation:  # Static control flow
+                x = F.relu(x)
+            return self.fc2(x)
+
+    cond_mlps = [ConditionalMLP(D).to(device).eval() for _ in range(N)]
+
+    # Trace with concrete_args to specialize on use_activation=True
+    wide_cond = TracedWideModel.from_models(
+        cond_mlps, sample,
+        concrete_args={'use_activation': True},
+        verbose=True,
+    ).to(device).eval()
+
+    print(f"✓ Conditional model traced successfully")
 
     print("\n" + "=" * 50)
     print("For full benchmarking: python -m wide_compiler.core.traced_benchmark")

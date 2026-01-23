@@ -13,12 +13,28 @@ from .traced_wide import (
     FunctionalOp,
     BinaryOp,
     print_trace,
+    GetAttrOp,
+    TraceNode,
+    analyze_trace,
+    print_trace,
+    DEFAULT_TRACE_CONFIG,
+    FunctionalOp,
+    BinaryOp,
+    GetAttrOp,
+    SequentialPassthrough,
+    TraceReport,
+    WideStage,
 )
 
 # Pack/unpack utilities
 from .ensemble_util import (
     pack_inputs,
     unpack_outputs,
+    to_n_first,
+    from_n_first,
+    iter_n_first,
+    stack_n_first,
+    get_n_first_shape,
 )
 
 # Registry
@@ -37,6 +53,7 @@ from .config import (
     WideConfig,
     get_default_config,
     set_default_config,
+
 )
 
 # Primitives
@@ -74,10 +91,23 @@ __all__ = [
     'FunctionalOp',
     'BinaryOp',
     'print_trace',
+    'TraceNode',
+    'analyze_trace',
+    'print_trace',
+    'DEFAULT_TRACE_CONFIG',
+    'GetAttrOp',
+    'SequentialPassthrough',
+    'TraceReport',
+    'WideStage',
 
     # Pack/unpack
     'pack_inputs',
     'unpack_outputs',
+    'to_n_first',
+    'from_n_first',
+    'iter_n_first',
+    'stack_n_first',
+    'get_n_first_shape',
 
     # Registry
     'WideRegistry',
