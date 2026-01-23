@@ -56,9 +56,9 @@ class WideMLPEmbedder(nn.Module):
         self.fc1_weight = nn.Parameter(torch.empty(n, hidden_features, in_features))
         self.fc1_bias = nn.Parameter(torch.empty(n, hidden_features))
 
-        # Second projection: [N, in, hidden] - projects back to in_features
-        self.fc2_weight = nn.Parameter(torch.empty(n, in_features, hidden_features))
-        self.fc2_bias = nn.Parameter(torch.empty(n, in_features))
+        # Second projection: [N, hidden, hidden] - projects to hidden_features
+        self.fc2_weight = nn.Parameter(torch.empty(n, hidden_features, hidden_features))
+        self.fc2_bias = nn.Parameter(torch.empty(n, hidden_features))
 
         self._reset_parameters()
 
@@ -225,7 +225,7 @@ class WideMLPEmbedder(nn.Module):
                 if hidden_dim is None:
                     hidden_dim = in_dim * 4
                 self.fc1 = nn.Linear(in_dim, hidden_dim)
-                self.fc2 = nn.Linear(hidden_dim, in_dim)
+                self.fc2 = nn.Linear(hidden_dim, hidden_dim)
                 self.activation = F.silu
 
             def forward(self, x):

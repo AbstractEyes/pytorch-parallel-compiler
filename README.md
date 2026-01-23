@@ -19,11 +19,11 @@ wide = wide_compiler.compile(models, sample_input)
 output = wide(packed_input)  # 1 kernel launch
 ```
 
-**Speedups:** 2-73x depending on model type, N, and compilation mode.
+**Speedups:** 2-173x depending on model type, N, and compilation mode (A100, compiled).
 
 ## What's New in 0.7.0
 
-- **24 Primitives** - Added 11 new primitives: RMSNorm (21x), AdaLayerNormZero (9.7x), MLPEmbedder (14.8x), CrossAttention (15.7x), ConvTranspose1d/2d, BatchNorm3d, RNN, PReLU, Dropout (73x), AdaptiveAvgPool2d
+- **24 Primitives** - Added 11 new primitives: RMSNorm (21x), AdaLayerNormZero (15x), MLPEmbedder (15x), CrossAttention (18x), ConvTranspose1d/2d (5-6x), BatchNorm3d (24x), RNN (6x), PReLU (12x), Dropout (174x), AdaptiveAvgPool2d (15x)
 - **5 Flux-Style Blocks** - WideMLP, WideAttention, WideJointAttention, WideDoubleStreamBlock, WideSingleStreamBlock for transformer architectures
 - **Registry-Based TracedWideModel** - Fully dynamic primitive lookup, no more hardcoded WIDE_BUILDERS dict
 - **RMSNorm Support** - Native PyTorch RMSNorm with 21x speedup at N=32
@@ -251,61 +251,61 @@ wide_compiler info
 
 | Layer | Wide Version | I/O Format | Strategies | Best Speedup |
 |-------|--------------|------------|------------|--------------|
-| `nn.Embedding` | `WideEmbedding` | `[N,B,T]→[N,B,T,D]` | indexed, gather, sequential | **9.1x** @ N=32 |
-| `nn.Linear` | `WideLinear` | `[N,B,...,Din]→[N,B,...,Dout]` | einsum, sequential | **9.7x** @ N=32 |
+| `nn.Embedding` | `WideEmbedding` | `[N,B,T]→[N,B,T,D]` | indexed, gather, sequential | **27.1x** @ N=32 |
 | `MLPEmbedder` | `WideMLPEmbedder` | `[N,B,D]→[N,B,Dout]` | fused, sequential | **14.8x** @ N=32 |
+| `nn.Linear` | `WideLinear` | `[N,B,...,Din]→[N,B,...,Dout]` | einsum, sequential | **8.8x** @ N=32 |
 
 ### Convolution Layers
 
 | Layer | Wide Version | I/O Format | Strategies | Best Speedup |
 |-------|--------------|------------|------------|--------------|
-| `nn.Conv1d` | `WideConv1d` | `[N,B,C,L]→[N,B,Cout,Lout]` | grouped, sequential | **5.3x** @ N=32 |
-| `nn.Conv2d` | `WideConv2d` | `[N,B,C,H,W]→[N,B,Cout,Hout,Wout]` | grouped, channels_last, sequential | **2.9x** @ N=16 |
-| `nn.Conv3d` | `WideConv3d` | `[N,B,C,D,H,W]→[N,B,Cout,Dout,Hout,Wout]` | grouped, sequential | **1.9x** @ N=16 |
-| `nn.ConvTranspose1d` | `WideConvTranspose1d` | `[N,B,C,L]→[N,B,Cout,Lout]` | grouped, sequential | **5.4x** @ N=32 |
-| `nn.ConvTranspose2d` | `WideConvTranspose2d` | `[N,B,C,H,W]→[N,B,Cout,Hout,Wout]` | grouped, channels_last, sequential | **3.8x** @ N=32 |
+| `nn.Conv1d` | `WideConv1d` | `[N,B,C,L]→[N,B,Cout,Lout]` | grouped, sequential | **12.1x** @ N=32 |
+| `nn.Conv2d` | `WideConv2d` | `[N,B,C,H,W]→[N,B,Cout,Hout,Wout]` | grouped, channels_last, sequential | **6.2x** @ N=32 |
+| `nn.ConvTranspose2d` | `WideConvTranspose2d` | `[N,B,C,H,W]→[N,B,Cout,Hout,Wout]` | grouped, channels_last, sequential | **5.7x** @ N=32 |
+| `nn.ConvTranspose1d` | `WideConvTranspose1d` | `[N,B,C,L]→[N,B,Cout,Lout]` | grouped, sequential | **5.3x** @ N=32 |
+| `nn.Conv3d` | `WideConv3d` | `[N,B,C,D,H,W]→[N,B,Cout,Dout,Hout,Wout]` | grouped, sequential | **4.4x** @ N=16 |
 
 ### Normalization Layers
 
 | Layer | Wide Version | I/O Format | Strategies | Best Speedup |
 |-------|--------------|------------|------------|--------------|
-| `nn.RMSNorm` | `WideRMSNorm` | `[N,B,...,D]→[N,B,...,D]` | batched, sequential | **21.0x** @ N=32 |
-| `nn.BatchNorm1d` | `WideBatchNorm1d` | `[N,B,C]→[N,B,C]` | wide | **11.5x** @ N=32 |
-| `AdaLayerNormZeroSingle` | `WideAdaLayerNormZeroSingle` | `[N,B,D],[N,B,Demb]→[N,B,D],gate` | fused, sequential | **9.7x** @ N=32 |
-| `nn.InstanceNorm2d` | `WideInstanceNorm2d` | `[N,B,C,H,W]→[N,B,C,H,W]` | fused, sequential | **7.7x** @ N=16 |
-| `nn.GroupNorm` | `WideGroupNorm` | `[N,B,C,...]→[N,B,C,...]` | fused, sequential | **4.9x** @ N=16 |
-| `nn.LayerNorm` | `WideLayerNorm` | `[N,B,...,D]→[N,B,...,D]` | wide | **4.7x** @ N=32 |
-| `nn.BatchNorm2d` | `WideBatchNorm2d` | `[N,B,C,H,W]→[N,B,C,H,W]` | wide | **3.4x** @ N=16 |
-| `nn.BatchNorm3d` | `WideBatchNorm3d` | `[N,B,C,D,H,W]→[N,B,C,D,H,W]` | wide | 0.9x @ N=4 (slower) |
+| `nn.BatchNorm1d` | `WideBatchNorm1d` | `[N,B,C]→[N,B,C]` | wide | **36.7x** @ N=32 |
+| `nn.BatchNorm2d` | `WideBatchNorm2d` | `[N,B,C,H,W]→[N,B,C,H,W]` | wide | **35.8x** @ N=32 |
+| `nn.BatchNorm3d` | `WideBatchNorm3d` | `[N,B,C,D,H,W]→[N,B,C,D,H,W]` | wide | **23.5x** @ N=32 |
+| `nn.InstanceNorm2d` | `WideInstanceNorm2d` | `[N,B,C,H,W]→[N,B,C,H,W]` | fused, sequential | **21.3x** @ N=32 |
+| `nn.RMSNorm` | `WideRMSNorm` | `[N,B,...,D]→[N,B,...,D]` | batched, sequential | **20.8x** @ N=32 |
+| `AdaLayerNormZeroSingle` | `WideAdaLayerNormZeroSingle` | `[N,B,D],[N,B,Demb]→[N,B,D],gate` | fused, sequential | **15.2x** @ N=16 |
+| `nn.GroupNorm` | `WideGroupNorm` | `[N,B,C,...]→[N,B,C,...]` | fused, sequential | **12.9x** @ N=32 |
+| `nn.LayerNorm` | `WideLayerNorm` | `[N,B,...,D]→[N,B,...,D]` | wide | **9.8x** @ N=32 |
 
 ### Attention Layers
 
 | Layer | Wide Version | I/O Format | Strategies | Best Speedup |
 |-------|--------------|------------|------------|--------------|
-| `MultiheadCrossAttention` | `WideMultiheadCrossAttention` | `[N,B,Tq,D],[N,B,Tkv,D]→[N,B,Tq,D]` | fused, sequential | **15.7x** @ N=32 |
-| `nn.MultiheadAttention` | `WideAttention` | `[N,B,T,D]→[N,B,T,D]` | fused, sequential | **3.5x** @ N=8 |
+| `MultiheadCrossAttention` | `WideMultiheadCrossAttention` | `[N,B,Tq,D],[N,B,Tkv,D]→[N,B,Tq,D]` | fused, sequential | **17.8x** @ N=32 |
+| `nn.MultiheadAttention` | `WideAttention` | `[N,B,T,D]→[N,B,T,D]` | fused, sequential | **9.6x** @ N=32 |
 
 ### RNN Layers
 
-| Layer | Wide Version | I/O Format | Strategies | Best Speedup | Notes |
-|-------|--------------|------------|------------|--------------|-------|
-| `nn.RNN` | `WideRNN` | `[N,B,T,Din]→[N,B,T,H],[N,B,H]` | fused, sequential | 1.0x @ N=32 | Break-even |
-| `nn.LSTM` | `WideLSTM` | `[N,B,T,Din]→[N,B,T,H],[N,B,H],[N,B,H]` | fused, sequential | 0.7x @ N=32 | Slower (cuDNN) |
-| `nn.GRU` | `WideGRU` | `[N,B,T,Din]→[N,B,T,H],[N,B,H]` | fused, sequential | 0.5x @ N=32 | Slower (cuDNN) |
+| Layer | Wide Version | I/O Format | Strategies | Best Speedup |
+|-------|--------------|------------|------------|--------------|
+| `nn.RNN` | `WideRNN` | `[N,B,T,Din]→[N,B,T,H],[N,B,H]` | fused, sequential | **5.6x** @ N=32 |
+| `nn.LSTM` | `WideLSTM` | `[N,B,T,Din]→[N,B,T,H],[N,B,H],[N,B,H]` | fused, sequential | **3.3x** @ N=32 |
+| `nn.GRU` | `WideGRU` | `[N,B,T,Din]→[N,B,T,H],[N,B,H]` | fused, sequential | **2.9x** @ N=32 |
 
 ### Other Layers
 
-| Layer | Wide Version | I/O Format | Strategies | Best Speedup | Notes |
-|-------|--------------|------------|------------|--------------|-------|
-| `nn.Dropout` | `WideDropout` | `[N,B,...]→[N,B,...]` | independent, shared, sequential | **73.2x** @ N=32 | Extreme speedup |
-| `nn.AdaptiveAvgPool2d` | `WideAdaptiveAvgPool2d` | `[N,B,C,Hin,Win]→[N,B,C,Hout,Wout]` | batched, sequential | **2.2x** @ N=8 |
-| `nn.PReLU` | `WidePReLU` | `[N,B,C,...]→[N,B,C,...]` | wide, sequential | 1.0x @ N=4 | Break-even |
-| `F.relu`, `F.gelu`, etc. | `FunctionalOp` | agnostic | — | — | Passthrough |
-| `+`, `-`, `*`, `/`, `@` | `BinaryOp` | agnostic | — | — | Element-wise |
+| Layer | Wide Version | I/O Format | Strategies | Best Speedup |
+|-------|--------------|------------|------------|--------------|
+| `nn.Dropout` | `WideDropout` | `[N,B,...]→[N,B,...]` | independent, shared, sequential | **173.7x** @ N=32 |
+| `nn.AdaptiveAvgPool2d` | `WideAdaptiveAvgPool2d` | `[N,B,C,Hin,Win]→[N,B,C,Hout,Wout]` | batched, sequential | **15.2x** @ N=32 |
+| `nn.PReLU` | `WidePReLU` | `[N,B,C,...]→[N,B,C,...]` | wide, sequential | **12.0x** @ N=32 |
+| `F.relu`, `F.gelu`, etc. | `FunctionalOp` | agnostic | — | — |
+| `+`, `-`, `*`, `/`, `@` | `BinaryOp` | agnostic | — | — |
 
 **All primitives operate on N-first format `[N, B, ...]` internally for optimal performance.**
 
-*Benchmarks: A100 GPU, eager mode (no compile), quick preset. See test_cases.py for full results.*
+*Benchmarks: A100 GPU, torch.compile (default mode), quick preset. See test_cases.py for full results.*
 
 ## Flux-Style Blocks (v0.7.0 - 5 blocks)
 
@@ -313,11 +313,11 @@ Higher-level composite blocks for transformer architectures.
 
 | Block | I/O Format | Components | Best Speedup |
 |-------|------------|------------|--------------|
-| `WideMLP` | `[N,B,T,D]→[N,B,T,D]` | 2x Linear + activation | **2.9x** @ N=32 |
-| `WideAttention` | `[N,B,T,D]→[N,B,T,D]` | QKV proj + SDPA + out proj | **7.9x** @ N=16 |
-| `WideJointAttention` | `[N,B,Ttxt,D],[N,B,Timg,D]→[N,B,Ttxt,D],[N,B,Timg,D]` | Dual-stream attention | **9.0x** @ N=32 |
-| `WideDoubleStreamBlock` | `[N,B,Ttxt,D],[N,B,Timg,D]→[N,B,Ttxt,D],[N,B,Timg,D]` | JointAttn + 2x MLP + norms | **5.2x** @ N=8 |
-| `WideSingleStreamBlock` | `[N,B,T,D],[N,B,Demb]→[N,B,T,D]` | AdaLN + Attn + MLP | **3.4x** @ N=8 |
+| `WideAttention` | `[N,B,T,D]→[N,B,T,D]` | QKV proj + SDPA + out proj | **10.7x** @ N=16 |
+| `WideDoubleStreamBlock` | `[N,B,Ttxt,D],[N,B,Timg,D]→[N,B,Ttxt,D],[N,B,Timg,D]` | JointAttn + 2x MLP + norms | **6.8x** @ N=8 |
+| `WideJointAttention` | `[N,B,Ttxt,D],[N,B,Timg,D]→[N,B,Ttxt,D],[N,B,Timg,D]` | Dual-stream attention | **5.5x** @ N=32 |
+| `WideMLP` | `[N,B,T,D]→[N,B,T,D]` | 2x Linear + activation | **3.9x** @ N=16 |
+| `WideSingleStreamBlock` | `[N,B,T,D],[N,B,Demb]→[N,B,T,D]` | AdaLN + Attn + MLP | **3.5x** @ N=8 |
 
 ### Block Usage
 
@@ -398,18 +398,18 @@ All benchmarks: A100 GPU, torch.compile (default mode), quick preset (N=[4,8,16,
 4. **RMSNorm** provides 20.8x speedup, outperforms LayerNorm (9.8x) by 2.1x
 5. **CrossAttention** scales to 17.8x with compilation
 6. **RNN layers** benefit from compilation (GRU: 2.9x, LSTM: 3.3x, RNN: 5.6x)
-7. **Conv1d** reaches 12.1x with compilation vs 5.3x eager
+7. **Conv1d** reaches 12.1x with compilation
 8. **Compilation is critical** - most primitives see 2-5x additional speedup
 
 ## Block Benchmarks (A100, compiled)
 
 | Block | N=4 | N=8 | N=16 | N=32 | Components |
 |-------|-----|-----|------|------|------------|
-| **AttentionBlock** | 3.7x | 6.1x | **10.7x** | 10.3x | QKV proj + SDPA + norm |
-| **DoubleStreamBlock** | 3.2x | **6.8x** | — | — | JointAttn + 2xMLP + norms |
-| **JointAttention** | 2.4x | 3.9x | 5.2x | **5.5x** | Dual-stream QKV + concat attn |
-| **MLPBlock** | 2.1x | 2.9x | 3.6x | **3.9x** | 2x Linear + activation |
-| **SingleStreamBlock** | 2.0x | **3.5x** | — | — | AdaLN + Attn + MLP |
+| **AttentionBlock** | 4.0x | 7.6x | **10.7x** | 8.4x | QKV proj + SDPA + norm |
+| **DoubleStreamBlock** | 4.0x | **6.8x** | — | — | JointAttn + 2xMLP + norms |
+| **JointAttention** | 3.0x | 3.9x | 5.4x | **5.5x** | Dual-stream QKV + concat attn |
+| **MLPBlock** | 3.1x | 3.4x | **3.9x** | 2.5x | 2x Linear + activation |
+| **SingleStreamBlock** | 3.1x | **3.5x** | — | — | AdaLN + Attn + MLP |
 
 ## How it Works (v0.7.0)
 
@@ -490,17 +490,11 @@ wide_compiler/
 - **Static shapes** - FX tracing requires fixed tensor shapes
 - **No dynamic control flow** - `if`/`for` based on tensor values won't trace
 
-### Known Slowdowns
-- **RNN layers** - cuDNN optimizations make sequential execution faster
-- **BatchNorm3d** - No grouped implementation, always slower
-- **PReLU** - High kernel launch overhead at low N
-- **Attention** - Performance degrades at N>16 (memory bandwidth)
-
 ### RNN Primitives (WideGRU, WideLSTM, WideRNN)
 - **Single layer only** - `num_layers=1` currently required
 - **Unidirectional only** - `bidirectional=False` required
 - **batch_first only** - `batch_first=True` required
-- **Slower than cuDNN** - Not recommended unless N>32
+- **Compilation recommended** - RNN layers see 2-6x speedup with torch.compile
 
 ## Use Cases
 
