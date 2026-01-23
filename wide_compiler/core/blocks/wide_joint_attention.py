@@ -163,14 +163,18 @@ class WideJointAttention(nn.Module):
 
         # Apply RoPE to image only
         if rope is not None:
-            img_q_flat = img_q.reshape(N * B * self.num_heads, S, self.head_dim)
-            img_k_flat = img_k.reshape(N * B * self.num_heads, S, self.head_dim)
+            # img_q/img_k: [N, B, H, S, D]
+            # rope: [B, S, D] - shared across N models
+            # Reshape to [B, N*H, S, D] so B is first dimension for apply_rope
+            N, B, H, S, D = img_q.shape
+            img_q_flat = img_q.permute(1, 0, 2, 3, 4).reshape(B, N * H, S, D)
+            img_k_flat = img_k.permute(1, 0, 2, 3, 4).reshape(B, N * H, S, D)
 
             img_q_flat = apply_rope(img_q_flat, rope)
             img_k_flat = apply_rope(img_k_flat, rope)
 
-            img_q = img_q_flat.reshape(N, B, self.num_heads, S, self.head_dim)
-            img_k = img_k_flat.reshape(N, B, self.num_heads, S, self.head_dim)
+            img_q = img_q_flat.reshape(B, N, H, S, D).permute(1, 0, 2, 3, 4)
+            img_k = img_k_flat.reshape(B, N, H, S, D).permute(1, 0, 2, 3, 4)
 
         # Concatenate K, V for joint attention: [N, B, num_heads, L+S, head_dim]
         k = torch.cat([txt_k, img_k], dim=3)
@@ -239,14 +243,11 @@ class WideJointAttention(nn.Module):
 
             # Apply RoPE to image
             if rope is not None:
-                img_q_flat = img_q.reshape(B * self.num_heads, S, self.head_dim)
-                img_k_flat = img_k.reshape(B * self.num_heads, S, self.head_dim)
-
-                img_q_flat = apply_rope(img_q_flat, rope)
-                img_k_flat = apply_rope(img_k_flat, rope)
-
-                img_q = img_q_flat.reshape(B, self.num_heads, S, self.head_dim)
-                img_k = img_k_flat.reshape(B, self.num_heads, S, self.head_dim)
+                # img_q/img_k: [B, H, S, D]
+                # rope: [B, S, D] - already matches B dimension!
+                # Just reshape to [B, H, S, D] (already is) for apply_rope
+                img_q = apply_rope(img_q, rope)
+                img_k = apply_rope(img_k, rope)
 
             # Concatenate K, V
             k = torch.cat([txt_k, img_k], dim=2)

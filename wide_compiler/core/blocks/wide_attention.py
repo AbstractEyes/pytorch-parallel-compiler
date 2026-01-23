@@ -139,15 +139,16 @@ class WideAttention(nn.Module):
 
         # Apply RoPE if provided
         if rope is not None:
-            # Reshape for rope: [N*B*num_heads, S, head_dim]
-            q_flat = q.reshape(N * B * self.num_heads, S, self.head_dim)
-            k_flat = k.reshape(N * B * self.num_heads, S, self.head_dim)
+            # Reshape to [B, N*num_heads, S, head_dim] so B is first dimension for apply_rope
+            # q/k are currently [N, B, num_heads, S, head_dim]
+            q_flat = q.permute(1, 0, 2, 3, 4).reshape(B, N * self.num_heads, S, self.head_dim)
+            k_flat = k.permute(1, 0, 2, 3, 4).reshape(B, N * self.num_heads, S, self.head_dim)
 
             q_flat = apply_rope(q_flat, rope)
             k_flat = apply_rope(k_flat, rope)
 
-            q = q_flat.reshape(N, B, self.num_heads, S, self.head_dim)
-            k = k_flat.reshape(N, B, self.num_heads, S, self.head_dim)
+            q = q_flat.reshape(B, N, self.num_heads, S, self.head_dim).permute(1, 0, 2, 3, 4)
+            k = k_flat.reshape(B, N, self.num_heads, S, self.head_dim).permute(1, 0, 2, 3, 4)
 
         # Flash Attention: [N*B, num_heads, S, head_dim]
         q = q.reshape(N * B, self.num_heads, S, self.head_dim)
@@ -190,14 +191,10 @@ class WideAttention(nn.Module):
 
             # Apply RoPE
             if rope is not None:
-                q_flat = q.reshape(B * self.num_heads, S, self.head_dim)
-                k_flat = k.reshape(B * self.num_heads, S, self.head_dim)
-
-                q_flat = apply_rope(q_flat, rope)
-                k_flat = apply_rope(k_flat, rope)
-
-                q = q_flat.reshape(B, self.num_heads, S, self.head_dim)
-                k = k_flat.reshape(B, self.num_heads, S, self.head_dim)
+                # q/k are [B, num_heads, S, head_dim] - already correct format!
+                # Just need to match apply_rope's expected format
+                q = apply_rope(q, rope)
+                k = apply_rope(k, rope)
 
             # Flash Attention
             out_i = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale)

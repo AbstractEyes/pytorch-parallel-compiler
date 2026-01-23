@@ -385,4 +385,142 @@ class WideRotaryEmbeddingShared(nn.Module):
                 f"strategy={self._strategy})")
 
 
-__all__ = ['WideRotaryEmbedding', 'WideRotaryEmbeddingShared', 'apply_rope']
+class WideRotaryEmbedding3D(nn.Module):
+    """
+    N parallel 3-axis Rotary Position Embeddings for Flux-style models.
+
+    Encodes positions along 3 axes (typically time, height, width) for image/video.
+    Each axis has its own frequency band.
+
+    Input: img_ids [B, num_patches, 3] - shared across all N models
+    Output: [B, num_patches, dim] - Shared across N models (blocks will broadcast)
+
+    This is different from standard RoPE:
+    - Standard RoPE: 1D positions → [seq_len, dim]
+    - 3D RoPE (Flux): 3D positions [t, h, w] → [num_patches, dim]
+
+    Strategies:
+    - 'batched': Single computation shared across N (FASTEST)
+    - 'sequential': N identical copies (baseline, for validation)
+    """
+
+    def __init__(
+        self,
+        n: int,
+        dim: int,
+        axes_dims: Tuple[int, int, int] = (16, 56, 56),
+        theta: float = 10000.0,
+        strategy: str = 'batched',
+    ):
+        """
+        Initialize 3-axis RoPE.
+
+        Args:
+            n: Number of parallel models
+            dim: Total embedding dimension (must equal sum of axes_dims)
+            axes_dims: Dimensions for each axis (time, height, width)
+            theta: Base for frequency computation
+            strategy: 'batched' or 'sequential'
+        """
+        super().__init__()
+        self.n = n
+        self.dim = dim
+        self.axes_dims = axes_dims
+        self.theta = theta
+        self._strategy = strategy
+
+        # Precompute frequencies for each axis (no runtime loops)
+        # Each axis produces axis_dim frequencies, concatenated to produce dim total
+        for i, axis_dim in enumerate(axes_dims):
+            freqs = 1.0 / (theta ** (torch.arange(0, axis_dim, 2).float() / axis_dim))
+            self.register_buffer(f'freqs_{i}', freqs, persistent=False)
+
+    @property
+    def strategy(self) -> str:
+        return self._strategy
+
+    def forward(self, ids: Tensor, dtype: torch.dtype = torch.float32) -> Tensor:
+        """
+        Compute 3-axis rotary embeddings.
+
+        Args:
+            ids: [B, num_patches, 3] - position indices (t, h, w) for each patch
+            dtype: Output dtype
+
+        Returns:
+            [B, num_patches, dim] - RoPE embeddings (shared across all N models)
+        """
+        if self._strategy == 'batched':
+            return self._forward_batched(ids, dtype)
+        return self._forward_sequential(ids, dtype)
+
+    def _forward_batched(self, ids: Tensor, dtype: torch.dtype) -> Tensor:
+        """Batched 3-axis RoPE (shared across N models)."""
+        B, num_patches, _ = ids.shape
+
+        # Extract positions for each axis
+        pos0 = ids[:, :, 0:1].float()  # [B, num_patches, 1]
+        pos1 = ids[:, :, 1:2].float()
+        pos2 = ids[:, :, 2:3].float()
+
+        # Compute angles for each axis (broadcasting)
+        # [B, num_patches, 1] * [axis_dim/2] -> [B, num_patches, axis_dim/2]
+        angles0 = pos0 * self.freqs_0
+        angles1 = pos1 * self.freqs_1
+        angles2 = pos2 * self.freqs_2
+
+        # Stack sin/cos and flatten for each axis
+        # [B, num_patches, axis_dim/2, 2] -> [B, num_patches, axis_dim]
+        emb0 = torch.stack([angles0.cos(), angles0.sin()], dim=-1).flatten(-2)
+        emb1 = torch.stack([angles1.cos(), angles1.sin()], dim=-1).flatten(-2)
+        emb2 = torch.stack([angles2.cos(), angles2.sin()], dim=-1).flatten(-2)
+
+        # Concatenate all axes: [B, num_patches, dim]
+        rope = torch.cat([emb0, emb1, emb2], dim=-1).to(dtype)
+
+        # Return as-is: [B, num_patches, dim]
+        # All N models share the same rope (blocks will broadcast)
+        return rope
+
+    def _forward_sequential(self, ids: Tensor, dtype: torch.dtype) -> Tensor:
+        """Sequential (same as batched since rope is shared across N)."""
+        return self._forward_batched(ids, dtype)
+
+    @classmethod
+    def from_modules(cls, modules: List[nn.Module], strategy: str = 'batched') -> 'WideRotaryEmbedding3D':
+        """
+        Create from N existing RotaryEmbedding modules.
+
+        Expects modules with:
+        - .dim attribute
+        - .axes_dims attribute
+        - .theta attribute
+        """
+        n = len(modules)
+        t = modules[0]
+
+        wide = cls(
+            n=n,
+            dim=t.dim,
+            axes_dims=t.axes_dims,
+            theta=t.theta,
+            strategy=strategy,
+        )
+
+        # Copy frequency buffers from first module (all should be identical)
+        with torch.no_grad():
+            for i in range(len(t.axes_dims)):
+                if hasattr(t, f'freqs_{i}'):
+                    wide_freqs = getattr(wide, f'freqs_{i}')
+                    module_freqs = getattr(t, f'freqs_{i}')
+                    wide_freqs.copy_(module_freqs)
+
+        return wide
+
+    def __repr__(self):
+        return (f"WideRotaryEmbedding3D({self.n}x[dim={self.dim}, "
+                f"axes={self.axes_dims}, theta={self.theta}], "
+                f"strategy={self._strategy})")
+
+
+__all__ = ['WideRotaryEmbedding', 'WideRotaryEmbeddingShared', 'WideRotaryEmbedding3D', 'apply_rope']

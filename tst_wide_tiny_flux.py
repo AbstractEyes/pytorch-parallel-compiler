@@ -17,8 +17,8 @@ def tst_model_init():
 
     n = 4
     hidden_size = 256
-    num_heads = 4
-    head_dim = 64
+    num_heads = 2
+    head_dim = 128  # Must match TinyFlux default (axes_dims_rope sums to this)
 
     model = WideTinyFlux(
         n=n,
@@ -58,8 +58,8 @@ def tst_forward_pass():
     model = WideTinyFlux(
         n=n,
         hidden_size=256,
-        num_heads=4,
-        head_dim=64,
+        num_heads=2,
+        head_dim=128,  # Must match axes_dims_rope sum
         in_channels=16,
         joint_attention_dim=768,
         pooled_projection_dim=768,
@@ -129,8 +129,8 @@ def tst_cuda_forward():
     model = WideTinyFlux(
         n=n,
         hidden_size=512,
-        num_heads=8,
-        head_dim=64,
+        num_heads=4,
+        head_dim=128,  # Must match axes_dims_rope sum
         in_channels=16,
         joint_attention_dim=768,
         pooled_projection_dim=768,
@@ -229,8 +229,8 @@ def tst_multiple_strategies():
         model = WideTinyFlux(
             n=n,
             hidden_size=256,
-            num_heads=4,
-            head_dim=64,
+            num_heads=2,
+            head_dim=128,  # Must match axes_dims_rope sum
             in_channels=16,
             joint_attention_dim=768,
             pooled_projection_dim=768,

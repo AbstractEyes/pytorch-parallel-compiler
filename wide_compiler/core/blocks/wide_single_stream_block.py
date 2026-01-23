@@ -203,12 +203,9 @@ class WideSingleStreamBlock(nn.Module):
         # Apply RoPE if provided
         if rope is not None:
             from wide_compiler.core.primitives.wide_rotary_embedding import apply_rope
-            q_flat = q.reshape(B * self.num_heads, S, self.head_dim)
-            k_flat = k.reshape(B * self.num_heads, S, self.head_dim)
-            q_flat = apply_rope(q_flat, rope)
-            k_flat = apply_rope(k_flat, rope)
-            q = q_flat.reshape(B, self.num_heads, S, self.head_dim)
-            k = k_flat.reshape(B, self.num_heads, S, self.head_dim)
+            # q/k are [B, num_heads, S, head_dim] - already correct format for apply_rope
+            q = apply_rope(q, rope)
+            k = apply_rope(k, rope)
 
         # Self-attention
         scale = self.head_dim ** -0.5

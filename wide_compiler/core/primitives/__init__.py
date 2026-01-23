@@ -64,6 +64,7 @@ from .wide_mlp_embedder import WideMLPEmbedder
 from .wide_rotary_embedding import (
     WideRotaryEmbedding,
     WideRotaryEmbeddingShared,
+    WideRotaryEmbedding3D,
     apply_rope,
 )
 
@@ -125,6 +126,7 @@ __all__ = [
     'WideMLPEmbedder',
     'WideRotaryEmbedding',
     'WideRotaryEmbeddingShared',
+    'WideRotaryEmbedding3D',
     'apply_rope',
 
     # Attention

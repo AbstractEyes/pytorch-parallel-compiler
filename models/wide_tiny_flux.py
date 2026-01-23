@@ -5,13 +5,14 @@ Uses ALL tested primitives and blocks from wide_compiler v0.7.0:
 - WideLinear (8.8x)
 - WideRMSNorm (20.8x)
 - WideMLPEmbedder (14.8x)
-- WideRotaryEmbedding (8-12x estimated)
+- WideRotaryEmbedding3D (8-12x estimated)
 - WideDoubleStreamBlock (6.8x)
 - WideSingleStreamBlock (3.5x)
 
 All operations use N-first format [N, B, ...] internally.
 
-Copyright 2025
+Author AbstractPhil
+Copyright 2026
 Apache 2.0 License
 """
 
@@ -25,7 +26,7 @@ from wide_compiler.core.primitives import (
     WideLinear,
     WideRMSNorm,
     WideMLPEmbedder,
-    WideRotaryEmbedding,
+    WideRotaryEmbedding3D,
 )
 
 # Import tested blocks
@@ -90,8 +91,8 @@ class WideTinyFlux(nn.Module):
         if guidance_embeds:
             self.guidance_in = WideMLPEmbedder(n, in_features=256, hidden_features=hidden_size, strategy='fused')
 
-        # Rotary Position Embedding (WideRotaryEmbedding: 8-12x estimated)
-        self.rope = WideRotaryEmbedding(n, dim=head_dim, max_seq_len=4096, strategy='batched')
+        # Rotary Position Embedding 3D (WideRotaryEmbedding3D: 8-12x estimated)
+        self.rope = WideRotaryEmbedding3D(n, dim=head_dim, axes_dims=axes_dims_rope, strategy='batched')
 
         # Double-stream blocks (WideDoubleStreamBlock)
         self.double_blocks = nn.ModuleList([
@@ -193,10 +194,10 @@ class WideTinyFlux(nn.Module):
             guidance_emb = self._sinusoidal_embedding(guidance)  # [N, B, 256]
             vec = vec + self.guidance_in(guidance_emb)  # [N, B, H]
 
-        # Note: RoPE computation would go here if needed
-        # For now, passing None - full impl would compute from img_ids
-        # RoPE is applied per-model in the blocks
-        rope = None
+        # Compute RoPE from img_ids (WideRotaryEmbedding3D)
+        # img_ids: [B, num_patches, 3] (shared across N models)
+        # rope: [B, num_patches, head_dim] (shared, blocks will broadcast across N)
+        rope = self.rope(img_ids, dtype=img.dtype)
 
         # Double-stream blocks
         for block in self.double_blocks:
@@ -207,7 +208,18 @@ class WideTinyFlux(nn.Module):
             N, B, L, H = txt.shape
             S = img.shape[2]
             x = torch.cat([txt, img], dim=2)  # [N, B, L+S, H]
-            x = block(x, vec, rope)
+
+            # Pad rope with zeros for text positions
+            # rope is [B, S, head_dim] for image only
+            # Need [B, L+S, head_dim] with zeros for text
+            if rope is not None:
+                B_rope, S_rope, D = rope.shape
+                txt_rope_zeros = torch.zeros(B_rope, L, D, device=rope.device, dtype=rope.dtype)
+                rope_padded = torch.cat([txt_rope_zeros, rope], dim=1)  # [B, L+S, D]
+            else:
+                rope_padded = None
+
+            x = block(x, vec, rope_padded)
             txt, img = x.split([L, S], dim=2)
 
         # Output
